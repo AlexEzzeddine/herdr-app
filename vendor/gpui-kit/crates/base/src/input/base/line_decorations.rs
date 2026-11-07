@@ -78,11 +78,10 @@ impl LineDecorations {
         }
     }
 
-    /// What each row in `rows` paints, indexed from `rows.start`. Later
-    /// decorations win, within a key and across keys (in key order).
     /// The paint of each of `rows` (sorted ascending, as laid out: folds
-    /// skip rows), one entry per row. Only the given rows are resolved, so a
-    /// fold over many rows costs nothing.
+    /// skip rows), one entry per row. Later decorations win, within a key
+    /// and across keys (in key order). Only the given rows are resolved, so
+    /// a fold over many rows costs nothing.
     pub(crate) fn resolve(&self, rows: &[usize]) -> Vec<Option<RowPaint>> {
         let mut out = vec![None; rows.len()];
         for decoration in self.by_key.values().flatten() {
