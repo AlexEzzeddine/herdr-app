@@ -432,6 +432,8 @@ impl InputBaseState<EditorMode> {
     /// Clear the inline completion suggestion.
     pub(crate) fn clear_inline_completion(&mut self, cx: &mut Context<Self>) {
         self.extras.inline_completion = InlineCompletion::default();
+        // HERDR: the next frame draws no ghost lines.
+        self.last_ghost_block = None;
         cx.notify();
     }
 
@@ -445,6 +447,8 @@ impl InputBaseState<EditorMode> {
         let Some(completion_item) = self.extras.inline_completion.item.take() else {
             return false;
         };
+        // HERDR: the next frame draws no ghost lines.
+        self.last_ghost_block = None;
 
         let cursor = self.cursor();
         let range_utf16 = self.range_to_utf16(&(cursor..cursor));

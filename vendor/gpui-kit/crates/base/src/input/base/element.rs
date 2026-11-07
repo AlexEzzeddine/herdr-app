@@ -485,9 +485,8 @@ pub(super) fn empty_bottom_height(
 struct FoldIconLayout {
     /// Hitbox for the line number area (used for hover detection)
     line_number_hitbox: Hitbox,
-    /// List of (display_row, is_folded, icon_element, HERDR: where it takes
-    /// presses) for each fold candidate
-    icons: Vec<(usize, bool, gpui::AnyElement, Bounds<Pixels>)>,
+    /// List of (display_row, is_folded, icon_element) pairs for each fold candidate
+    icons: Vec<(usize, bool, gpui::AnyElement)>,
 }
 
 pub(super) struct TextElement<M: InputModeKind> {
@@ -1462,14 +1461,9 @@ impl<M: InputModeKind> TextElement<M> {
                 cx,
             );
 
-            // The icon element is FOLD_ICON_WIDTH square at the hitbox origin.
-            let pressable = Bounds::new(
-                fold_icon_bounds.origin,
-                size(FOLD_ICON_WIDTH, FOLD_ICON_WIDTH),
-            );
             icon_layout
                 .icons
-                .push((info.display_row, info.is_folded, icon, pressable));
+                .push((info.display_row, info.is_folded, icon));
         }
 
         icon_layout
@@ -1488,7 +1482,7 @@ impl<M: InputModeKind> TextElement<M> {
         current_row: Option<usize>,
         window: &mut Window,
         cx: &mut App,
-    ) -> Vec<Bounds<Pixels>> {
+    ) {
         let is_hovered = fold_icon_layout.line_number_hitbox.is_hovered(window);
         if !fold_icon_layout.icons.is_empty() {
             // Mouse moves do not repaint the editor, so repaint when the pointer
@@ -1501,8 +1495,7 @@ impl<M: InputModeKind> TextElement<M> {
                 }
             });
         }
-        let mut painted = Vec::new();
-        for (display_row, is_folded, icon, pressable) in fold_icon_layout.icons.iter_mut() {
+        for (display_row, is_folded, icon) in fold_icon_layout.icons.iter_mut() {
             let is_current_line = current_row == Some(*display_row);
 
             if !is_hovered && !is_current_line && !*is_folded {
@@ -1510,9 +1503,7 @@ impl<M: InputModeKind> TextElement<M> {
             }
 
             icon.paint(window, cx);
-            painted.push(*pressable);
         }
-        painted
     }
 
     fn token_element(
@@ -3412,7 +3403,7 @@ impl<M: InputModeKind> Element for TextElement<M> {
         }
 
         // Paint fold icons (only visible on hover or for current line)
-        let fold_icon_bounds = self.paint_fold_icons(
+        self.paint_fold_icons(
             &mut prepaint.fold_icon_layout,
             prepaint.current_row,
             window,
@@ -3434,7 +3425,6 @@ impl<M: InputModeKind> Element for TextElement<M> {
             state.last_selected_range = Some(selected_range);
             state.scroll_size = prepaint.scroll_size;
             state.last_ghost_block = ghost;
-            state.last_fold_icon_bounds = fold_icon_bounds;
             state.last_frame_wrap_rows = state.display_map.wrap_row_count();
             state.last_frame_document_revision = state.document_revision;
             state.update_scroll_offset(Some(prepaint.cursor_scroll_offset), cx);
@@ -3938,6 +3928,54 @@ mod tests {
         });
     }
 
+    // HERDR: an added selection that merges into an earlier one still
+    // scrolls to where it was added, not to the active caret.
+    #[gpui::test]
+    fn add_selection_merged_into_an_earlier_one_scrolls_to_it(cx: &mut TestAppContext) {
+        let text = sixty_lines("line");
+        let (editor, window) = decoration_editor(cx, &text, false);
+        let mut cx = VisualTestContext::from_window(window.into(), cx);
+        let at = |row: usize| text.find(&format!("line {row}\n")).unwrap();
+        cx.update(|window, cx| {
+            editor.update(cx, |state, cx| {
+                state.set_selections(vec![sel(0..0, false), sel(at(30)..at(35), false)], cx)
+            });
+            window.draw(cx).clear(cx);
+            window.draw(cx).clear(cx);
+            editor.update(cx, |state, cx| state.add_selection(at(32)..at(50), cx));
+            window.draw(cx).clear(cx);
+        });
+        editor.read_with(&cx, |state, _| {
+            assert_eq!(state.selections(), vec![sel(0..0, false), sel(at(30)..at(50), false)]);
+            let (top, height) = state.row_bounds(50).expect("row 50");
+            assert!(top >= px(0.) && top + height <= px(140.), "row 50 is in view: {top:?}");
+        });
+    }
+
+    // HERDR: on a single-line input, add_selection replaces the selection
+    // the same way whichever side the caret is on.
+    #[gpui::test]
+    fn add_selection_on_a_single_line_input_keeps_the_caret_side(cx: &mut TestAppContext) {
+        cx.update(crate::init);
+        let mut input = None;
+        let _window = cx.open_window(size(px(240.), px(40.)), |window, cx| {
+            let state = cx.new(|cx| crate::input::InputState::new(window, cx).default_value("abcdefgh"));
+            input = Some(state.clone());
+            gpui::Empty
+        });
+        let input = input.unwrap();
+        for reversed in [false, true] {
+            cx.update(|cx| {
+                input.update(cx, |state, cx| {
+                    state.set_selected_range(0..1, cx);
+                    state.add_selection_range(sel(2..6, reversed), cx);
+                })
+            });
+            let state = cx.read(|cx| input.read(cx).selections());
+            assert_eq!(state, vec![sel(2..6, reversed)], "reversed: {reversed}");
+        }
+    }
+
     // HERDR: a single-line input keeps only the first range.
     #[gpui::test]
     fn set_selections_on_a_single_line_input_keeps_the_first(cx: &mut TestAppContext) {
@@ -4214,7 +4252,7 @@ mod tests {
         // completion here to draw one.
         cx.update(|_, cx| editor.update(cx, |state, _| state.last_ghost_block = Some((1, ghost))));
         editor.read_with(&cx, |state, _| {
-            let at = |row_y: Pixels| state.gutter_row_at(point(gutter, top + row_y), MouseButton::Left);
+            let at = |row_y: Pixels| state.gutter_row_at(point(gutter, top + row_y));
             assert_eq!(at(line_height * 0.5), Some(0));
             assert_eq!(at(line_height * 1.5), Some(1));
             assert_eq!(at(line_height * 2.5), None, "on the ghost lines");
@@ -4437,6 +4475,24 @@ mod tests {
         });
     }
 
+    // HERDR: a selection set by code clears the inline completion, so
+    // scroll_to_row and row_bounds in the same handler don't count its
+    // ghost lines, which the next frame won't draw.
+    #[gpui::test]
+    fn cleared_ghost_lines_are_not_counted(cx: &mut TestAppContext) {
+        let (editor, window) = decoration_editor(cx, &sixty_lines("line"), false);
+        let mut cx = VisualTestContext::from_window(window.into(), cx);
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        editor.update_in(&mut cx, |state, _, cx| {
+            let line_height = state.last_layout.as_ref().unwrap().line_height;
+            state.last_ghost_block = Some((10, line_height * 3.));
+            state.set_selections(vec![sel(0..0, false)], cx);
+            state.scroll_to_row(20, crate::input::RowScrollAlign::Top, cx);
+            assert_eq!(state.queued_scroll_offset().y, -(line_height * 20.), "no ghost lines in the target");
+            assert_eq!(state.row_bounds(20).expect("row 20").0, px(0.));
+        });
+    }
+
     // HERDR: a horizontal scroll queued after replacing the text isn't
     // clamped to the old text's width.
     #[gpui::test]
@@ -4469,50 +4525,81 @@ mod tests {
             let origin = state.input_bounds.origin;
             let y = origin.y + line_height * 1.5;
             assert_eq!(
-                state.gutter_row_at(point(origin.x - px(4.), y), MouseButton::Left),
+                state.gutter_row_at(point(origin.x - px(4.), y)),
                 None,
                 "in the padding"
             );
-            assert_eq!(state.gutter_row_at(point(origin.x + px(2.), y), MouseButton::Left), Some(1));
+            assert_eq!(state.gutter_row_at(point(origin.x + px(2.), y)), Some(1));
         });
     }
 
-    // HERDR: a left press on a painted fold chevron is the chevron's: it is
-    // not reported as a gutter click. The chevron ignores other buttons, so
+    // HERDR: a left press on a painted fold chevron is the chevron's: it
+    // folds and is not reported as a gutter click (the chevron stops the
+    // press before the input sees it). The chevron ignores other buttons, so
     // a right press there is one.
     #[gpui::test]
     fn a_left_press_on_a_fold_chevron_is_not_a_gutter_click(cx: &mut TestAppContext) {
-        let (editor, mut cx) = numbered_editor(cx, "a\nb\nc");
-        let (gutter, top, line_height) = editor.read_with(&cx, |state, _| {
+        cx.update(crate::init);
+        let mut editor = None;
+        let window = cx.open_window(size(px(240.), px(140.)), |window, cx| {
+            let state = cx.new(|cx| {
+                EditorState::new(window, cx)
+                    .line_number(true)
+                    .folding(true)
+                    .soft_wrap(false)
+                    .default_value("a\nb\nc\nd")
+            });
+            editor = Some(state.clone());
+            DecorationHarness(state)
+        });
+        let editor = editor.unwrap();
+        let mut cx = VisualTestContext::from_window(window.into(), cx);
+        cx.update(|window, cx| {
+            editor.update(cx, |state, cx| {
+                state
+                    .display_map
+                    .set_fold_candidates(vec![crate::input::FoldRange::new(0, 2)]);
+                // The chevron paints on the caret's row without hovering.
+                state.set_selected_range(0..0, cx);
+            });
+            window.draw(cx).clear(cx);
+        });
+        let seen = Rc::new(std::cell::RefCell::new(Vec::new()));
+        cx.update(|window, cx| {
+            let seen = seen.clone();
+            window
+                .subscribe(&editor, cx, move |_, event: &InputEvent, _, _| {
+                    if let InputEvent::GutterClick { row, button, .. } = event {
+                        seen.borrow_mut().push((*row, *button));
+                    }
+                })
+                .detach();
+        });
+        // Where `layout_fold_icons` puts row 0's chevron: its center.
+        let chevron = editor.read_with(&cx, |state, _| {
             let layout = state.last_layout.as_ref().unwrap();
-            (
-                state.input_bounds.origin.x + px(2.),
-                state.input_bounds.origin.y,
-                layout.line_height,
-            )
+            let bounds = state.last_bounds.unwrap();
+            let x = bounds.origin.x + layout.line_number_width
+                - LINE_NUMBER_RIGHT_MARGIN
+                - FOLD_ICON_HITBOX_WIDTH
+                + (FOLD_ICON_HITBOX_WIDTH - FOLD_ICON_WIDTH).half()
+                + FOLD_ICON_WIDTH.half();
+            point(x, bounds.origin.y + layout.visible_top + layout.line_height.half())
         });
-        let chevron = Bounds::new(
-            point(gutter + px(10.), top + line_height),
-            size(px(14.), line_height),
+
+        cx.simulate_mouse_down(chevron, MouseButton::Left, gpui::Modifiers::default());
+        cx.simulate_mouse_up(chevron, MouseButton::Left, gpui::Modifiers::default());
+        cx.run_until_parked();
+        assert!(
+            editor.read_with(&cx, |state, _| state.display_map.is_folded_at(0)),
+            "the chevron folds"
         );
-        // Set after the frame: these rows have no fold for paint to record.
-        cx.update(|_, cx| {
-            editor.update(cx, |state, _| state.last_fold_icon_bounds = vec![chevron])
-        });
-        editor.read_with(&cx, |state, _| {
-            let y = top + line_height * 1.5;
-            assert_eq!(
-                state.gutter_row_at(point(gutter + px(12.), y), MouseButton::Left),
-                None,
-                "on the chevron"
-            );
-            assert_eq!(
-                state.gutter_row_at(point(gutter + px(12.), y), MouseButton::Right),
-                Some(1),
-                "a right press on the chevron"
-            );
-            assert_eq!(state.gutter_row_at(point(gutter, y), MouseButton::Left), Some(1), "beside it");
-        });
+        assert_eq!(*seen.borrow(), vec![], "a left press on the chevron");
+
+        cx.simulate_mouse_down(chevron, MouseButton::Right, gpui::Modifiers::default());
+        cx.simulate_mouse_up(chevron, MouseButton::Right, gpui::Modifiers::default());
+        cx.run_until_parked();
+        assert_eq!(*seen.borrow(), vec![(0, MouseButton::Right)], "a right press on the chevron");
     }
 
     fn numbered_editor(

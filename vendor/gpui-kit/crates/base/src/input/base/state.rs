@@ -634,11 +634,10 @@ pub struct InputBaseState<M: InputModeKind> {
     reported_selections_generation: u64,
     /// HERDR: the inline-completion ghost block of the last frame: the
     /// buffer row it is drawn under and its height. Rows after it are drawn
-    /// that much lower.
-    pub(super) last_ghost_block: Option<(usize, Pixels)>,
-    /// HERDR: the fold chevrons painted in the last frame, where they take
-    /// presses (window coordinates).
-    pub(super) last_fold_icon_bounds: Vec<Bounds<Pixels>>,
+    /// that much lower. Cleared with the completion, so `scroll_to_row` and
+    /// `row_bounds` in the same handler don't count lines the next frame
+    /// won't draw.
+    pub(in crate::input) last_ghost_block: Option<(usize, Pixels)>,
 
     pub(super) auto_scroll: AutoScroll,
 }
@@ -979,7 +978,6 @@ impl<M: InputModeKind> InputBaseState<M> {
             reported_selections: vec![SelectionRange { range: 0..0, reversed: false }],
             reported_selections_generation: 0,
             last_ghost_block: None,
-            last_fold_icon_bounds: Vec::new(),
             _pending_update: false,
             cursor_line_end_affinity: false,
             auto_scroll: AutoScroll::default(),
@@ -2550,6 +2548,10 @@ impl<M: InputModeKind> InputBaseState<M> {
         // selection (Root) so it does not start a drag from here.
         crate::global_state::GlobalState::suppress_text_selection(cx);
 
+        // Measured on the frame that was pressed, ghost lines included,
+        // before clearing the completion drops them. A left press on a fold
+        // chevron never gets here: the chevron stops it.
+        let gutter_row = self.gutter_row_at(event.position);
         // Clear inline completion on any mouse interaction
         M::clear_inline_completion(self, cx);
         // A tap on the touch selection asks for its menu back. Any other press
@@ -2575,7 +2577,7 @@ impl<M: InputModeKind> InputBaseState<M> {
         let (offset, line_end_affinity, columns_past_line_end) =
             self.resolve_mouse_position(event.position);
 
-        if let Some(row) = self.gutter_row_at(event.position, event.button) {
+        if let Some(row) = gutter_row {
             cx.emit(InputEvent::GutterClick {
                 row,
                 button: event.button,
@@ -2924,7 +2926,9 @@ impl<M: InputModeKind> InputBaseState<M> {
 
     /// HERDR: where the view will be after the next frame: a scroll queued
     /// in this handler (clamped to what the text can reach, since
-    /// `set_scroll_offset` stores any offset), or the current one.
+    /// `set_scroll_offset` stores any offset), or the current one. Before
+    /// the first layout a row or caret scroll has no offset yet and isn't
+    /// counted.
     pub fn queued_scroll_offset(&self) -> Point<Pixels> {
         let Some(mut offset) = self.deferred_scroll_offset() else {
             return self.scroll_handle.offset();
@@ -3357,6 +3361,12 @@ impl<M: InputModeKind> InputBaseState<M> {
     /// Non-empty ranges expand to character boundaries. Empty ranges remain empty and are
     /// clipped to the preceding character boundary.
     pub fn set_selected_range(&mut self, range: Range<usize>, cx: &mut Context<Self>) {
+        self.select_range(range, false, cx);
+    }
+
+    /// [`Self::set_selected_range`] with the caret at the start when
+    /// `reversed` (and the range isn't empty).
+    fn select_range(&mut self, range: Range<usize>, reversed: bool, cx: &mut Context<Self>) {
         let range = self.normalize_token_range(range);
         let end_bias = if range.start == range.end {
             Bias::Left
@@ -3366,10 +3376,11 @@ impl<M: InputModeKind> InputBaseState<M> {
         let start = self.text.clip_offset(range.start, Bias::Left);
         let end = self.text.clip_offset(range.end, end_bias);
 
-        self.move_to(start, None, cx);
+        let (anchor, caret) = if reversed { (end, start) } else { (start, end) };
+        self.move_to(anchor, None, cx);
         self.active_selection_mut().reversed = false;
         self.selected_word_range = None;
-        self.select_to(end, cx);
+        self.select_to(caret, cx);
     }
 
     /// Add `range` as an additional selection, keeping the existing ones —
@@ -3395,12 +3406,8 @@ impl<M: InputModeKind> InputBaseState<M> {
     /// [`Self::add_selection`], keeping which side the caret is on.
     pub fn add_selection_range(&mut self, selection: SelectionRange, cx: &mut Context<Self>) {
         if !self.is_multi_line() {
-            if selection.reversed {
-                self.set_selections(vec![selection], cx);
-            } else {
-                // The path `add_selection` has always taken on single-line inputs.
-                self.set_selected_range(selection.range, cx);
-            }
+            // The path `add_selection` has always taken on single-line inputs.
+            self.select_range(selection.range, selection.reversed, cx);
             return;
         }
 
@@ -3415,6 +3422,14 @@ impl<M: InputModeKind> InputBaseState<M> {
         let id = added.id;
         self.selections.add(added);
         self.selections.merge_overlapping();
+        // Merging into an earlier selection drops the added id: reveal the
+        // selection that now covers the added range instead.
+        let id = self
+            .selections
+            .iter()
+            .find(|sel| sel.id == id)
+            .or_else(|| self.selections.iter().find(|sel| sel.start <= start && end <= sel.end))
+            .map_or(id, |sel| sel.id);
         self.reveal_caret(id, cx);
         cx.notify();
     }
@@ -3625,17 +3640,13 @@ impl<M: InputModeKind> InputBaseState<M> {
             .contains(&position)
     }
 
-    /// The buffer row whose line number a `button` press at `position` is
-    /// on: `None` outside the gutter or in its padding, for a left press on a
-    /// fold chevron (it takes those itself), or off every laid-out row (the
+    /// The buffer row whose line number a press at `position` is on: `None`
+    /// outside the gutter or in its padding, or off every laid-out row (the
     /// ghost lines of an inline completion, or the empty space below the
     /// last line). Rows are measured like [`Self::resolve_mouse_position`],
     /// so it matches where the caret goes.
-    pub(super) fn gutter_row_at(&self, position: Point<Pixels>, button: MouseButton) -> Option<usize> {
-        if !self.is_in_gutter(position)
-            || (button == MouseButton::Left
-                && self.last_fold_icon_bounds.iter().any(|icon| icon.contains(&position)))
-        {
+    pub(super) fn gutter_row_at(&self, position: Point<Pixels>) -> Option<usize> {
+        if !self.is_in_gutter(position) {
             return None;
         }
         let (bounds, layout) = (self.last_bounds.as_ref()?, self.last_layout.as_ref()?);
@@ -3667,27 +3678,10 @@ impl<M: InputModeKind> InputBaseState<M> {
         Some((top, line_height * rows.len()))
     }
 
-    /// Whether the selections still match the last report. Runs on every
-    /// notify (cursor blink included), so it compares without allocating.
+    /// Whether the selections still match the last report.
+    #[cfg(test)]
     fn selections_match_reported(&self) -> bool {
-        let reported = &self.reported_selections;
-        if reported.len() != self.selections.len() {
-            return false;
-        }
-        // `reported` is in `selections()` order: active first, then by
-        // (start, end).
-        let mut rest = self.selections.iter();
-        let Some(active) = rest.next() else {
-            return reported.is_empty();
-        };
-        if reported[0] != Self::selection_range(active) {
-            return false;
-        }
-        rest.all(|sel| {
-            reported[1..]
-                .binary_search_by_key(&(sel.start, sel.end), |r| (r.range.start, r.range.end))
-                .is_ok_and(|i| reported[1 + i] == Self::selection_range(sel))
-        })
+        self.reported_selections == self.selections()
     }
 
     fn mark_selections_reported(&mut self) {
@@ -3695,9 +3689,7 @@ impl<M: InputModeKind> InputBaseState<M> {
             return;
         }
         self.reported_selections_generation = self.selections.generation();
-        if !self.selections_match_reported() {
-            self.reported_selections = self.selections();
-        }
+        self.reported_selections = self.selections();
     }
 
     /// Runs on every notify. Every selection mutation goes through
@@ -3714,10 +3706,14 @@ impl<M: InputModeKind> InputBaseState<M> {
             return;
         }
         self.reported_selections_generation = generation;
-        if self.selections_match_reported() {
+        // Compared whole, in `selections()` order, so two equal carets can't
+        // both stand for one reported entry. Only a selection mutation gets
+        // here, so a cursor blink doesn't pay for the allocation.
+        let current = self.selections();
+        if current == self.reported_selections {
             return;
         }
-        self.reported_selections = self.selections();
+        self.reported_selections = current;
         cx.emit(InputEvent::SelectionChange);
     }
 
@@ -8108,7 +8104,7 @@ mod tests {
         for caret_first in [true, false] {
             input_view.input.update_in(&mut cx, |state, _, cx| {
                 state.set_selected_range(0..0, cx);
-                let mut add = |state: &mut InputBaseState<TextareaMode>, start, end| {
+                let add = |state: &mut InputBaseState<TextareaMode>, start, end| {
                     let id = state.selections.generate_id();
                     state.selections.add(CursorSelection::new(id, start, end));
                 };
@@ -8124,6 +8120,28 @@ mod tests {
                 assert!(state.selections_match_reported(), "caret first: {caret_first}");
             });
         }
+    }
+
+    /// HERDR: two equal carets don't both stand for one reported entry, so
+    /// moving the caret that differed is still a change.
+    #[gpui::test]
+    fn equal_carets_dont_hide_a_moved_one(cx: &mut TestAppContext) {
+        let input_view = InputView::build_textarea(cx, |state| state.default_value("alpha beta gamma"));
+        let mut cx = VisualTestContext::from_window(input_view.window_handle.into(), cx);
+        input_view.input.update_in(&mut cx, |state, _, cx| {
+            state.set_selected_range(0..0, cx);
+            let add = |state: &mut InputBaseState<TextareaMode>, at| {
+                let id = state.selections.generate_id();
+                state.selections.add(CursorSelection::new(id, at, at));
+            };
+            add(state, 5);
+            add(state, 12);
+            state.reported_selections = state.selections();
+            state.selections.remove_all_but_active();
+            add(state, 5);
+            add(state, 5);
+            assert!(!state.selections_match_reported());
+        });
     }
 
     /// HERDR: only code editors report selection changes and scrolls.

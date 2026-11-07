@@ -3184,7 +3184,8 @@ const BASE: &str = r#"  /** A row. */
      * Defaults to "nearest". */
     scroll_to_row(row: number, align?: "nearest" | "top" | "center"): void;
     /** Pixels scrolled from the top left, counting a scroll asked for earlier in the same
-     * handler (`scroll_to_row`, `set_selections`); `line_height` is null before the first layout. */
+     * handler (`scroll_to_row`, `set_selections`). Before the first layout `line_height` is
+     * null and such a scroll is still waiting: it isn't counted until the editor is laid out. */
     scroll_position(): { top: number; left: number; line_height: number | null };
     /** Pixels from the top of the visible text area; null before layout or inside a fold.
      * A soft-wrapped row is taller than one line. Counts a scroll asked for earlier in the
