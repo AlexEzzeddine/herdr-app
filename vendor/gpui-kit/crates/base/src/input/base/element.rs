@@ -939,7 +939,7 @@ impl<M: InputModeKind> TextElement<M> {
         cx: &mut App,
     ) -> Vec<Path<Pixels>> {
         let state = self.state.read(cx);
-        if !state.has_selection_focus(window, cx) {
+        if !state.show_unfocused_selection && !state.has_selection_focus(window, cx) {
             return vec![];
         }
 
@@ -3315,6 +3315,14 @@ impl<M: InputModeKind> Element for TextElement<M> {
             state.scroll_size = prepaint.scroll_size;
             state.update_scroll_offset(Some(prepaint.cursor_scroll_offset), cx);
             state.deferred_scroll_offset = None;
+            state.apply_pending_scroll_row(cx);
+            let scroll = state.scroll_handle.offset();
+            if scroll != state.reported_scroll {
+                state.reported_scroll = scroll;
+                if state.emit_events {
+                    cx.emit(crate::input::InputEvent::Scroll);
+                }
+            }
 
             // Layout consumers need changed geometry, not another notification
             // for every paint of an unchanged input.
@@ -3592,7 +3600,7 @@ fn split_runs_by_bg_segments(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::input::{EditorMode, EditorState, FoldRange, RangeDecoration, Redo, Undo};
+    use crate::input::{EditorMode, EditorState, FoldRange, InputEvent, RangeDecoration, Redo, Undo};
     use gpui::{
         AppContext as _, Context, EntityInputHandler as _, Render, TestAppContext,
         VisualTestContext, div,
@@ -3643,6 +3651,60 @@ mod tests {
             DecorationHarness(state)
         });
         (editor.unwrap(), window)
+    }
+
+    // HERDR: selections chosen by code (a review's lines) can stay visible unfocused.
+    #[gpui::test]
+    fn unfocused_selections_paint_when_asked(cx: &mut TestAppContext) {
+        let (editor, window) = decoration_editor(cx, "alpha\nbeta\ngamma", false);
+        let mut cx = VisualTestContext::from_window(window.into(), cx);
+        cx.update(|window, cx| {
+            editor.update(cx, |state, cx| {
+                state.set_selections(vec![0..5, 11..16], cx);
+            });
+            let selection_paths = |window: &mut Window, cx: &mut App| {
+                window.draw(cx).clear(cx);
+                let state = editor.read(cx);
+                let layout = state.last_layout.clone().unwrap();
+                let mut bounds = state.input_bounds;
+                TextElement::new(editor.clone()).layout_selections(&layout, &mut bounds, window, cx)
+            };
+            assert!(!editor.read(cx).focus_handle.is_focused(window));
+            assert!(selection_paths(window, cx).is_empty());
+
+            editor.update(cx, |state, cx| state.set_show_unfocused_selection(true, cx));
+            assert_eq!(selection_paths(window, cx).len(), 2);
+        });
+    }
+
+    // HERDR: a scroll is reported after the frame that applies it.
+    #[gpui::test]
+    fn scrolling_to_a_row_reports_a_scroll_with_current_bounds(cx: &mut TestAppContext) {
+        let text = (0..60).map(|i| format!("line {i}")).collect::<Vec<_>>().join("\n");
+        let (editor, window) = decoration_editor(cx, &text, false);
+        let mut cx = VisualTestContext::from_window(window.into(), cx);
+        let seen = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        cx.update(|window, cx| {
+            let seen = seen.clone();
+            window
+                .subscribe(&editor, cx, move |editor, event: &InputEvent, _, cx| {
+                    if matches!(event, InputEvent::Scroll) {
+                        seen.borrow_mut().push(editor.read(cx).row_bounds(40));
+                    }
+                })
+                .detach();
+            window.draw(cx).clear(cx);
+            editor.update(cx, |state, cx| {
+                state.scroll_to_row(40, crate::input::RowScrollAlign::Top, cx)
+            });
+            window.draw(cx).clear(cx);
+        });
+        cx.run_until_parked();
+        let seen = seen.borrow();
+        assert_eq!(seen.len(), 1, "one scroll, reported once");
+        let (top, height) = seen[0].expect("row 40 is laid out");
+        assert_eq!(top, px(0.), "row 40 is at the top when the handler reads it");
+        assert!(height > px(0.));
     }
 
     #[gpui::test]

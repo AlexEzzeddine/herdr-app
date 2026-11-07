@@ -3879,7 +3879,12 @@ impl ShellRuntime {
                     payload.set("secondary", *secondary)?;
                     payload.set("shift", *shift)?;
                 }
-                InputEvent::Change | InputEvent::Focus | InputEvent::Blur | InputEvent::PasteWithoutText => {}
+                InputEvent::Change
+                | InputEvent::Focus
+                | InputEvent::Blur
+                | InputEvent::PasteWithoutText
+                | InputEvent::SelectionChange
+                | InputEvent::Scroll => {}
             }
             handler.call::<_, ()>((
                 payload,
@@ -7035,6 +7040,15 @@ globalThis.__gpui = (() => {
           value: () => __editor_value(handle),
           set_value: (value) => __editor_set_value(handle, String(value)),
           on: (event, handler) => __editor_on(handle, String(event), handler),
+          selections: () => JSON.parse(__editor_selections(handle)),
+          set_selections: (ranges) =>
+            __editor_set_selections(handle, JSON.stringify(Array.from(ranges)), false),
+          add_selection: (range) =>
+            __editor_set_selections(handle, JSON.stringify([range]), true),
+          scroll_to_row: (row, align) =>
+            __editor_scroll_to_row(handle, Number(row), String(align ?? "nearest")),
+          scroll_position: () => JSON.parse(__editor_scroll_position(handle)),
+          row_bounds: (row) => JSON.parse(__editor_row_bounds(handle, Number(row))),
           release: () => __editor_release(handle),
         };
       },

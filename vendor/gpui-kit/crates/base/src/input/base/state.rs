@@ -123,6 +123,33 @@ actions!(
     ]
 );
 
+/// Where [`InputBaseState::scroll_to_row`] places the row in the viewport.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum RowScrollAlign {
+    /// Scroll as little as possible to make the row visible.
+    #[default]
+    Nearest,
+    /// Put the row at the top of the viewport.
+    Top,
+    /// Center the row in the viewport.
+    Center,
+}
+
+/// One selection as a byte range, with the side its caret is on.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SelectionRange {
+    pub range: Range<usize>,
+    /// The caret is at `range.start` (the selection was made backwards).
+    pub reversed: bool,
+}
+
+impl SelectionRange {
+    /// Byte offset of the caret.
+    pub fn head(&self) -> usize {
+        if self.reversed { self.range.start } else { self.range.end }
+    }
+}
+
 #[derive(Clone)]
 pub enum InputEvent {
     Change,
@@ -131,6 +158,12 @@ pub enum InputEvent {
     Blur,
     /// A paste found no text on the clipboard (an image, say): the owner may read it.
     PasteWithoutText,
+    /// The selections or carets moved, were added, or were removed.
+    /// Read them with [`InputBaseState::selections`].
+    SelectionChange,
+    /// The view scrolled (by the user, by code, or to follow the caret).
+    /// Emitted after the frame that applied it, so layout reads are current.
+    Scroll,
 }
 
 pub(super) const CONTEXT: &str = "Input";
@@ -489,6 +522,13 @@ pub struct InputBaseState<M: InputModeKind> {
     pub(crate) scroll_handle: ScrollHandle,
     /// The deferred scroll offset to apply on next layout.
     pub(crate) deferred_scroll_offset: Option<Point<Pixels>>,
+    /// A [`Self::scroll_to_row`] asked for before the first layout, applied
+    /// once there is one.
+    pub(crate) pending_scroll_row: Option<(usize, RowScrollAlign)>,
+    /// Paint selections even while another element has focus.
+    pub(crate) show_unfocused_selection: bool,
+    /// The scroll offset last reported by [`InputEvent::Scroll`].
+    pub(crate) reported_scroll: Point<Pixels>,
     /// The size of the scrollable content.
     pub(crate) scroll_size: gpui::Size<Pixels>,
     pub(super) editor_scrollbar_snapshot: Cell<Option<EditorScrollbarSnapshot>>,
@@ -549,6 +589,8 @@ pub struct InputBaseState<M: InputModeKind> {
     pub(super) emit_events: bool,
 
     _subscriptions: Vec<Subscription>,
+    /// The selections last reported by [`InputEvent::SelectionChange`].
+    reported_selections: Vec<SelectionRange>,
 
     pub(super) auto_scroll: AutoScroll,
 }
@@ -797,6 +839,9 @@ impl<M: InputModeKind> InputBaseState<M> {
             }),
             cx.on_focus(&focus_handle, window, Self::on_focus),
             cx.on_blur(&focus_handle, window, Self::on_blur),
+            // Every selection mutation notifies; compare once here rather
+            // than emitting from each of them.
+            cx.observe_self(Self::report_selection_change),
         ];
 
         let text_style = window.text_style();
@@ -860,6 +905,9 @@ impl<M: InputModeKind> InputBaseState<M> {
             longest_line_width: Cell::new(None),
             editor_paddings: Edges::default(),
             deferred_scroll_offset: None,
+            pending_scroll_row: None,
+            show_unfocused_selection: false,
+            reported_scroll: point(px(0.), px(0.)),
             placeholder: SharedString::default(),
             mask_pattern: MaskPattern::default(),
             mask_pattern_set: false,
@@ -874,6 +922,7 @@ impl<M: InputModeKind> InputBaseState<M> {
             silent_replace_text: false,
             emit_events: true,
             _subscriptions,
+            reported_selections: vec![SelectionRange { range: 0..0, reversed: false }],
             _pending_update: false,
             cursor_line_end_affinity: false,
             auto_scroll: AutoScroll::default(),
@@ -3211,6 +3260,126 @@ impl<M: InputModeKind> InputBaseState<M> {
         self.selections.merge_overlapping();
         self.scroll_to(end, None, cx);
         cx.notify();
+    }
+
+    /// Keep painting selections while the input is not focused, so a
+    /// selection set by code (a review's chosen lines) stays visible.
+    pub fn set_show_unfocused_selection(&mut self, show: bool, cx: &mut Context<Self>) {
+        if self.show_unfocused_selection != show {
+            self.show_unfocused_selection = show;
+            cx.notify();
+        }
+    }
+
+    /// Every selection, the active (primary) one first, the rest in the
+    /// order they were added.
+    pub fn selections(&self) -> Vec<SelectionRange> {
+        let active = self.selections.active().id;
+        let mut out: Vec<SelectionRange> = Vec::with_capacity(self.selections.len());
+        for sel in self.selections.iter() {
+            let item = SelectionRange {
+                range: sel.start..sel.end,
+                reversed: sel.reversed,
+            };
+            if sel.id == active {
+                out.insert(0, item);
+            } else {
+                out.push(item);
+            }
+        }
+        out
+    }
+
+    /// Replace every selection. The first range becomes the active one and the
+    /// view scrolls to it; an empty list leaves the selections unchanged.
+    ///
+    /// Ranges are clipped and snapped like [`Self::set_selected_range`];
+    /// overlapping ones are merged.
+    pub fn set_selections(&mut self, ranges: Vec<Range<usize>>, cx: &mut Context<Self>) {
+        let mut ranges = ranges.into_iter();
+        let Some(first) = ranges.next() else {
+            return;
+        };
+        self.set_selected_range(first, cx);
+        let primary = self.selections.active().end;
+        for range in ranges {
+            self.add_selection(range, cx);
+        }
+        self.scroll_to(primary, None, cx);
+        cx.notify();
+    }
+
+    /// Scroll so buffer `row` (0-based, clamped to the document) is in view.
+    ///
+    /// Before the first layout the request is kept and applied after it.
+    pub fn scroll_to_row(&mut self, row: usize, align: RowScrollAlign, cx: &mut Context<Self>) {
+        let row = row.min(self.text.lines_len().saturating_sub(1));
+        if self.last_layout.is_none() || self.last_bounds.is_none() {
+            self.pending_scroll_row = Some((row, align));
+            cx.notify();
+            return;
+        }
+        self.pending_scroll_row = None;
+        if align == RowScrollAlign::Nearest {
+            let offset = self.text.line_start_offset(row);
+            self.scroll_to_with_padding(offset, None, ScrollPadding::Minimal, cx);
+            return;
+        }
+        let (Some(layout), Some(bounds)) = (self.last_layout.as_ref(), self.last_bounds) else {
+            return;
+        };
+        let line_height = layout.line_height;
+        let rows = self
+            .display_map
+            .buffer_line_to_display_row_range(row)
+            .unwrap_or_else(|| {
+                let start = self.display_map.buffer_line_to_display_row(row);
+                start..start + 1
+            });
+        let top = line_height * rows.start;
+        let target = match align {
+            RowScrollAlign::Center => {
+                top - (bounds.size.height - line_height * rows.len()) / 2.
+            }
+            _ => top,
+        };
+        let mut scroll_offset = self.scroll_handle.offset();
+        let safe_y_min = (-self.scroll_size.height + self.input_bounds.size.height).min(px(0.));
+        scroll_offset.y = (-target).clamp(safe_y_min, px(0.));
+        self.deferred_scroll_offset = Some(scroll_offset);
+        cx.notify();
+    }
+
+    /// Where buffer `row` sits vertically, relative to the top of the visible
+    /// text area: `(top, height)`. `top` is negative or past the viewport when
+    /// the row is scrolled out of view; a soft-wrapped row is taller than one
+    /// line. `None` before the first layout or when a fold hides the row.
+    pub fn row_bounds(&self, row: usize) -> Option<(Pixels, Pixels)> {
+        let line_height = self.last_layout.as_ref()?.line_height;
+        if row >= self.text.lines_len() {
+            return None;
+        }
+        let rows = self.display_map.buffer_line_to_display_row_range(row)?;
+        let top = line_height * rows.start + self.scroll_handle.offset().y;
+        Some((top, line_height * rows.len()))
+    }
+
+    fn report_selection_change(&mut self, cx: &mut Context<Self>) {
+        let current = self.selections();
+        if current == self.reported_selections {
+            return;
+        }
+        self.reported_selections = current;
+        if self.emit_events {
+            cx.emit(InputEvent::SelectionChange);
+        }
+    }
+
+    /// Apply a [`Self::scroll_to_row`] that arrived before layout.
+    pub(super) fn apply_pending_scroll_row(&mut self, cx: &mut Context<Self>) {
+        if let Some((row, align)) = self.pending_scroll_row.take() {
+            self.scroll_to_row(row, align, cx);
+        }
     }
 
     /// Resolve a mouse position to a byte offset in the text.

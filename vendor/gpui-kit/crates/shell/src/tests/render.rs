@@ -5739,6 +5739,90 @@ export default class Code extends View {
     assert!(tree.contains("changes=1"), "{tree}");
 }
 
+// HERDR: scripts read and set multiple selections by row/col and scroll to rows.
+#[gpui::test]
+fn a_script_editor_reads_sets_and_scrolls_to_selections(cx: &mut TestAppContext) {
+    cx.update(|cx| crate::init(cx));
+    let runtime = ShellRuntime::new_isolated().expect("runtime");
+    cx.update(|cx| runtime.set_global(cx));
+    let source = r##"
+import { View, div } from "gpui-kit";
+import { Editor, EditorState } from "gpui-base";
+export default class Code extends View {
+  init() {
+    const lines = [];
+    for (let i = 0; i < 80; i++) lines.push(i === 3 ? "a😀bc" : "line " + i);
+    this.code = EditorState.new({
+      language: "rust", value: lines.join("\n"), show_unfocused_selection: true,
+    });
+    this.selection_events = 0;
+    this.scroll_seen = [];
+    this.code.on("scroll", () => { this.scroll_seen.push(this.code.row_bounds(60)?.top); });
+    this.code.on("selection_change", () => { this.selection_events += 1; });
+    this.code.set_selections([
+      { start: { row: 3, col: 3 }, end: { row: 3, col: 5 } },
+      { start: { row: 10, col: 0 }, end: { row: 12, col: 2 } },
+    ]);
+    this.code.add_selection({ start: { row: 20, col: 1 }, end: { row: 20, col: 1 } });
+    this.code.scroll_to_row(60, "top");
+  }
+  render(cx) {
+    return div()
+      .child(Editor.new(this.code).h(200))
+      .child("sel=" + JSON.stringify(this.code.selections()))
+      .child("events=" + this.selection_events)
+      .child("row60=" + JSON.stringify(this.code.row_bounds(60)))
+      .child("scrolled=" + (this.code.scroll_position().top > 0))
+      .child("scroll_seen=" + JSON.stringify(this.scroll_seen));
+  }
+}
+"##;
+    let view_type = runtime.load_source("selections", source).expect("load");
+    let window = cx.add_window(|_, _| Empty);
+    let mut context = VisualTestContext::from_window(*window.deref(), cx);
+    let object = context
+        .update(|window, cx| runtime.instantiate(&view_type, window, cx))
+        .expect("instantiate");
+    let view = context.update(|_, cx| cx.new(|_| ScriptView::new(runtime.clone(), object.clone())));
+    for _ in 0..3 {
+        draw(&mut context, &view);
+    }
+    let editor = runtime.entities().first_editor().expect("editor");
+    context.update(|_, cx| {
+        let state = editor.read(cx);
+        let text = state.value().to_string();
+        let selections = state.selections();
+        assert_eq!(selections.len(), 3);
+        // The emoji is two UTF-16 units, so col 3..5 is "bc".
+        assert_eq!(&text[selections[0].range.clone()], "bc");
+        assert!(f32::from(state.scroll_offset().y) < 0., "scrolled to row 60");
+    });
+    let tree = context
+        .update(|window, cx| runtime.render_to_spec(&object, None, window, cx))
+        .expect("render")
+        .replace("\\\"", "\"");
+    assert!(
+        tree.contains(r#"{"start":{"row":3,"col":3},"end":{"row":3,"col":5},"head":{"row":3,"col":5},"primary":true}"#),
+        "{tree}"
+    );
+    assert!(tree.contains(r#"{"start":{"row":20,"col":1},"end":{"row":20,"col":1},"head":{"row":20,"col":1},"primary":false}"#), "{tree}");
+    assert!(tree.contains("scrolled=true"), "{tree}");
+    // Scrolled to the top, row 60 starts the visible text.
+    assert!(tree.contains(r#"row60={"top":0,"#), "{tree}");
+    assert!(!tree.contains("events=0"), "{tree}");
+    // The scroll handler already saw row 60 at the top.
+    assert!(tree.contains("scroll_seen=[0]"), "{tree}");
+
+    // A user moving the caret is reported too.
+    context.update(|_, cx| editor.update(cx, |state, cx| state.set_selected_range(0..0, cx)));
+    draw(&mut context, &view);
+    let tree = context
+        .update(|window, cx| runtime.render_to_spec(&object, None, window, cx))
+        .expect("render")
+        .replace("\\\"", "\"");
+    assert!(tree.contains(r#"sel=[{"start":{"row":0,"col":0},"end":{"row":0,"col":0}"#), "{tree}");
+}
+
 // HERDR: readonly rejects keyboard edits without disabling selection or programmatic refresh.
 #[gpui::test]
 fn a_readonly_script_editor_remains_selectable(cx: &mut TestAppContext) {

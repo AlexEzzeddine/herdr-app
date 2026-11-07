@@ -3145,8 +3145,37 @@ const BASE: &str = r#"  /** A row. */
     value(): string;
     /** Programmatic replacement works even in readonly mode. */
     set_value(value: string): void;
-    on(event: "change" | "submit" | "focus" | "blur" | "paste_other", handler: (event: InputEvent, cx: Context) => void): boolean;
+    /** `selection_change`: selections or carets moved, were added or removed; read `selections()`.
+     * `scroll`: the view scrolled; `scroll_position()` and `row_bounds()` are current in the handler. */
+    on(event: "change" | "submit" | "focus" | "blur" | "paste_other" | "selection_change" | "scroll", handler: (event: InputEvent, cx: Context) => void): boolean;
+    /** Every selection, the primary one first. An empty selection is a caret. */
+    selections(): EditorSelection[];
+    /** Replaces every selection; the first becomes primary and is scrolled into view. */
+    set_selections(ranges: EditorRange[]): void;
+    /** Adds a selection (like Alt-click), keeping the others. */
+    add_selection(range: EditorRange): void;
+    /** Before the first layout the request waits for it. Defaults to "nearest". */
+    scroll_to_row(row: number, align?: "nearest" | "top" | "center"): void;
+    /** Pixels scrolled from the top left; `line_height` is null before the first layout. */
+    scroll_position(): { top: number; left: number; line_height: number | null };
+    /** Pixels from the top of the visible text area; null before layout or inside a fold.
+     * A soft-wrapped row is taller than one line. */
+    row_bounds(row: number): { top: number; height: number } | null;
     release(): boolean;
+  }
+  /** 0-based; `col` counts UTF-16 code units, so it indexes the line as a JS string. */
+  export interface EditorPosition {
+    row: number;
+    col: number;
+  }
+  export interface EditorRange {
+    start: EditorPosition;
+    end: EditorPosition;
+  }
+  export interface EditorSelection extends EditorRange {
+    /** Where the caret is: `start` or `end`. */
+    head: EditorPosition;
+    primary: boolean;
   }
   export const EditorState: {
     new: (options?: {
@@ -3164,6 +3193,8 @@ const BASE: &str = r#"  /** A row. */
       readonly?: boolean;
       /** Defaults to false. */
       soft_wrap?: boolean;
+      /** Keep showing selections while the editor is not focused (e.g. lines chosen by code). Defaults to false. */
+      show_unfocused_selection?: boolean;
       /** Semantic colors: keyword, string, comment, function, type, number,
        * constant, variable, operator, punctuation, boolean, string.escape.
        * Values are concrete hex colors; unspecified UI colors follow the theme. */

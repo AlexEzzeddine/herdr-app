@@ -497,6 +497,140 @@ pub fn install(ctx: &Ctx<'_>, module: &Object<'_>, runtime: Weak<ShellRuntime>) 
         ),
     )?;
 
+    // HERDR: selections and scrolling. Positions are 0-based { row, col },
+    // `col` in UTF-16 code units so it indexes the line as a JS string.
+    let read_selections = runtime.clone();
+    globals.set(
+        "__editor_selections",
+        Func::from(
+            move |ctx: Ctx<'_>, handle: EntityHandle| -> JsResult<String> {
+                let state = live_editor(&ctx, &read_selections, handle)?;
+                scope::with_current_app(|cx| {
+                    let state = state.read(cx);
+                    let text = state.text();
+                    let items: Vec<serde_json::Value> = state
+                        .selections()
+                        .into_iter()
+                        .enumerate()
+                        .map(|(index, selection)| {
+                            serde_json::json!({
+                                "start": editor_position(text, selection.range.start),
+                                "end": editor_position(text, selection.range.end),
+                                "head": editor_position(text, selection.head()),
+                                "primary": index == 0,
+                            })
+                        })
+                        .collect();
+                    serde_json::Value::Array(items).to_string()
+                })
+                .ok_or_else(|| needs_call(&ctx, "selections()"))
+            },
+        ),
+    )?;
+
+    let write_selections = runtime.clone();
+    globals.set(
+        "__editor_set_selections",
+        Func::from(
+            move |ctx: Ctx<'_>, handle: EntityHandle, json: String, add: bool| -> JsResult<()> {
+                let state = live_editor(&ctx, &write_selections, handle)?;
+                let ranges: Vec<EditorRange> = serde_json::from_str(&json).map_err(|error| {
+                    Exception::throw_type(
+                        &ctx,
+                        &format!("expected {{ start: {{ row, col }}, end: {{ row, col }} }}: {error}"),
+                    )
+                })?;
+                scope::with_current(|_, cx| {
+                    state.update(cx, |state, cx| {
+                        let ranges: Vec<_> = ranges
+                            .iter()
+                            .map(|range| {
+                                let start = editor_offset(state.text(), range.start);
+                                let end = editor_offset(state.text(), range.end);
+                                start.min(end)..start.max(end)
+                            })
+                            .collect();
+                        if add {
+                            for range in ranges {
+                                state.add_selection(range, cx);
+                            }
+                        } else {
+                            state.set_selections(ranges, cx);
+                        }
+                    })
+                })
+                .ok_or_else(|| needs_call(&ctx, "set_selections()"))
+            },
+        ),
+    )?;
+
+    let scroll_editor = runtime.clone();
+    globals.set(
+        "__editor_scroll_to_row",
+        Func::from(
+            move |ctx: Ctx<'_>, handle: EntityHandle, row: f64, align: String| -> JsResult<()> {
+                let state = live_editor(&ctx, &scroll_editor, handle)?;
+                let row = editor_row(&ctx, row)?;
+                let align = match align.as_str() {
+                    "nearest" => gpui_base::input::RowScrollAlign::Nearest,
+                    "top" => gpui_base::input::RowScrollAlign::Top,
+                    "center" => gpui_base::input::RowScrollAlign::Center,
+                    _ => {
+                        return Err(Exception::throw_type(
+                            &ctx,
+                            "scroll_to_row align must be \"nearest\", \"top\" or \"center\"",
+                        ));
+                    }
+                };
+                scope::with_current(|_, cx| {
+                    state.update(cx, |state, cx| state.scroll_to_row(row, align, cx))
+                })
+                .ok_or_else(|| needs_call(&ctx, "scroll_to_row()"))
+            },
+        ),
+    )?;
+
+    let read_scroll = runtime.clone();
+    globals.set(
+        "__editor_scroll_position",
+        Func::from(
+            move |ctx: Ctx<'_>, handle: EntityHandle| -> JsResult<String> {
+                let state = live_editor(&ctx, &read_scroll, handle)?;
+                scope::with_current_app(|cx| {
+                    let state = state.read(cx);
+                    let offset = state.scroll_offset();
+                    serde_json::json!({
+                        "top": -f32::from(offset.y),
+                        "left": -f32::from(offset.x),
+                        "line_height": state.line_height().map(f32::from),
+                    })
+                    .to_string()
+                })
+                .ok_or_else(|| needs_call(&ctx, "scroll_position()"))
+            },
+        ),
+    )?;
+
+    let read_row = runtime.clone();
+    globals.set(
+        "__editor_row_bounds",
+        Func::from(
+            move |ctx: Ctx<'_>, handle: EntityHandle, row: f64| -> JsResult<String> {
+                let state = live_editor(&ctx, &read_row, handle)?;
+                let row = editor_row(&ctx, row)?;
+                scope::with_current_app(|cx| match state.read(cx).row_bounds(row) {
+                    Some((top, height)) => serde_json::json!({
+                        "top": f32::from(top),
+                        "height": f32::from(height),
+                    })
+                    .to_string(),
+                    None => "null".to_string(),
+                })
+                .ok_or_else(|| needs_call(&ctx, "row_bounds()"))
+            },
+        ),
+    )?;
+
     let subscribe_editor = runtime.clone();
     globals.set(
         "__editor_on",
@@ -1797,4 +1931,44 @@ fn needs_call(ctx: &Ctx<'_>, what: &str) -> rquickjs::Error {
         ctx,
         &format!("{what} needs a live host call; call it from render or an event handler"),
     )
+}
+
+// HERDR: editor positions crossing to scripts.
+#[derive(Clone, Copy, serde::Deserialize)]
+struct EditorPosition {
+    row: usize,
+    col: usize,
+}
+
+#[derive(serde::Deserialize)]
+struct EditorRange {
+    start: EditorPosition,
+    end: EditorPosition,
+}
+
+fn editor_row(ctx: &Ctx<'_>, row: f64) -> JsResult<usize> {
+    if !row.is_finite() || row < 0. || row.fract() != 0. {
+        return Err(Exception::throw_range(ctx, "row must be a non-negative integer"));
+    }
+    Ok(row as usize)
+}
+
+/// `{ row, col }` of a byte offset, `col` in UTF-16 code units.
+fn editor_position(text: &gpui_base::input::Rope, offset: usize) -> serde_json::Value {
+    use gpui_base::input::RopeExt as _;
+    let point = text.offset_to_point(offset);
+    let col = text.slice_line(point.row).byte_to_utf16_idx(point.column);
+    serde_json::json!({ "row": point.row, "col": col })
+}
+
+/// Byte offset of `{ row, col }`, clamped to the document and the line.
+fn editor_offset(text: &gpui_base::input::Rope, position: EditorPosition) -> usize {
+    use gpui_base::input::RopeExt as _;
+    let lines = text.lines_len().max(1);
+    if position.row >= lines {
+        return text.len();
+    }
+    let line = text.slice_line(position.row);
+    let col = position.col.min(line.len_utf16());
+    text.line_start_offset(position.row) + line.utf16_to_byte_idx(col)
 }

@@ -184,6 +184,8 @@ pub(crate) struct EditorOptions {
     pub syntax: HashMap<String, String>,
     pub font_family: Option<String>,
     pub font_size: Option<f32>,
+    /// HERDR: paint selections while unfocused.
+    pub show_unfocused_selection: bool,
 }
 
 impl Default for EditorOptions {
@@ -198,6 +200,7 @@ impl Default for EditorOptions {
             syntax: HashMap::new(),
             font_family: None,
             font_size: None,
+            show_unfocused_selection: false,
         }
     }
 }
@@ -462,6 +465,7 @@ impl EntityStore {
                 .folding(options.folding)
                 .soft_wrap(options.soft_wrap);
             state.set_readonly(options.readonly, cx);
+            state.set_show_unfocused_selection(options.show_unfocused_selection, cx);
             state.set_editor_style(style);
             state.set_highlighter_factory(
                 Rc::new(|language| {
@@ -1264,6 +1268,10 @@ pub enum InputEventName {
     Blur,
     /// A paste with no text on the clipboard (an image): the script reads it.
     PasteOther,
+    /// HERDR: selections or carets changed.
+    SelectionChange,
+    /// HERDR: the view scrolled.
+    Scroll,
 }
 
 impl InputEventName {
@@ -1274,11 +1282,21 @@ impl InputEventName {
             "focus" => Some(Self::Focus),
             "blur" => Some(Self::Blur),
             "paste_other" => Some(Self::PasteOther),
+            "selection_change" => Some(Self::SelectionChange),
+            "scroll" => Some(Self::Scroll),
             _ => None,
         }
     }
 
-    pub const NAMES: &'static [&'static str] = &["change", "submit", "focus", "blur", "paste_other"];
+    pub const NAMES: &'static [&'static str] = &[
+        "change",
+        "submit",
+        "focus",
+        "blur",
+        "paste_other",
+        "selection_change",
+        "scroll",
+    ];
 
     fn matches(self, event: &InputEvent) -> bool {
         matches!(
@@ -1288,6 +1306,8 @@ impl InputEventName {
                 | (Self::Focus, InputEvent::Focus)
                 | (Self::Blur, InputEvent::Blur)
                 | (Self::PasteOther, InputEvent::PasteWithoutText)
+                | (Self::SelectionChange, InputEvent::SelectionChange)
+                | (Self::Scroll, InputEvent::Scroll)
         )
     }
 }
