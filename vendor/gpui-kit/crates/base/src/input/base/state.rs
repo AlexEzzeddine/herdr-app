@@ -1125,9 +1125,16 @@ impl<M: InputModeKind> InputBaseState<M> {
         self.reset_selection();
         self.reset_lsp_state();
         self.reset_scroll_to_start();
-        // Selection reports run after the update, when `emit_events` is on
-        // again; mark the reset as already reported so it stays silent.
+        // A caret reveal asked for before layout points into the old text;
+        // a row request still applies (rows are clamped when applied).
+        if matches!(self.pending_scroll, Some(PendingScroll::Offset(_))) {
+            self.pending_scroll = None;
+        }
+        // Selection and scroll reports run after the update, when
+        // `emit_events` is on again; mark the resets as already reported so
+        // they stay silent.
         self.mark_selections_reported();
+        self.reported_scroll = self.scroll_handle.offset();
 
         self.undo_manager.clear();
         cx.notify();
@@ -2819,11 +2826,33 @@ impl<M: InputModeKind> InputBaseState<M> {
         // Clamp the deferred target into the same safe range that
         // `update_scroll_offset` enforces on persist, so paint never shows an
         // over-scrolled frame before the post-paint clamp pulls it back.
-        let safe_y_min = (-self.scroll_size.height + self.input_bounds.size.height).min(px(0.));
+        let safe_y_min = self.safe_scroll_y_min(line_height);
         scroll_offset.x = scroll_offset.x.min(px(0.));
         scroll_offset.y = scroll_offset.y.clamp(safe_y_min, px(0.));
         self.deferred_scroll_offset = Some(scroll_offset);
         cx.notify();
+    }
+
+    /// The lowest vertical scroll offset, from the current text rather than
+    /// the last frame's `scroll_size`: text set since that frame (a file
+    /// loaded and scrolled to in one handler) must be reachable. Matches the
+    /// height `TextElement` lays out, minus transient ghost lines.
+    /// Never tighter than the last frame's range (ghost lines included), so
+    /// existing scrolls keep their reach.
+    fn safe_scroll_y_min(&self, line_height: Pixels) -> Pixels {
+        let last_frame = (-self.scroll_size.height + self.input_bounds.size.height).min(px(0.));
+        let Some(bounds) = self.last_bounds else {
+            return last_frame;
+        };
+        let content = line_height * self.display_map.wrap_row_count()
+            + super::element::empty_bottom_height(
+                self.is_code_editor(),
+                self.scroll_beyond_last_line,
+                bounds.size.height,
+                line_height,
+            );
+        (-content.max(bounds.size.height) + self.input_bounds.size.height)
+            .min(last_frame)
     }
 
     pub(super) fn show_character_palette(
@@ -3270,27 +3299,23 @@ impl<M: InputModeKind> InputBaseState<M> {
     /// [`Self::add_selection`], keeping which side the caret is on.
     pub fn add_selection_range(&mut self, selection: SelectionRange, cx: &mut Context<Self>) {
         if !self.is_multi_line() {
-            self.set_selections(vec![selection], cx);
+            if selection.reversed {
+                self.set_selections(vec![selection], cx);
+            } else {
+                // The path `add_selection` has always taken on single-line inputs.
+                self.set_selected_range(selection.range, cx);
+            }
             return;
         }
 
-        let (start, end) = self.clip_selection_range(selection.range);
-
-        for sel in self.selections.iter() {
-            if sel.start <= start && end <= sel.end {
-                return;
-            }
+        let (start, end) = self.clip_selection_range(selection.range.clone());
+        if self.selections.iter().any(|sel| sel.start <= start && end <= sel.end) {
+            return;
         }
 
-        self.undo_manager.break_transaction_coalescing();
-        self.selected_word_range = None;
-        self.pause_blink_cursor(cx);
-        M::hide_context_menu(self, cx);
-        M::clear_inline_completion(self, cx);
+        self.begin_programmatic_selection(cx);
         let id = self.selections.generate_id();
-        let mut added = CursorSelection::new(id, start, end);
-        added.reversed = selection.reversed && start != end;
-        added.column_anchor = self.preferred_column_for(added.cursor_offset());
+        let added = self.build_selection(id, start, end, selection.reversed);
         let head = added.cursor_offset();
         self.selections.add(added);
         self.selections.merge_overlapping();
@@ -3340,27 +3365,46 @@ impl<M: InputModeKind> InputBaseState<M> {
             } else {
                 self.selections.generate_id()
             };
-            let mut sel = CursorSelection::new(id, start, end);
-            sel.reversed = selection.reversed && start != end;
-            sel.column_anchor = self.preferred_column_for(sel.cursor_offset());
-            built.push(sel);
+            built.push(self.build_selection(id, start, end, selection.reversed));
         }
         if built.is_empty() {
             return;
         }
 
-        self.undo_manager.break_transaction_coalescing();
-        self.selected_word_range = None;
+        self.begin_programmatic_selection(cx);
+        // The active caret moves, so its line-end affinity no longer applies.
         self.cursor_line_end_affinity = false;
-        self.pause_blink_cursor(cx);
-        M::hide_context_menu(self, cx);
-        M::clear_inline_completion(self, cx);
         self.selections.replace_all(built);
         // Merging may widen the active selection, so read its caret after.
         self.selections.merge_overlapping();
         let head = self.selections.active().cursor_offset();
         self.reveal_offset(head, cx);
         cx.notify();
+    }
+
+    /// A selection over clipped `start..end`, with its caret side and the
+    /// column vertical moves keep.
+    fn build_selection(
+        &self,
+        id: super::selection::CursorId,
+        start: usize,
+        end: usize,
+        reversed: bool,
+    ) -> CursorSelection {
+        let mut sel = CursorSelection::new(id, start, end);
+        sel.reversed = reversed && start != end;
+        sel.column_anchor = self.preferred_column_for(sel.cursor_offset());
+        sel
+    }
+
+    /// What every selection set by code does first: end typing coalescing
+    /// and drop menus, completions and word selection tied to the old carets.
+    fn begin_programmatic_selection(&mut self, cx: &mut Context<Self>) {
+        self.undo_manager.break_transaction_coalescing();
+        self.selected_word_range = None;
+        self.pause_blink_cursor(cx);
+        M::hide_context_menu(self, cx);
+        M::clear_inline_completion(self, cx);
     }
 
     /// Clip and snap a selection range for [`Self::add_selection`] and
@@ -3411,7 +3455,9 @@ impl<M: InputModeKind> InputBaseState<M> {
             });
         let top = line_height * rows.start;
         let height = line_height * rows.len();
-        let mut scroll_offset = self.scroll_handle.offset();
+        // Measure against a scroll already queued this frame, so "nearest"
+        // can't keep an earlier target that would hide the row.
+        let mut scroll_offset = self.deferred_scroll_offset.unwrap_or(self.scroll_handle.offset());
         let view_top = -scroll_offset.y;
         let view_height = bounds.size.height;
         let target = match align {
@@ -3424,7 +3470,7 @@ impl<M: InputModeKind> InputBaseState<M> {
             }
             RowScrollAlign::Nearest => return,
         };
-        let safe_y_min = (-self.scroll_size.height + self.input_bounds.size.height).min(px(0.));
+        let safe_y_min = self.safe_scroll_y_min(line_height);
         scroll_offset.y = (-target).clamp(safe_y_min, px(0.));
         self.deferred_scroll_offset = Some(scroll_offset);
         cx.notify();
@@ -3432,15 +3478,15 @@ impl<M: InputModeKind> InputBaseState<M> {
 
     /// Replace the line decorations under `key` (an owner's name, so owners
     /// don't replace each other); an empty list removes them. Rows are fixed
-    /// and don't follow edits; rows past the end of the text are dropped.
+    /// and don't follow edits; rows past the end of the text are kept and
+    /// paint once the text reaches them.
     pub fn set_line_decorations(
         &mut self,
         key: impl Into<SharedString>,
         decorations: Vec<super::LineDecoration>,
         cx: &mut Context<Self>,
     ) {
-        let line_count = self.text.lines_len();
-        if self.line_decorations.set(key.into(), decorations, line_count) {
+        if self.line_decorations.set(key.into(), decorations) {
             cx.notify();
         }
     }

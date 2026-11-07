@@ -942,7 +942,8 @@ JS string units); `scroll_to_row(row, "nearest" | "top" | "center")`,
 `scroll_position()` and `row_bounds(row)` scroll and measure; `on("selection_change")`
 and `on("scroll")` report changes. `set_line_decorations(key, [{ row,
 end_row?, background?, gutter? }])` colors whole rows and puts a bar in the
-gutter (a diff: re-set on `change`, rows don't follow edits);
+gutter (a diff: re-set on `change`, rows don't follow edits; set them
+before or after `set_value`);
 `on("gutter_click", ({ row, button }) => …)` reports a press on a line
 number. `show_unfocused_selection: true` keeps
 selections painted while another element has focus. A viewer opens

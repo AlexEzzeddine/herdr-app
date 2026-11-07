@@ -1,7 +1,7 @@
 //! HERDR: whole-row decorations (a background and a gutter bar), set by the
 //! application under a key so independent owners don't replace each other.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::ops::Range;
 
 use gpui::{Hsla, SharedString};
@@ -49,50 +49,44 @@ pub(crate) struct RowPaint {
     pub gutter: Option<Hsla>,
 }
 
-/// Every key's decorations, flattened to a per-row lookup for painting.
+/// Every key's decorations, kept as ranges and resolved per visible row when
+/// painting, so a set costs the number of decorations, not of decorated rows.
 #[derive(Default)]
 pub(crate) struct LineDecorations {
     by_key: BTreeMap<SharedString, Vec<LineDecoration>>,
-    rows: HashMap<usize, RowPaint>,
 }
 
 impl LineDecorations {
     /// Replace `key`'s decorations; an empty list removes the key. Rows past
-    /// `line_count` are dropped. Returns whether anything changed.
-    pub(crate) fn set(
-        &mut self,
-        key: SharedString,
-        decorations: Vec<LineDecoration>,
-        line_count: usize,
-    ) -> bool {
+    /// the end of the text are kept (the text may still grow) and simply
+    /// don't paint. Returns whether anything changed.
+    pub(crate) fn set(&mut self, key: SharedString, decorations: Vec<LineDecoration>) -> bool {
         let decorations: Vec<LineDecoration> = decorations
             .into_iter()
-            .filter_map(|mut decoration| {
-                decoration.rows.end = decoration.rows.end.min(line_count);
+            .filter(|decoration| {
                 let paints = decoration.background.is_some() || decoration.gutter.is_some();
-                (paints && !decoration.rows.is_empty()).then_some(decoration)
+                paints && !decoration.rows.is_empty()
             })
             .collect();
-        let changed = if decorations.is_empty() {
+        if decorations.is_empty() {
             self.by_key.remove(&key).is_some()
         } else if self.by_key.get(&key) == Some(&decorations) {
             false
         } else {
             self.by_key.insert(key, decorations);
             true
-        };
-        if changed {
-            self.rebuild();
         }
-        changed
     }
 
-    /// Later decorations win, within a key and across keys (in key order).
-    fn rebuild(&mut self) {
-        self.rows.clear();
+    /// What each row in `rows` paints, indexed from `rows.start`. Later
+    /// decorations win, within a key and across keys (in key order).
+    pub(crate) fn resolve(&self, rows: Range<usize>) -> Vec<Option<RowPaint>> {
+        let mut out = vec![None; rows.len()];
         for decoration in self.by_key.values().flatten() {
-            for row in decoration.rows.clone() {
-                let paint = self.rows.entry(row).or_default();
+            let start = decoration.rows.start.max(rows.start);
+            let end = decoration.rows.end.min(rows.end);
+            for row in start..end {
+                let paint = out[row - rows.start].get_or_insert_with(RowPaint::default);
                 if decoration.background.is_some() {
                     paint.background = decoration.background;
                 }
@@ -101,14 +95,16 @@ impl LineDecorations {
                 }
             }
         }
+        out
     }
 
+    #[cfg(test)]
     pub(crate) fn row(&self, row: usize) -> Option<RowPaint> {
-        self.rows.get(&row).copied()
+        self.resolve(row..row + 1)[0]
     }
 
     pub(crate) fn is_empty(&self) -> bool {
-        self.rows.is_empty()
+        self.by_key.is_empty()
     }
 }
 
@@ -125,30 +121,39 @@ mod tests {
         assert!(decorations.set(
             "a".into(),
             vec![LineDecoration::new(0..3).with_background(red)],
-            10,
         ));
         assert!(decorations.set(
             "b".into(),
             vec![LineDecoration::new(2..4).with_background(green).with_gutter(green)],
-            10,
         ));
         assert_eq!(decorations.row(0).unwrap().background, Some(red));
         assert_eq!(decorations.row(2).unwrap(), RowPaint { background: Some(green), gutter: Some(green) });
         assert_eq!(decorations.row(4), None);
 
-        assert!(!decorations.set("a".into(), vec![LineDecoration::new(0..3).with_background(red)], 10));
-        assert!(decorations.set("b".into(), vec![], 10));
+        assert!(!decorations.set("a".into(), vec![LineDecoration::new(0..3).with_background(red)]));
+        assert!(decorations.set("b".into(), vec![]));
         assert_eq!(decorations.row(2).unwrap(), RowPaint { background: Some(red), gutter: None });
     }
 
     #[test]
-    fn rows_past_the_end_and_empty_decorations_are_dropped() {
+    fn rows_past_the_end_are_kept_and_empty_decorations_dropped() {
         let red = hsla(0., 1., 0.5, 1.);
         let mut decorations = LineDecorations::default();
-        decorations.set("a".into(), vec![LineDecoration::new(3..usize::MAX).with_gutter(red)], 5);
-        assert!(decorations.row(4).is_some());
-        assert!(decorations.row(5).is_none());
-        assert!(!decorations.set("b".into(), vec![LineDecoration::new(0..2)], 5));
+        decorations.set("a".into(), vec![LineDecoration::new(3..usize::MAX).with_gutter(red)]);
+        assert!(decorations.row(2).is_none());
+        assert!(decorations.row(1_000_000).is_some(), "kept for text that grows later");
+        assert!(!decorations.set("b".into(), vec![LineDecoration::new(0..2)]));
+        assert!(!decorations.set("c".into(), vec![LineDecoration::new(4..4).with_gutter(red)]));
         assert!(!decorations.is_empty());
+    }
+
+    #[test]
+    fn resolve_covers_only_the_asked_rows() {
+        let red = hsla(0., 1., 0.5, 1.);
+        let mut decorations = LineDecorations::default();
+        decorations.set("a".into(), vec![LineDecoration::new(0..usize::MAX).with_background(red)]);
+        let rows = decorations.resolve(100..103);
+        assert_eq!(rows.len(), 3);
+        assert!(rows.iter().all(|row| row.unwrap().background == Some(red)));
     }
 }

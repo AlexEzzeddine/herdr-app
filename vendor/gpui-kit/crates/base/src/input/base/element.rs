@@ -416,7 +416,7 @@ pub(super) fn cursor_surrounding_padding(
 /// `0` outside code-editor mode. Inside it, `None` is half the viewport
 /// (floored at [`BOTTOM_MARGIN_ROWS`] line-heights); `Some(n)` is exactly
 /// `n` line-heights.
-fn empty_bottom_height(
+pub(super) fn empty_bottom_height(
     is_code_editor: bool,
     override_rows: Option<usize>,
     viewport_height: Pixels,
@@ -3052,7 +3052,13 @@ impl<M: InputModeKind> Element for TextElement<M> {
         let decorated_rows: Vec<(Pixels, Pixels, super::line_decorations::RowPaint)> = {
             let decorations = &self.state.read(cx).line_decorations;
             let mut rows = Vec::new();
-            if !decorations.is_empty() {
+            let visible = &prepaint.last_layout.visible_buffer_lines;
+            if let (false, Some(&first), Some(&last)) = (
+                decorations.is_empty(),
+                visible.iter().min(),
+                visible.iter().max(),
+            ) {
+                let resolved = decorations.resolve(first..last + 1);
                 let mut offset_y = invisible_top_padding;
                 for (line, &buffer_line) in prepaint
                     .last_layout
@@ -3061,7 +3067,7 @@ impl<M: InputModeKind> Element for TextElement<M> {
                     .zip(prepaint.last_layout.visible_buffer_lines.iter())
                 {
                     let height = line.size(line_height).height;
-                    if let Some(paint) = decorations.row(buffer_line) {
+                    if let Some(paint) = resolved[buffer_line - first] {
                         rows.push((origin.y + offset_y, height, paint));
                     }
                     offset_y += height;
@@ -3911,6 +3917,125 @@ mod tests {
         assert_eq!(editor.read_with(&cx, |state, _| state.scroll_offset()), before);
     }
 
+    fn sixty_lines(prefix: &str) -> String {
+        (0..60).map(|i| format!("{prefix} {i}")).collect::<Vec<_>>().join("\n")
+    }
+
+    // HERDR: text loaded and scrolled to in one handler is reachable, though
+    // the last frame laid out a shorter text.
+    #[gpui::test]
+    fn scroll_to_row_reaches_text_set_in_the_same_handler(cx: &mut TestAppContext) {
+        let (editor, window) = decoration_editor(cx, "short", false);
+        let mut cx = VisualTestContext::from_window(window.into(), cx);
+        cx.update(|window, cx| {
+            window.draw(cx).clear(cx);
+            editor.update(cx, |state, cx| {
+                state.set_value(sixty_lines("line"), window, cx);
+                state.scroll_to_row(40, crate::input::RowScrollAlign::Top, cx);
+            });
+            window.draw(cx).clear(cx);
+            window.draw(cx).clear(cx);
+        });
+        let (top, _) = editor.read_with(&cx, |state, _| state.row_bounds(40)).expect("row 40");
+        assert_eq!(top, px(0.), "row 40 is at the top");
+    }
+
+    // HERDR: "nearest" measures against a scroll queued earlier in the same
+    // handler, so the latest request wins.
+    #[gpui::test]
+    fn nearest_after_a_queued_scroll_still_shows_the_row(cx: &mut TestAppContext) {
+        let (editor, window) = decoration_editor(cx, &sixty_lines("line"), false);
+        let mut cx = VisualTestContext::from_window(window.into(), cx);
+        cx.update(|window, cx| {
+            window.draw(cx).clear(cx);
+            editor.update(cx, |state, cx| {
+                state.scroll_to_row(50, crate::input::RowScrollAlign::Top, cx);
+                state.scroll_to_row(0, crate::input::RowScrollAlign::Nearest, cx);
+            });
+            window.draw(cx).clear(cx);
+        });
+        let (top, _) = editor.read_with(&cx, |state, _| state.row_bounds(0)).expect("row 0");
+        assert_eq!(top, px(0.), "row 0 is in view");
+    }
+
+    // HERDR: a caret reveal queued before layout doesn't survive set_value,
+    // whose text it no longer points into.
+    #[gpui::test]
+    fn set_value_drops_a_caret_reveal_queued_before_layout(cx: &mut TestAppContext) {
+        cx.update(crate::init);
+        let placeholder = sixty_lines("old");
+        let far = placeholder.find("old 50").unwrap();
+        let mut editor = None;
+        let window = cx.open_window(size(px(240.), px(140.)), |window, cx| {
+            let state = cx.new(|cx| {
+                let mut state = EditorState::new(window, cx).soft_wrap(false);
+                state.set_value(placeholder, window, cx);
+                state.set_selections(vec![sel(far..far, false)], cx);
+                state.set_value(sixty_lines("new"), window, cx);
+                state
+            });
+            editor = Some(state.clone());
+            DecorationHarness(state)
+        });
+        let editor = editor.unwrap();
+        let mut cx = VisualTestContext::from_window(window.into(), cx);
+        cx.update(|window, cx| {
+            window.draw(cx).clear(cx);
+            window.draw(cx).clear(cx);
+        });
+        assert_eq!(editor.read_with(&cx, |state, _| state.scroll_offset().y), px(0.));
+    }
+
+    // HERDR: set_value's scroll reset is as silent as the rest of it.
+    #[gpui::test]
+    fn set_value_does_not_report_its_scroll_reset(cx: &mut TestAppContext) {
+        let (editor, window) = decoration_editor(cx, &sixty_lines("line"), false);
+        let mut cx = VisualTestContext::from_window(window.into(), cx);
+        let scrolls = Rc::new(std::cell::Cell::new(0));
+        cx.update(|window, cx| {
+            window.draw(cx).clear(cx);
+            editor.update(cx, |state, cx| {
+                state.scroll_to_row(40, crate::input::RowScrollAlign::Top, cx)
+            });
+            window.draw(cx).clear(cx);
+            let counter = scrolls.clone();
+            window
+                .subscribe(&editor, cx, move |_, event: &InputEvent, _, _| {
+                    if matches!(event, InputEvent::Scroll) {
+                        counter.set(counter.get() + 1);
+                    }
+                })
+                .detach();
+            editor.update(cx, |state, cx| state.set_value(sixty_lines("other"), window, cx));
+            window.draw(cx).clear(cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(editor.read_with(&cx, |state, _| state.scroll_offset().y), px(0.));
+        assert_eq!(scrolls.get(), 0, "set_value stays silent");
+    }
+
+    // HERDR: decorations set before the text arrives paint once it does.
+    #[gpui::test]
+    fn line_decorations_set_before_the_text_paint_after_it(cx: &mut TestAppContext) {
+        let (editor, mut cx) = numbered_editor(cx, "");
+        let red = gpui::hsla(0., 1., 0.5, 0.3);
+        cx.update(|window, cx| {
+            editor.update(cx, |state, cx| {
+                state.set_line_decorations(
+                    "diff",
+                    vec![crate::input::LineDecoration::new(2..4).with_gutter(red)],
+                    cx,
+                );
+                state.set_value("a\nb\nc\nd\ne", window, cx);
+            });
+            window.draw(cx).clear(cx);
+        });
+        editor.read_with(&cx, |state, _| {
+            assert_eq!(state.line_decorations.row(2).unwrap().gutter, Some(red));
+            assert!(state.line_decorations.row(4).is_none());
+        });
+    }
+
     fn numbered_editor(
         cx: &mut TestAppContext,
         text: &str,
@@ -3999,7 +4124,6 @@ mod tests {
         editor.read_with(&cx, |state, _| {
             assert_eq!(state.line_decorations.row(1).unwrap().gutter, Some(red));
             assert!(state.line_decorations.row(2).is_some());
-            assert!(state.line_decorations.row(3).is_none(), "rows past the end are dropped");
             assert_eq!(state.last_layout.as_ref().unwrap().line_number_width, before, "the gutter keeps its width");
         });
         cx.update(|_, cx| editor.update(cx, |state, cx| state.set_line_decorations("diff", vec![], cx)));

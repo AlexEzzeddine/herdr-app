@@ -3164,7 +3164,8 @@ const BASE: &str = r#"  /** A row. */
     on(event: "gutter_click", handler: (event: GutterClickEvent, cx: Context) => void): boolean;
     /** Replaces the line decorations under `key` (each owner uses its own key, so they
      * don't replace each other); an empty list removes them. Rows are fixed: they don't
-     * move with edits, so set them again on `change`. Later decorations win. */
+     * move with edits, so set them again on `change`. Rows past the end of the text
+     * are kept and paint once the text reaches them. Later decorations win. */
     set_line_decorations(key: string, decorations: LineDecoration[]): void;
     /** Every selection: the primary one first, then the rest in document order.
      * An empty selection is a caret. `set_value` changes it without a `selection_change`. */
