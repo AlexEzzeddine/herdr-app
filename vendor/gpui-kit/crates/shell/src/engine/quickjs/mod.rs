@@ -3879,6 +3879,21 @@ impl ShellRuntime {
                     payload.set("secondary", *secondary)?;
                     payload.set("shift", *shift)?;
                 }
+                InputEvent::GutterClick {
+                    row,
+                    button,
+                    modifiers,
+                } => {
+                    payload.set("row", *row as f64)?;
+                    let button = match button {
+                        gpui::MouseButton::Right => "right",
+                        gpui::MouseButton::Middle => "middle",
+                        _ => "left",
+                    };
+                    payload.set("button", button)?;
+                    payload.set("shift", modifiers.shift)?;
+                    payload.set("secondary", modifiers.secondary())?;
+                }
                 InputEvent::Change
                 | InputEvent::Focus
                 | InputEvent::Blur
@@ -7049,6 +7064,8 @@ globalThis.__gpui = (() => {
             __editor_scroll_to_row(handle, Number(row), String(align ?? "nearest")),
           scroll_position: () => JSON.parse(__editor_scroll_position(handle)),
           row_bounds: (row) => JSON.parse(__editor_row_bounds(handle, Number(row))),
+          set_line_decorations: (key, decorations) =>
+            __editor_set_line_decorations(handle, String(key), JSON.stringify(Array.from(decorations))),
           release: () => __editor_release(handle),
         };
       },

@@ -174,6 +174,14 @@ pub enum InputEvent {
     /// The view scrolled (by the user, by code, or to follow the caret).
     /// Emitted after the frame that applied it, so layout reads are current.
     Scroll,
+    /// A press in the line-number gutter, outside a fold chevron. The press
+    /// still places the caret as usual.
+    GutterClick {
+        /// 0-based buffer row.
+        row: usize,
+        button: MouseButton,
+        modifiers: gpui::Modifiers,
+    },
 }
 
 pub(super) const CONTEXT: &str = "Input";
@@ -537,6 +545,8 @@ pub struct InputBaseState<M: InputModeKind> {
     pub(crate) pending_scroll: Option<PendingScroll>,
     /// Paint selections even while another element has focus.
     pub(crate) show_unfocused_selection: bool,
+    /// Whole-row backgrounds and gutter bars set by the application.
+    pub(crate) line_decorations: super::line_decorations::LineDecorations,
     /// The scroll offset last reported by [`InputEvent::Scroll`].
     pub(crate) reported_scroll: Point<Pixels>,
     /// The size of the scrollable content.
@@ -917,6 +927,7 @@ impl<M: InputModeKind> InputBaseState<M> {
             deferred_scroll_offset: None,
             pending_scroll: None,
             show_unfocused_selection: false,
+            line_decorations: Default::default(),
             reported_scroll: point(px(0.), px(0.)),
             placeholder: SharedString::default(),
             mask_pattern: MaskPattern::default(),
@@ -2513,6 +2524,14 @@ impl<M: InputModeKind> InputBaseState<M> {
         let (offset, line_end_affinity, columns_past_line_end) =
             self.resolve_mouse_position(event.position);
 
+        if self.is_in_gutter(event.position) {
+            cx.emit(InputEvent::GutterClick {
+                row: self.text.offset_to_point(offset).row,
+                button: event.button,
+                modifiers: event.modifiers,
+            });
+        }
+
         if M::on_click(self, event, offset, window, cx) {
             return;
         }
@@ -3409,6 +3428,37 @@ impl<M: InputModeKind> InputBaseState<M> {
         scroll_offset.y = (-target).clamp(safe_y_min, px(0.));
         self.deferred_scroll_offset = Some(scroll_offset);
         cx.notify();
+    }
+
+    /// Replace the line decorations under `key` (an owner's name, so owners
+    /// don't replace each other); an empty list removes them. Rows are fixed
+    /// and don't follow edits; rows past the end of the text are dropped.
+    pub fn set_line_decorations(
+        &mut self,
+        key: impl Into<SharedString>,
+        decorations: Vec<super::LineDecoration>,
+        cx: &mut Context<Self>,
+    ) {
+        let line_count = self.text.lines_len();
+        if self.line_decorations.set(key.into(), decorations, line_count) {
+            cx.notify();
+        }
+    }
+
+    /// Whether `position` (window coordinates) is in the line-number gutter.
+    /// Fold chevrons take their own presses before the input sees them.
+    fn is_in_gutter(&self, position: Point<Pixels>) -> bool {
+        let Some(layout) = self.last_layout.as_ref() else {
+            return false;
+        };
+        self.mode.line_number()
+            && super::element::editor_gutter_bounds(
+                self.input_bounds,
+                layout.line_number_width,
+                px(0.),
+                self.editor_paddings,
+            )
+            .contains(&position)
     }
 
     /// Where buffer `row` sits vertically, relative to the top of the visible

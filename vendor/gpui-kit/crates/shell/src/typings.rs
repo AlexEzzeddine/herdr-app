@@ -3032,6 +3032,15 @@ const BASE: &str = r#"  /** A row. */
     readonly shift?: boolean;
   }
 
+  /** An `EditorState` `gutter_click`: a press on a line number. */
+  export interface GutterClickEvent extends InputEvent {
+    /** 0-based buffer row. */
+    readonly row: number;
+    readonly button: "left" | "right" | "middle";
+    readonly secondary: boolean;
+    readonly shift: boolean;
+  }
+
   /** The OTP event payload is currently empty; read the value from the state. */
   export interface OtpEvent {}
 
@@ -3150,6 +3159,13 @@ const BASE: &str = r#"  /** A row. */
     /** `selection_change`: selections or carets moved, were added or removed; read `selections()`.
      * `scroll`: the view scrolled; `scroll_position()` and `row_bounds()` are current in the handler. */
     on(event: "change" | "submit" | "focus" | "blur" | "paste_other" | "selection_change" | "scroll", handler: (event: InputEvent, cx: Context) => void): boolean;
+    /** A press on a line number (not a fold chevron). The press still places the caret,
+     * so dragging down the gutter still selects lines. Needs line numbers. */
+    on(event: "gutter_click", handler: (event: GutterClickEvent, cx: Context) => void): boolean;
+    /** Replaces the line decorations under `key` (each owner uses its own key, so they
+     * don't replace each other); an empty list removes them. Rows are fixed: they don't
+     * move with edits, so set them again on `change`. Later decorations win. */
+    set_line_decorations(key: string, decorations: LineDecoration[]): void;
     /** Every selection: the primary one first, then the rest in document order.
      * An empty selection is a caret. `set_value` changes it without a `selection_change`. */
     selections(): EditorSelection[];
@@ -3169,6 +3185,17 @@ const BASE: &str = r#"  /** A row. */
      * A soft-wrapped row is taller than one line. */
     row_bounds(row: number): { top: number; height: number } | null;
     release(): boolean;
+  }
+  export interface LineDecoration {
+    /** 0-based buffer row. */
+    row: number;
+    /** Last row (inclusive) for a range of rows; defaults to `row`. */
+    end_row?: number;
+    /** Fill behind the rows' text and line numbers, under the selection. Use a
+     * translucent color (`#rrggbbaa`) so the active line still shows. */
+    background?: Color;
+    /** A bar at the gutter's left edge. Needs line numbers. */
+    gutter?: Color;
   }
   /** 0-based; `col` counts UTF-16 code units, so it indexes the line as a JS string. */
   export interface EditorPosition {

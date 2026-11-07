@@ -627,6 +627,48 @@ pub fn install(ctx: &Ctx<'_>, module: &Object<'_>, runtime: Weak<ShellRuntime>) 
         ),
     )?;
 
+    let decorate_editor = runtime.clone();
+    globals.set(
+        "__editor_set_line_decorations",
+        Func::from(
+            move |ctx: Ctx<'_>, handle: EntityHandle, key: String, json: String| -> JsResult<()> {
+                let state = live_editor(&ctx, &decorate_editor, handle)?;
+                let items: Vec<EditorLineDecoration> = serde_json::from_str(&json).map_err(|error| {
+                    Exception::throw_type(
+                        &ctx,
+                        &format!("expected [{{ row, end_row?, background?, gutter? }}]: {error}"),
+                    )
+                })?;
+                let color = |value: &Option<String>| -> JsResult<Option<gpui::Hsla>> {
+                    value
+                        .as_ref()
+                        .map(|value| {
+                            crate::value::Bridged::Str(value.clone())
+                                .as_color()
+                                .map_err(|error| Exception::throw_type(&ctx, &error.to_string()))
+                        })
+                        .transpose()
+                };
+                let mut decorations = Vec::with_capacity(items.len());
+                for item in &items {
+                    let end = item.end_row.unwrap_or(item.row);
+                    if end < item.row {
+                        return Err(Exception::throw_range(&ctx, "end_row must not be before row"));
+                    }
+                    decorations.push(gpui_base::input::LineDecoration {
+                        rows: item.row..end.saturating_add(1),
+                        background: color(&item.background)?,
+                        gutter: color(&item.gutter)?,
+                    });
+                }
+                scope::with_current(|_, cx| {
+                    state.update(cx, |state, cx| state.set_line_decorations(key, decorations, cx))
+                })
+                .ok_or_else(|| needs_call(&ctx, "set_line_decorations()"))
+            },
+        ),
+    )?;
+
     let subscribe_editor = runtime.clone();
     globals.set(
         "__editor_on",
@@ -1944,6 +1986,18 @@ struct EditorRange {
     /// whose `start` is after its `end` is a backwards selection.
     #[serde(default)]
     head: Option<EditorPosition>,
+}
+
+#[derive(serde::Deserialize)]
+struct EditorLineDecoration {
+    row: usize,
+    /// Inclusive.
+    #[serde(default)]
+    end_row: Option<usize>,
+    #[serde(default)]
+    background: Option<String>,
+    #[serde(default)]
+    gutter: Option<String>,
 }
 
 /// A script range as a byte selection, keeping which side the caret is on.

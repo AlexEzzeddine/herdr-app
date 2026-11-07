@@ -1272,6 +1272,8 @@ pub enum InputEventName {
     SelectionChange,
     /// HERDR: the view scrolled.
     Scroll,
+    /// HERDR: a press in the line-number gutter.
+    GutterClick,
 }
 
 impl InputEventName {
@@ -1284,6 +1286,7 @@ impl InputEventName {
             "paste_other" => Some(Self::PasteOther),
             "selection_change" => Some(Self::SelectionChange),
             "scroll" => Some(Self::Scroll),
+            "gutter_click" => Some(Self::GutterClick),
             _ => None,
         }
     }
@@ -1296,6 +1299,7 @@ impl InputEventName {
         "paste_other",
         "selection_change",
         "scroll",
+        "gutter_click",
     ];
 
     fn matches(self, event: &InputEvent) -> bool {
@@ -1308,6 +1312,7 @@ impl InputEventName {
                 | (Self::PasteOther, InputEvent::PasteWithoutText)
                 | (Self::SelectionChange, InputEvent::SelectionChange)
                 | (Self::Scroll, InputEvent::Scroll)
+                | (Self::GutterClick, InputEvent::GutterClick { .. })
         )
     }
 }

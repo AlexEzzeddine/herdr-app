@@ -51,6 +51,8 @@ pub(super) const RIGHT_MARGIN: Pixels = px(10.);
 pub(super) const LINE_NUMBER_RIGHT_MARGIN: Pixels = px(6.);
 const FOLD_ICON_WIDTH: Pixels = px(14.);
 const FOLD_ICON_HITBOX_WIDTH: Pixels = px(18.);
+/// HERDR: width of a line decoration's bar at the gutter's left edge.
+const GUTTER_BAR_WIDTH: Pixels = px(3.);
 const MAX_HIGHLIGHT_LINE_LENGTH: usize = 10_000;
 const MIN_LINE_NUMBER_DIGITS: usize = 3;
 const MAX_LINE_NUMBER_DIGITS: usize = 7;
@@ -320,7 +322,7 @@ fn clamp_auto_grow_vertical_scroll_offset(
     }
 }
 
-fn editor_gutter_bounds(
+pub(super) fn editor_gutter_bounds(
     input_bounds: Bounds<Pixels>,
     line_number_width: Pixels,
     ghost_lines_height: Pixels,
@@ -3045,6 +3047,42 @@ impl<M: InputModeKind> Element for TextElement<M> {
             editor_style.background
         };
 
+        // HERDR: application row decorations: where each decorated visible row
+        // is drawn, walked like the glyph backgrounds below (ghost lines included).
+        let decorated_rows: Vec<(Pixels, Pixels, super::line_decorations::RowPaint)> = {
+            let decorations = &self.state.read(cx).line_decorations;
+            let mut rows = Vec::new();
+            if !decorations.is_empty() {
+                let mut offset_y = invisible_top_padding;
+                for (line, &buffer_line) in prepaint
+                    .last_layout
+                    .lines
+                    .iter()
+                    .zip(prepaint.last_layout.visible_buffer_lines.iter())
+                {
+                    let height = line.size(line_height).height;
+                    if let Some(paint) = decorations.row(buffer_line) {
+                        rows.push((origin.y + offset_y, height, paint));
+                    }
+                    offset_y += height;
+                    if Some(buffer_line) == prepaint.current_row {
+                        offset_y += prepaint.ghost_lines_height;
+                    }
+                }
+            }
+            rows
+        };
+
+        // HERDR: row backgrounds sit under the active line, selections and text.
+        for (y, height, paint) in &decorated_rows {
+            if let Some(color) = paint.background {
+                window.paint_quad(fill(
+                    Bounds::new(point(input_bounds.origin.x, *y), size(bounds.size.width, *height)),
+                    color,
+                ));
+            }
+        }
+
         // Paint active line
         let mut offset_y = px(0.);
         if let Some(line_numbers) = prepaint.line_numbers.as_ref() {
@@ -3256,6 +3294,19 @@ impl<M: InputModeKind> Element for TextElement<M> {
                 editor_paddings,
             );
             window.paint_quad(fill(gutter_bounds, gutter_bg));
+            // HERDR: the opaque gutter covered the row backgrounds; repaint them
+            // under the line numbers.
+            for (y, height, paint) in &decorated_rows {
+                if let Some(color) = paint.background {
+                    window.paint_quad(fill(
+                        Bounds::new(
+                            point(gutter_bounds.origin.x, *y),
+                            size(gutter_bounds.size.width, *height),
+                        ),
+                        color,
+                    ));
+                }
+            }
 
             // Each item is the normal lines.
             for (lines, &buffer_line) in line_numbers
@@ -3287,6 +3338,16 @@ impl<M: InputModeKind> Element for TextElement<M> {
                 // Add ghost line height after cursor row for line numbers alignment
                 if !prepaint.ghost_lines.is_empty() && prepaint.current_row == Some(buffer_line) {
                     offset_y += prepaint.ghost_lines_height;
+                }
+            }
+
+            // HERDR: line decoration bars at the gutter's left edge.
+            for (y, height, paint) in &decorated_rows {
+                if let Some(color) = paint.gutter {
+                    window.paint_quad(fill(
+                        Bounds::new(point(gutter_bounds.origin.x, *y), size(GUTTER_BAR_WIDTH, *height)),
+                        color,
+                    ));
                 }
             }
         }
@@ -3848,6 +3909,101 @@ mod tests {
             window.draw(cx).clear(cx);
         });
         assert_eq!(editor.read_with(&cx, |state, _| state.scroll_offset()), before);
+    }
+
+    fn numbered_editor(
+        cx: &mut TestAppContext,
+        text: &str,
+    ) -> (Entity<EditorState>, VisualTestContext) {
+        cx.update(crate::init);
+        let mut editor = None;
+        let window = cx.open_window(size(px(240.), px(140.)), |window, cx| {
+            let state = cx.new(|cx| {
+                EditorState::new(window, cx)
+                    .line_number(true)
+                    .soft_wrap(false)
+                    .default_value(text)
+            });
+            editor = Some(state.clone());
+            DecorationHarness(state)
+        });
+        let mut cx = VisualTestContext::from_window(window.into(), cx);
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        (editor.unwrap(), cx)
+    }
+
+    // HERDR: a press on a line number reports its row and still places the caret.
+    #[gpui::test]
+    fn a_gutter_press_reports_its_row(cx: &mut TestAppContext) {
+        let (editor, mut cx) = numbered_editor(cx, "alpha\nbeta\ngamma\ndelta");
+        let seen = Rc::new(std::cell::RefCell::new(Vec::new()));
+        cx.update(|window, cx| {
+            let seen = seen.clone();
+            window
+                .subscribe(&editor, cx, move |_, event: &InputEvent, _, _| {
+                    if let InputEvent::GutterClick { row, button, modifiers } = event {
+                        seen.borrow_mut().push((*row, *button, modifiers.shift));
+                    }
+                })
+                .detach();
+        });
+        let (gutter, text, top, line_height) = editor.read_with(&cx, |state, _| {
+            let layout = state.last_layout.as_ref().unwrap();
+            let origin = state.input_bounds.origin;
+            (
+                origin.x + px(2.),
+                origin.x + layout.line_number_width + px(10.),
+                origin.y,
+                layout.line_height,
+            )
+        });
+        let y = |row: f32| top + line_height * (row + 0.5);
+
+        let shift = gpui::Modifiers { shift: true, ..Default::default() };
+        cx.simulate_mouse_down(point(gutter, y(2.)), MouseButton::Left, gpui::Modifiers::default());
+        cx.simulate_mouse_up(point(gutter, y(2.)), MouseButton::Left, gpui::Modifiers::default());
+        assert_eq!(
+            editor.read_with(&cx, |state, _| state.text.offset_to_point(state.cursor()).row),
+            2,
+            "the press still places the caret"
+        );
+        cx.simulate_mouse_down(point(gutter, y(1.)), MouseButton::Right, shift);
+        cx.simulate_mouse_up(point(gutter, y(1.)), MouseButton::Right, shift);
+        cx.simulate_mouse_down(point(text, y(3.)), MouseButton::Left, gpui::Modifiers::default());
+        cx.simulate_mouse_up(point(text, y(3.)), MouseButton::Left, gpui::Modifiers::default());
+        cx.run_until_parked();
+
+        assert_eq!(
+            *seen.borrow(),
+            vec![(2, MouseButton::Left, false), (1, MouseButton::Right, true)],
+            "a press in the text is not a gutter click"
+        );
+    }
+
+    // HERDR: line decorations paint without disturbing layout, and clear by key.
+    #[gpui::test]
+    fn line_decorations_set_and_clear_by_key(cx: &mut TestAppContext) {
+        let (editor, mut cx) = numbered_editor(cx, "alpha\nbeta\ngamma");
+        let red = gpui::hsla(0., 1., 0.5, 0.3);
+        let before = editor.read_with(&cx, |state, _| state.last_layout.as_ref().unwrap().line_number_width);
+        cx.update(|window, cx| {
+            editor.update(cx, |state, cx| {
+                state.set_line_decorations(
+                    "diff",
+                    vec![crate::input::LineDecoration::new(1..usize::MAX).with_background(red).with_gutter(red)],
+                    cx,
+                );
+            });
+            window.draw(cx).clear(cx);
+        });
+        editor.read_with(&cx, |state, _| {
+            assert_eq!(state.line_decorations.row(1).unwrap().gutter, Some(red));
+            assert!(state.line_decorations.row(2).is_some());
+            assert!(state.line_decorations.row(3).is_none(), "rows past the end are dropped");
+            assert_eq!(state.last_layout.as_ref().unwrap().line_number_width, before, "the gutter keeps its width");
+        });
+        cx.update(|_, cx| editor.update(cx, |state, cx| state.set_line_decorations("diff", vec![], cx)));
+        assert!(editor.read_with(&cx, |state, _| state.line_decorations.is_empty()));
     }
 
     #[gpui::test]
