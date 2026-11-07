@@ -542,20 +542,16 @@ pub fn install(ctx: &Ctx<'_>, module: &Object<'_>, runtime: Weak<ShellRuntime>) 
                 })?;
                 scope::with_current(|_, cx| {
                     state.update(cx, |state, cx| {
-                        let ranges: Vec<_> = ranges
+                        let selections: Vec<_> = ranges
                             .iter()
-                            .map(|range| {
-                                let start = editor_offset(state.text(), range.start);
-                                let end = editor_offset(state.text(), range.end);
-                                start.min(end)..start.max(end)
-                            })
+                            .map(|range| editor_selection(state.text(), range))
                             .collect();
                         if add {
-                            for range in ranges {
-                                state.add_selection(range, cx);
+                            for selection in selections {
+                                state.add_selection_range(selection, cx);
                             }
                         } else {
-                            state.set_selections(ranges, cx);
+                            state.set_selections(selections, cx);
                         }
                     })
                 })
@@ -1944,6 +1940,28 @@ struct EditorPosition {
 struct EditorRange {
     start: EditorPosition,
     end: EditorPosition,
+    /// The caret's side, as `selections()` reports it; without it a range
+    /// whose `start` is after its `end` is a backwards selection.
+    #[serde(default)]
+    head: Option<EditorPosition>,
+}
+
+/// A script range as a byte selection, keeping which side the caret is on.
+fn editor_selection(
+    text: &gpui_base::input::Rope,
+    range: &EditorRange,
+) -> gpui_base::input::SelectionRange {
+    let start = editor_offset(text, range.start);
+    let end = editor_offset(text, range.end);
+    let (low, high) = (start.min(end), start.max(end));
+    let reversed = match range.head {
+        Some(head) => low != high && editor_offset(text, head) == low,
+        None => start > end,
+    };
+    gpui_base::input::SelectionRange {
+        range: low..high,
+        reversed,
+    }
 }
 
 fn editor_row(ctx: &Ctx<'_>, row: f64) -> JsResult<usize> {

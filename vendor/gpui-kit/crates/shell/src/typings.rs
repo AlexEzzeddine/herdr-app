@@ -3051,8 +3051,9 @@ const BASE: &str = r#"  /** A row. */
     value(): string;
     /** Plain text, or a content snapshot to restore its tokens as well. */
     set_value(next: string | InputContent): void;
-    /** `change`, `submit`, `focus`, `blur`, or `paste_other`: a paste found no text (an image, say). */
-    on(event: "change" | "submit" | "focus" | "blur" | "paste_other", handler: (event: InputEvent, cx: Context) => void): boolean;
+    /** `change`, `submit`, `focus`, `blur`, `paste_other`: a paste found no text (an image, say),
+     * `selection_change`: the selection or caret moved, or `scroll`: the view scrolled. */
+    on(event: "change" | "submit" | "focus" | "blur" | "paste_other" | "selection_change" | "scroll", handler: (event: InputEvent, cx: Context) => void): boolean;
     /**
      * How much one step moves the value in a `NumberInput`. Default is 1;
      * `null` gives up stepping entirely.
@@ -3120,8 +3121,9 @@ const BASE: &str = r#"  /** A row. */
     value(): string;
     /** Plain text, or a content snapshot to restore its tokens as well. */
     set_value(next: string | InputContent): void;
-    /** `change`, `submit`, `focus`, `blur`, or `paste_other`: a paste found no text (an image, say). */
-    on(event: "change" | "submit" | "focus" | "blur" | "paste_other", handler: (event: InputEvent, cx: Context) => void): boolean;
+    /** `change`, `submit`, `focus`, `blur`, `paste_other`: a paste found no text (an image, say),
+     * `selection_change`: the selection or caret moved, or `scroll`: the view scrolled. */
+    on(event: "change" | "submit" | "focus" | "blur" | "paste_other" | "selection_change" | "scroll", handler: (event: InputEvent, cx: Context) => void): boolean;
     /** Shows this many rows. */
     set_rows(rows: number): void;
     /** Grows with the content, between the two row counts. */
@@ -3148,13 +3150,18 @@ const BASE: &str = r#"  /** A row. */
     /** `selection_change`: selections or carets moved, were added or removed; read `selections()`.
      * `scroll`: the view scrolled; `scroll_position()` and `row_bounds()` are current in the handler. */
     on(event: "change" | "submit" | "focus" | "blur" | "paste_other" | "selection_change" | "scroll", handler: (event: InputEvent, cx: Context) => void): boolean;
-    /** Every selection, the primary one first. An empty selection is a caret. */
+    /** Every selection: the primary one first, then the rest in document order.
+     * An empty selection is a caret. `set_value` changes it without a `selection_change`. */
     selections(): EditorSelection[];
-    /** Replaces every selection; the first becomes primary and is scrolled into view. */
+    /** Replaces every selection; the first becomes primary and its caret is scrolled
+     * into view (after the first layout, if there is none yet). Overlapping ranges merge.
+     * Pass `head` (or `start` after `end`) for a backwards selection, so `selections()`
+     * round-trips. */
     set_selections(ranges: EditorRange[]): void;
     /** Adds a selection (like Alt-click), keeping the others. */
     add_selection(range: EditorRange): void;
-    /** Before the first layout the request waits for it. Defaults to "nearest". */
+    /** Scrolls vertically only. Before the first layout the request waits for it.
+     * Defaults to "nearest". */
     scroll_to_row(row: number, align?: "nearest" | "top" | "center"): void;
     /** Pixels scrolled from the top left; `line_height` is null before the first layout. */
     scroll_position(): { top: number; left: number; line_height: number | null };
@@ -3171,6 +3178,8 @@ const BASE: &str = r#"  /** A row. */
   export interface EditorRange {
     start: EditorPosition;
     end: EditorPosition;
+    /** Where the caret goes: `start` or `end`. Defaults to `end`. */
+    head?: EditorPosition;
   }
   export interface EditorSelection extends EditorRange {
     /** Where the caret is: `start` or `end`. */

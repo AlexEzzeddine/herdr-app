@@ -3315,7 +3315,7 @@ impl<M: InputModeKind> Element for TextElement<M> {
             state.scroll_size = prepaint.scroll_size;
             state.update_scroll_offset(Some(prepaint.cursor_scroll_offset), cx);
             state.deferred_scroll_offset = None;
-            state.apply_pending_scroll_row(cx);
+            state.apply_pending_scroll(cx);
             let scroll = state.scroll_handle.offset();
             if scroll != state.reported_scroll {
                 state.reported_scroll = scroll;
@@ -3600,7 +3600,9 @@ fn split_runs_by_bg_segments(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::input::{EditorMode, EditorState, FoldRange, InputEvent, RangeDecoration, Redo, Undo};
+    use crate::input::{
+        EditorMode, EditorState, FoldRange, InputEvent, RangeDecoration, Redo, SelectionRange, Undo,
+    };
     use gpui::{
         AppContext as _, Context, EntityInputHandler as _, Render, TestAppContext,
         VisualTestContext, div,
@@ -3660,7 +3662,13 @@ mod tests {
         let mut cx = VisualTestContext::from_window(window.into(), cx);
         cx.update(|window, cx| {
             editor.update(cx, |state, cx| {
-                state.set_selections(vec![0..5, 11..16], cx);
+                state.set_selections(
+                    vec![
+                        SelectionRange { range: 0..5, reversed: false },
+                        SelectionRange { range: 11..16, reversed: false },
+                    ],
+                    cx,
+                );
             });
             let selection_paths = |window: &mut Window, cx: &mut App| {
                 window.draw(cx).clear(cx);
@@ -3705,6 +3713,141 @@ mod tests {
         let (top, height) = seen[0].expect("row 40 is laid out");
         assert_eq!(top, px(0.), "row 40 is at the top when the handler reads it");
         assert!(height > px(0.));
+    }
+
+    fn sel(range: Range<usize>, reversed: bool) -> SelectionRange {
+        SelectionRange { range, reversed }
+    }
+
+    fn count_selection_changes(
+        editor: &Entity<EditorState>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Rc<std::cell::Cell<usize>> {
+        let seen = Rc::new(std::cell::Cell::new(0));
+        let counter = seen.clone();
+        window
+            .subscribe(editor, cx, move |_, event: &InputEvent, _, _| {
+                if matches!(event, InputEvent::SelectionChange) {
+                    counter.set(counter.get() + 1);
+                }
+            })
+            .detach();
+        seen
+    }
+
+    // HERDR: set_value is silent, its selection reset included; code-set selections are not.
+    #[gpui::test]
+    fn set_value_does_not_report_a_selection_change(cx: &mut TestAppContext) {
+        let (editor, window) = decoration_editor(cx, "alpha\nbeta", false);
+        let mut cx = VisualTestContext::from_window(window.into(), cx);
+        let seen = cx.update(|window, cx| count_selection_changes(&editor, window, cx));
+        cx.update(|_window, cx| {
+            editor.update(cx, |state, cx| state.set_selected_range(2..4, cx));
+        });
+        cx.run_until_parked();
+        assert_eq!(seen.get(), 1, "a selection set by code is reported");
+        cx.update(|window, cx| {
+            editor.update(cx, |state, cx| state.set_value("gamma\ndelta", window, cx));
+        });
+        cx.run_until_parked();
+        assert_eq!(seen.get(), 1, "set_value stays silent");
+        assert_eq!(editor.read_with(&cx, |state, _| state.selected_range()), 0..0);
+    }
+
+    // HERDR: a row asked for before layout and before the text arrives is still reached.
+    #[gpui::test]
+    fn scroll_to_row_before_the_text_arrives_keeps_the_row(cx: &mut TestAppContext) {
+        cx.update(crate::init);
+        let text = (0..60).map(|i| format!("line {i}")).collect::<Vec<_>>().join("\n");
+        let mut editor = None;
+        let window = cx.open_window(size(px(240.), px(140.)), |window, cx| {
+            let state = cx.new(|cx| {
+                let mut state = EditorState::new(window, cx).soft_wrap(false);
+                // Like a mod's init(): scroll first, then load the file.
+                state.scroll_to_row(40, crate::input::RowScrollAlign::Top, cx);
+                state.set_value(text, window, cx);
+                state
+            });
+            editor = Some(state.clone());
+            DecorationHarness(state)
+        });
+        let editor = editor.unwrap();
+        let mut cx = VisualTestContext::from_window(window.into(), cx);
+        cx.update(|window, cx| {
+            window.draw(cx).clear(cx);
+            window.draw(cx).clear(cx);
+        });
+        let (top, _) = editor
+            .read_with(&cx, |state, _| state.row_bounds(40))
+            .expect("row 40 is laid out");
+        assert_eq!(top, px(0.), "row 40 is at the top");
+    }
+
+    // HERDR: set_selections merges, keeps direction, and scrolls to the merged caret.
+    #[gpui::test]
+    fn set_selections_merges_keeps_direction_and_scrolls_after_layout(cx: &mut TestAppContext) {
+        let text = (0..60).map(|i| format!("line {i}")).collect::<Vec<_>>().join("\n");
+        let (editor, window) = decoration_editor(cx, &text, false);
+        let mut cx = VisualTestContext::from_window(window.into(), cx);
+        let far = text.find("line 50").unwrap();
+        cx.update(|window, cx| {
+            // Before the first layout: the scroll waits for it.
+            editor.update(cx, |state, cx| {
+                state.set_selections(vec![sel(0..4, false), sel(2..far, false), sel(far + 2..far + 4, true)], cx)
+            });
+            window.draw(cx).clear(cx);
+            window.draw(cx).clear(cx);
+        });
+        editor.read_with(&cx, |state, _| {
+            let selections = state.selections();
+            assert_eq!(selections, vec![sel(0..far, false), sel(far + 2..far + 4, true)]);
+            assert_eq!(selections[1].head(), far + 2);
+            let (top, height) = state.row_bounds(50).expect("row 50");
+            assert!(top >= px(0.) && top + height <= px(140.), "the merged caret on row 50 is in view: {top:?}");
+        });
+    }
+
+    // HERDR: a single-line input keeps only the first range.
+    #[gpui::test]
+    fn set_selections_on_a_single_line_input_keeps_the_first(cx: &mut TestAppContext) {
+        cx.update(crate::init);
+        let mut input = None;
+        let window = cx.open_window(size(px(240.), px(40.)), |window, cx| {
+            let state = cx.new(|cx| crate::input::InputState::new(window, cx).default_value("abcdefgh"));
+            input = Some(state.clone());
+            gpui::Empty
+        });
+        let input = input.unwrap();
+        let _ = window;
+        cx.update(|cx| {
+            input.update(cx, |state, cx| state.set_selections(vec![sel(0..3, false), sel(5..8, false)], cx))
+        });
+        assert_eq!(cx.read(|cx| input.read(cx).selections()), vec![sel(0..3, false)]);
+    }
+
+    // HERDR: "nearest" on a visible row leaves the horizontal scroll alone.
+    #[gpui::test]
+    fn scroll_to_a_visible_row_keeps_the_horizontal_scroll(cx: &mut TestAppContext) {
+        let long = "x".repeat(400);
+        let text = format!("{long}\n{long}\nshort");
+        let (editor, window) = decoration_editor(cx, &text, false);
+        let mut cx = VisualTestContext::from_window(window.into(), cx);
+        cx.update(|window, cx| {
+            window.draw(cx).clear(cx);
+            editor.update(cx, |state, cx| state.set_selected_range(390..390, cx));
+            window.draw(cx).clear(cx);
+            window.draw(cx).clear(cx);
+        });
+        let before = editor.read_with(&cx, |state, _| state.scroll_offset());
+        assert!(before.x < px(0.), "scrolled right to the caret");
+        cx.update(|window, cx| {
+            editor.update(cx, |state, cx| {
+                state.scroll_to_row(1, crate::input::RowScrollAlign::Nearest, cx)
+            });
+            window.draw(cx).clear(cx);
+        });
+        assert_eq!(editor.read_with(&cx, |state, _| state.scroll_offset()), before);
     }
 
     #[gpui::test]
