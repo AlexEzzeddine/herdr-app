@@ -154,6 +154,15 @@ pub(in crate::input) enum QueuedScroll {
     Caret(super::selection::CursorId),
 }
 
+/// HERDR: one selection as [`InputEvent::SelectionChange`] compares it:
+/// `(row, col)` of each end, `col` in UTF-16 code units as scripts read it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ReportedSelection {
+    start: (usize, usize),
+    end: (usize, usize),
+    reversed: bool,
+}
+
 /// One selection as a byte range, with the side its caret is on.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SelectionRange {
@@ -626,8 +635,12 @@ pub struct InputBaseState<M: InputModeKind> {
     pub(super) emit_events: bool,
 
     _subscriptions: Vec<Subscription>,
-    /// The selections last reported by [`InputEvent::SelectionChange`].
-    reported_selections: Vec<SelectionRange>,
+    /// The selections last reported by [`InputEvent::SelectionChange`],
+    /// as scripts see them.
+    reported_selections: Vec<ReportedSelection>,
+    /// Reused for the next comparison, so a selection change doesn't
+    /// allocate.
+    selection_report_scratch: Vec<ReportedSelection>,
     /// [`Selections::generation`] when `reported_selections` was last
     /// checked: an unchanged generation skips the comparison (cursor blinks
     /// notify without touching the selections).
@@ -975,7 +988,12 @@ impl<M: InputModeKind> InputBaseState<M> {
             silent_replace_text: false,
             emit_events: true,
             _subscriptions,
-            reported_selections: vec![SelectionRange { range: 0..0, reversed: false }],
+            reported_selections: vec![ReportedSelection {
+                start: (0, 0),
+                end: (0, 0),
+                reversed: false,
+            }],
+            selection_report_scratch: Vec::new(),
             reported_selections_generation: 0,
             last_ghost_block: None,
             _pending_update: false,
@@ -2795,9 +2813,7 @@ impl<M: InputModeKind> InputBaseState<M> {
     ) {
         // The newest scroll request wins over one kept for after layout
         // (before layout the caret-follow in paint reveals this offset).
-        if matches!(self.queued_scroll, Some(QueuedScroll::Row(..) | QueuedScroll::Caret(_))) {
-            self.queued_scroll = None;
-        }
+        self.drop_pending_row_scroll();
         let Some(last_layout) = self.last_layout.as_ref() else {
             return;
         };
@@ -2899,8 +2915,9 @@ impl<M: InputModeKind> InputBaseState<M> {
     /// The lowest vertical scroll offset, from the current text rather than
     /// the last frame's `scroll_size`: text set since that frame (a file
     /// loaded and scrolled to in one handler) must be reachable, and text
-    /// shortened since must not be scrolled past. Matches the height
-    /// `TextElement` lays out, minus transient ghost lines.
+    /// shortened since must not be scrolled past. Uses the height
+    /// `TextElement` lays out ([`Self::content_height`]), minus transient
+    /// ghost lines.
     /// While the rows are those of the last frame, never tighter than its
     /// range (ghost lines included), so existing scrolls keep their reach.
     fn safe_scroll_y_min(&self, line_height: Pixels) -> Pixels {
@@ -2909,19 +2926,36 @@ impl<M: InputModeKind> InputBaseState<M> {
             return last_frame;
         };
         let rows = self.display_map.wrap_row_count();
-        let content = line_height * rows
-            + super::element::empty_bottom_height(
-                self.is_code_editor(),
-                self.scroll_beyond_last_line,
-                bounds.size.height,
-                line_height,
-            );
-        let current = (-content.max(bounds.size.height) + self.input_bounds.size.height).min(px(0.));
+        let content = self.content_height(bounds.size.height, line_height, px(0.));
+        let current = (-content + self.input_bounds.size.height).min(px(0.));
         if rows == self.last_frame_wrap_rows {
             current.min(last_frame)
         } else {
             current
         }
+    }
+
+    /// HERDR: the scrollable height `TextElement` lays out for the current
+    /// text in a `viewport_height` view, with `ghost_lines_height` of inline
+    /// completion below the caret row. The one place this is computed, so
+    /// layout and the scroll clamps in this file agree.
+    pub(super) fn content_height(
+        &self,
+        viewport_height: Pixels,
+        line_height: Pixels,
+        ghost_lines_height: Pixels,
+    ) -> Pixels {
+        let empty_bottom = super::element::empty_bottom_height(
+            self.is_code_editor(),
+            self.scroll_beyond_last_line,
+            viewport_height,
+            line_height,
+        );
+        // Empty bottom and ghost lines both describe extra height past the
+        // last content row, so take the max rather than summing — summing
+        // left a band of empty space the cursor could never reach.
+        (line_height * self.display_map.wrap_row_count() + empty_bottom.max(ghost_lines_height))
+            .max(viewport_height)
     }
 
     /// HERDR: where the view will be after the next frame: a scroll queued
@@ -3419,7 +3453,6 @@ impl<M: InputModeKind> InputBaseState<M> {
         self.begin_programmatic_selection(cx);
         let id = self.selections.generate_id();
         let added = self.build_selection(id, start, end, selection.reversed);
-        let id = added.id;
         self.selections.add(added);
         self.selections.merge_overlapping();
         // Merging into an earlier selection drops the added id: reveal the
@@ -3559,17 +3592,16 @@ impl<M: InputModeKind> InputBaseState<M> {
     ///
     /// Before the first layout the request is kept and applied after it.
     pub fn scroll_to_row(&mut self, row: usize, align: RowScrollAlign, cx: &mut Context<Self>) {
-        let (Some(layout), Some(bounds)) = (self.last_layout.as_ref(), self.last_bounds) else {
+        let (Some(line_height), Some(bounds)) =
+            (self.last_layout.as_ref().map(|layout| layout.line_height), self.last_bounds)
+        else {
             // Clamp when applied: the text may still change before layout.
             self.queued_scroll = Some(QueuedScroll::Row(row, align));
             cx.notify();
             return;
         };
-        if matches!(self.queued_scroll, Some(QueuedScroll::Row(..) | QueuedScroll::Caret(_))) {
-            self.queued_scroll = None;
-        }
+        self.drop_pending_row_scroll();
         let row = row.min(self.text.lines_len().saturating_sub(1));
-        let line_height = layout.line_height;
         let rows = self
             .display_map
             .buffer_line_to_display_row_range(row)
@@ -3577,15 +3609,7 @@ impl<M: InputModeKind> InputBaseState<M> {
                 let start = self.display_map.buffer_line_to_display_row(row);
                 start..start + 1
             });
-        let mut top = line_height * rows.start;
-        // Rows below an inline completion are drawn under its ghost lines,
-        // as `row_bounds` measures them.
-        if let Some((ghost_row, ghost_height)) = self.last_ghost_block
-            && row > ghost_row
-        {
-            top += ghost_height;
-        }
-        let height = line_height * rows.len();
+        let (top, height) = self.row_span(row, rows, line_height);
         // Measure against a scroll already queued this frame, so "nearest"
         // can't keep an earlier target that would hide the row.
         let mut scroll_offset = self.queued_scroll_offset();
@@ -3668,20 +3692,73 @@ impl<M: InputModeKind> InputBaseState<M> {
             return None;
         }
         let rows = self.display_map.buffer_line_to_display_row_range(row)?;
-        let mut top = line_height * rows.start + self.queued_scroll_offset().y;
-        // Rows below an inline completion are drawn under its ghost lines.
-        if let Some((ghost_row, height)) = self.last_ghost_block
+        let (top, height) = self.row_span(row, rows, line_height);
+        Some((top + self.queued_scroll_offset().y, height))
+    }
+
+    /// Where buffer `row`, laid out on display `rows`, sits in the content
+    /// (unscrolled): `(top, height)`. Rows below an inline completion are
+    /// drawn under its ghost lines. Shared by [`Self::scroll_to_row`] and
+    /// [`Self::row_bounds`], so scrolling to a row and measuring it agree.
+    fn row_span(&self, row: usize, rows: Range<usize>, line_height: Pixels) -> (Pixels, Pixels) {
+        let mut top = line_height * rows.start;
+        if let Some((ghost_row, ghost_height)) = self.last_ghost_block
             && row > ghost_row
         {
-            top += height;
+            top += ghost_height;
         }
-        Some((top, line_height * rows.len()))
+        (top, line_height * rows.len())
+    }
+
+    /// Drop a row or caret scroll kept for after the first layout: a newer
+    /// scroll request replaces it.
+    fn drop_pending_row_scroll(&mut self) {
+        if matches!(self.queued_scroll, Some(QueuedScroll::Row(..) | QueuedScroll::Caret(_))) {
+            self.queued_scroll = None;
+        }
     }
 
     /// Whether the selections still match the last report.
     #[cfg(test)]
     fn selections_match_reported(&self) -> bool {
-        self.reported_selections == self.selections()
+        let mut current = Vec::new();
+        self.selection_report_into(&mut current);
+        self.reported_selections == current
+    }
+
+    /// The selections as scripts see them, in [`Self::selections`] order.
+    #[cfg(test)]
+    fn selection_report(&self) -> Vec<ReportedSelection> {
+        let mut out = Vec::new();
+        self.selection_report_into(&mut out);
+        out
+    }
+
+    /// Fill `out` with every selection as `{ row, col }` positions (`col` in
+    /// UTF-16 units, what scripts read), the active one first and the rest
+    /// in document order. Compared in that space, an edit that keeps a
+    /// caret's byte offset but moves its row or column is still a change,
+    /// and one that shifts bytes without moving any position isn't.
+    fn selection_report_into(&self, out: &mut Vec<ReportedSelection>) {
+        let point = |offset: usize| {
+            let point = self.text.offset_to_point(offset);
+            let col = self.text.slice_line(point.row).byte_to_utf16_idx(point.column);
+            (point.row, col)
+        };
+        out.clear();
+        out.extend(self.selections.iter().map(|sel| ReportedSelection {
+            start: point(sel.start),
+            end: point(sel.end),
+            reversed: sel.reversed,
+        }));
+        // Selections are usually kept in document order already: check
+        // before sorting.
+        let key = |sel: &ReportedSelection| (sel.start, sel.end, sel.reversed);
+        if let Some(rest) = out.get_mut(1..)
+            && !rest.is_sorted_by_key(key)
+        {
+            rest.sort_unstable_by_key(key);
+        }
     }
 
     fn mark_selections_reported(&mut self) {
@@ -3689,7 +3766,9 @@ impl<M: InputModeKind> InputBaseState<M> {
             return;
         }
         self.reported_selections_generation = self.selections.generation();
-        self.reported_selections = self.selections();
+        let mut current = std::mem::take(&mut self.reported_selections);
+        self.selection_report_into(&mut current);
+        self.reported_selections = current;
     }
 
     /// Runs on every notify. Every selection mutation goes through
@@ -3708,13 +3787,17 @@ impl<M: InputModeKind> InputBaseState<M> {
         self.reported_selections_generation = generation;
         // Compared whole, in `selections()` order, so two equal carets can't
         // both stand for one reported entry. Only a selection mutation gets
-        // here, so a cursor blink doesn't pay for the allocation.
-        let current = self.selections();
-        if current == self.reported_selections {
-            return;
+        // here, so a cursor blink doesn't pay for it.
+        let mut current = std::mem::take(&mut self.selection_report_scratch);
+        self.selection_report_into(&mut current);
+        let changed = current != self.reported_selections;
+        if changed {
+            std::mem::swap(&mut current, &mut self.reported_selections);
         }
-        self.reported_selections = current;
-        cx.emit(InputEvent::SelectionChange);
+        self.selection_report_scratch = current;
+        if changed {
+            cx.emit(InputEvent::SelectionChange);
+        }
     }
 
     /// The offset the next paint applies, if one is queued.
@@ -8116,7 +8199,7 @@ mod tests {
                     add(state, 5, 5);
                 }
                 add(state, 12, 12);
-                state.reported_selections = state.selections();
+                state.reported_selections = state.selection_report();
                 assert!(state.selections_match_reported(), "caret first: {caret_first}");
             });
         }
@@ -8136,7 +8219,7 @@ mod tests {
             };
             add(state, 5);
             add(state, 12);
-            state.reported_selections = state.selections();
+            state.reported_selections = state.selection_report();
             state.selections.remove_all_but_active();
             add(state, 5);
             add(state, 5);

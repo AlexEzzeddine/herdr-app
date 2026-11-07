@@ -2841,26 +2841,13 @@ impl<M: InputModeKind> Element for TextElement<M> {
         let ghost_line_count = ghost_lines.len();
         let ghost_lines_height = ghost_line_count as f32 * line_height;
 
-        let total_wrapped_lines = state.display_map.wrap_row_count();
-        let empty_bottom_height = empty_bottom_height(
-            state.is_code_editor(),
-            state.scroll_beyond_last_line,
-            bounds.size.height,
-            line_height,
-        );
-
-        // Empty bottom and ghost lines both describe extra height past the
-        // last content row, so take the max rather than summing — summing
-        // left a band of empty space the cursor could never reach.
         let mut scroll_size = size(
             if longest_line_width + line_number_width + RIGHT_MARGIN > bounds.size.width {
                 longest_line_width + line_number_width + RIGHT_MARGIN
             } else {
                 longest_line_width
             },
-            (total_wrapped_lines as f32 * line_height
-                + empty_bottom_height.max(ghost_lines_height))
-            .max(bounds.size.height),
+            state.content_height(bounds.size.height, line_height, ghost_lines_height),
         );
 
         // TODO: should be add some gap to right, to convenient to focus on boundary position
@@ -3118,17 +3105,9 @@ impl<M: InputModeKind> Element for TextElement<M> {
             }
         };
 
-        // HERDR: row backgrounds sit under the active line, selections and text.
-        for (y, height, paint) in &decorated_rows {
-            if let Some(color) = paint.background {
-                window.paint_quad(fill(
-                    Bounds::new(point(input_bounds.origin.x, *y), size(bounds.size.width, *height)),
-                    color,
-                ));
-            }
-        }
-
-        // Paint active line
+        // Paint active line. Its `(y, height)` is kept for the gutter, which
+        // repaints it.
+        let mut active_line_span = None;
         let mut offset_y = px(0.);
         if let Some(line_numbers) = prepaint.line_numbers.as_ref() {
             offset_y += invisible_top_padding;
@@ -3144,6 +3123,7 @@ impl<M: InputModeKind> Element for TextElement<M> {
                 // Paint the current line background
                 if is_active {
                     if let Some(bg_color) = active_line_color {
+                        active_line_span = Some((p.y, height, bg_color));
                         window.paint_quad(fill(
                             Bounds::new(p, size(bounds.size.width, height)),
                             bg_color,
@@ -3151,6 +3131,22 @@ impl<M: InputModeKind> Element for TextElement<M> {
                     }
                 }
                 offset_y += height;
+                // Ghost lines shift every later line down.
+                if Some(buffer_line) == prepaint.current_row {
+                    offset_y += prepaint.ghost_lines_height;
+                }
+            }
+        }
+
+        // HERDR: row backgrounds sit over the active line (a translucent one
+        // lets it show through) and under selections and text, so an opaque
+        // active-line color can't hide the decoration on the caret's row.
+        for (y, height, paint) in &decorated_rows {
+            if let Some(color) = paint.background {
+                window.paint_quad(fill(
+                    Bounds::new(point(input_bounds.origin.x, *y), size(bounds.size.width, *height)),
+                    color,
+                ));
             }
         }
 
@@ -3344,8 +3340,18 @@ impl<M: InputModeKind> Element for TextElement<M> {
                 editor_paddings,
             );
             window.paint_quad(fill(gutter_bounds, gutter_bg));
-            // HERDR: the opaque gutter covered the row backgrounds; repaint them
+            // The active line number's background, then (HERDR) the row
+            // backgrounds the opaque gutter covered, in the text area's order,
             // under the line numbers.
+            if let Some((y, height, bg_color)) = active_line_span {
+                window.paint_quad(fill(
+                    Bounds::new(
+                        point(gutter_bounds.origin.x, y),
+                        size(gutter_bounds.size.width, height),
+                    ),
+                    bg_color,
+                ));
+            }
             for (y, height, paint) in &decorated_rows {
                 if let Some(color) = paint.background {
                     window.paint_quad(fill(
@@ -3364,21 +3370,6 @@ impl<M: InputModeKind> Element for TextElement<M> {
                 .zip(prepaint.last_layout.visible_buffer_lines.iter())
             {
                 let p = point(input_bounds.origin.x, origin.y + offset_y);
-                let is_active = prepaint.current_row == Some(buffer_line);
-
-                let height = line_height * lines.len() as f32;
-                // paint active line number background
-                if is_active {
-                    if let Some(bg_color) = active_line_color {
-                        window.paint_quad(fill(
-                            Bounds::new(
-                                point(gutter_bounds.origin.x, p.y),
-                                size(gutter_bounds.size.width, height),
-                            ),
-                            bg_color,
-                        ));
-                    }
-                }
 
                 for line in lines {
                     _ = line.paint(p, line_height, TextAlign::Left, None, window, cx);
@@ -3873,6 +3864,26 @@ mod tests {
         cx.run_until_parked();
         assert_eq!(seen.get(), 1, "set_value stays silent");
         assert_eq!(editor.read_with(&cx, |state, _| state.selected_range()), 0..0);
+    }
+
+    // HERDR: selection changes are judged by the { row, col } scripts read
+    // (col in UTF-16 units), not by byte offsets.
+    #[gpui::test]
+    fn selection_changes_follow_script_positions(cx: &mut TestAppContext) {
+        let (editor, window) = decoration_editor(cx, "aa\néx", false);
+        let mut cx = VisualTestContext::from_window(window.into(), cx);
+        let seen = cx.update(|window, cx| count_selection_changes(&editor, window, cx));
+        // The caret after "é" (byte 5): row 1, col 1.
+        cx.update(|_window, cx| editor.update(cx, |state, cx| state.set_selected_range(5..5, cx)));
+        cx.run_until_parked();
+        assert_eq!(seen.get(), 1);
+        // "é" (2 bytes) to "ab" (2 bytes): same byte offset, col 1 -> 2.
+        cx.update(|window, cx| {
+            editor.update(cx, |state, cx| state.replace_text_in_ranges(&[(3..5, "ab".into())], window, cx))
+        });
+        cx.run_until_parked();
+        assert_eq!(editor.read_with(&cx, |state, _| state.selected_range()), 5..5);
+        assert_eq!(seen.get(), 2, "the caret's column moved");
     }
 
     // HERDR: a row asked for before layout and before the text arrives is still reached.

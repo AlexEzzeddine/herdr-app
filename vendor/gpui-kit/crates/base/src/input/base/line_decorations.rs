@@ -15,7 +15,7 @@ use gpui::{Hsla, SharedString};
 pub struct LineDecoration {
     /// 0-based buffer rows, end exclusive.
     pub rows: Range<usize>,
-    /// Fill behind the rows, under the active line, selections and text.
+    /// Fill behind the rows, over the active line and under selections and text.
     pub background: Option<Hsla>,
     /// A bar at the gutter's left edge; needs line numbers.
     pub gutter: Option<Hsla>,
