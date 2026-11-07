@@ -135,11 +135,18 @@ pub enum RowScrollAlign {
     Center,
 }
 
-/// A scroll asked for before the first layout, applied once there is one.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(in crate::input) enum PendingScroll {
-    /// [`InputBaseState::scroll_to_row`]; the row is clamped when applied,
-    /// since the text may still change before layout.
+/// HERDR: a scroll asked for and not applied yet. There is one at a time:
+/// the latest request replaces the one before it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(in crate::input) enum QueuedScroll {
+    /// An offset the next paint applies (and clamps). `reveal`: it reveals a
+    /// caret (cursor-follow) rather than being a scroll asked for by code
+    /// (`scroll_to_row`, `set_scroll_offset`). Replacing the text drops a
+    /// reveal, which points into the old text, but keeps a code scroll.
+    Offset { offset: Point<Pixels>, reveal: bool },
+    /// [`InputBaseState::scroll_to_row`] before the first layout, applied
+    /// once there is one; the row is clamped when applied, since the text
+    /// may still change before layout.
     Row(usize, RowScrollAlign),
     /// Reveal this selection's caret ([`InputBaseState::set_selections`]).
     /// Kept by id, not offset: selections follow edits made before layout,
@@ -544,20 +551,15 @@ pub struct InputBaseState<M: InputModeKind> {
     /// The maximum value for [`super::NumberInput`]. See [`Self::max`].
     pub(crate) number_max: Option<f64>,
     pub(crate) scroll_handle: ScrollHandle,
-    /// The deferred scroll offset to apply on next layout.
-    pub(crate) deferred_scroll_offset: Option<Point<Pixels>>,
-    /// HERDR: `deferred_scroll_offset` reveals a caret (cursor-follow) rather
-    /// than being a scroll asked for by code (`scroll_to_row`,
-    /// `set_scroll_offset`). Replacing the text drops a reveal, which points
-    /// into the old text, but keeps a code scroll.
-    pub(crate) deferred_scroll_is_reveal: bool,
+    /// HERDR: the scroll the next paint applies, if any.
+    pub(in crate::input) queued_scroll: Option<QueuedScroll>,
     /// HERDR: [`DisplayMap::wrap_row_count`] when the last frame was painted:
     /// while it is unchanged, the last frame's `scroll_size` (ghost lines
     /// included) still describes the text.
     pub(crate) last_frame_wrap_rows: usize,
-    /// A scroll asked for by code before the first layout, applied once
-    /// there is one. The latest request wins.
-    pub(in crate::input) pending_scroll: Option<PendingScroll>,
+    /// HERDR: `document_revision` when the last frame was painted: while it
+    /// is unchanged, the last frame's `scroll_size.width` is the text's.
+    pub(crate) last_frame_document_revision: u64,
     /// Paint selections even while another element has focus.
     pub(crate) show_unfocused_selection: bool,
     /// Whole-row backgrounds and gutter bars set by the application.
@@ -858,7 +860,7 @@ impl<M: InputModeKind> InputBaseState<M> {
         let blink_cursor = cx.new(|_| BlinkCursor::new());
         let undo_manager = UndoManager::new();
 
-        let _subscriptions = vec![
+        let mut _subscriptions = vec![
             // Key bindings can consume events before on_key_down. Observe input
             // before action dispatch so every keystroke resets the blink delay.
             cx.intercept_keystrokes({
@@ -885,10 +887,14 @@ impl<M: InputModeKind> InputBaseState<M> {
             }),
             cx.on_focus(&focus_handle, window, Self::on_focus),
             cx.on_blur(&focus_handle, window, Self::on_blur),
-            // Every selection mutation notifies; compare once here rather
-            // than emitting from each of them.
-            cx.observe_self(Self::report_selection_change),
         ];
+        // HERDR: only code editors report selection changes (scripts can
+        // subscribe to them on an `EditorState` alone). Every selection
+        // mutation notifies; compare once here rather than emitting from
+        // each of them.
+        if M::CODE_EDITOR {
+            _subscriptions.push(cx.observe_self(Self::report_selection_change));
+        }
 
         let text_style = window.text_style();
 
@@ -950,10 +956,9 @@ impl<M: InputModeKind> InputBaseState<M> {
             editor_scrollbar_snapshot: Cell::new(None),
             longest_line_width: Cell::new(None),
             editor_paddings: Edges::default(),
-            deferred_scroll_offset: None,
-            deferred_scroll_is_reveal: false,
+            queued_scroll: None,
             last_frame_wrap_rows: 0,
-            pending_scroll: None,
+            last_frame_document_revision: 0,
             show_unfocused_selection: false,
             line_decorations: Default::default(),
             reported_scroll: point(px(0.), px(0.)),
@@ -1279,18 +1284,20 @@ impl<M: InputModeKind> InputBaseState<M> {
         // the start visible; the deferred offset is consumed during that paint.
         self.scroll_handle.set_offset(point(px(0.), px(0.)));
         if self.is_single_line() {
-            self.deferred_scroll_offset = Some(point(px(0.), px(0.)));
-        } else if self.deferred_scroll_is_reveal {
-            // A reveal queued for the old text (a caret scrolled to in the
-            // same handler, after layout) would scroll the new text there.
-            // A scroll asked for by code (`scroll_to_row`, `set_scroll_offset`)
-            // is kept, as it is before layout; paint clamps it to the new text.
-            self.deferred_scroll_offset = None;
+            self.queue_scroll_offset(point(px(0.), px(0.)), false);
+            return;
         }
-        // A caret reveal asked for before layout belonged to the old text;
-        // a row request still applies (rows are clamped when applied).
-        if matches!(self.pending_scroll, Some(PendingScroll::Caret(_))) {
-            self.pending_scroll = None;
+        match self.queued_scroll {
+            // A caret reveal (queued after layout, or kept for after the
+            // first one) belongs to the old text and would scroll the new
+            // text there.
+            Some(QueuedScroll::Offset { reveal: true, .. } | QueuedScroll::Caret(_)) => {
+                self.queued_scroll = None;
+            }
+            // A scroll asked for by code (`scroll_to_row`, `set_scroll_offset`)
+            // is kept; paint clamps it to the new text, and rows are clamped
+            // when applied.
+            Some(QueuedScroll::Offset { reveal: false, .. } | QueuedScroll::Row(..)) | None => {}
         }
     }
 
@@ -2568,7 +2575,7 @@ impl<M: InputModeKind> InputBaseState<M> {
         let (offset, line_end_affinity, columns_past_line_end) =
             self.resolve_mouse_position(event.position);
 
-        if let Some(row) = self.gutter_row_at(event.position) {
+        if let Some(row) = self.gutter_row_at(event.position, event.button) {
             cx.emit(InputEvent::GutterClick {
                 row,
                 button: event.button,
@@ -2786,7 +2793,9 @@ impl<M: InputModeKind> InputBaseState<M> {
     ) {
         // The newest scroll request wins over one kept for after layout
         // (before layout the caret-follow in paint reveals this offset).
-        self.pending_scroll = None;
+        if matches!(self.queued_scroll, Some(QueuedScroll::Row(..) | QueuedScroll::Caret(_))) {
+            self.queued_scroll = None;
+        }
         let Some(last_layout) = self.last_layout.as_ref() else {
             return;
         };
@@ -2874,8 +2883,14 @@ impl<M: InputModeKind> InputBaseState<M> {
         let safe_y_min = self.safe_scroll_y_min(line_height);
         scroll_offset.x = scroll_offset.x.min(px(0.));
         scroll_offset.y = scroll_offset.y.clamp(safe_y_min, px(0.));
-        self.deferred_scroll_offset = Some(scroll_offset);
-        self.deferred_scroll_is_reveal = true;
+        // Revealing an offset that is visible at a code scroll queued earlier
+        // in this handler keeps that scroll, labelled as asked for by code,
+        // so replacing the text afterwards doesn't drop it.
+        let keeps_code_scroll = scroll_offset == was_offset
+            && matches!(self.queued_scroll, Some(QueuedScroll::Offset { reveal: false, .. }));
+        if !keeps_code_scroll {
+            self.queue_scroll_offset(scroll_offset, true);
+        }
         cx.notify();
     }
 
@@ -2911,19 +2926,27 @@ impl<M: InputModeKind> InputBaseState<M> {
     /// in this handler (clamped to what the text can reach, since
     /// `set_scroll_offset` stores any offset), or the current one.
     pub fn queued_scroll_offset(&self) -> Point<Pixels> {
-        let Some(mut offset) = self.deferred_scroll_offset else {
+        let Some(mut offset) = self.deferred_scroll_offset() else {
             return self.scroll_handle.offset();
         };
         let (Some(layout), Some(bounds)) = (self.last_layout.as_ref(), self.last_bounds) else {
             return offset;
         };
         offset.y = offset.y.clamp(self.safe_scroll_y_min(layout.line_height), px(0.));
-        offset.x = super::element::clamp_horizontal_scroll_offset(
-            offset.x,
-            self.scroll_size.width,
-            bounds.size.width,
-            layout.text_align,
-        );
+        offset.x = if self.document_revision == self.last_frame_document_revision {
+            super::element::clamp_horizontal_scroll_offset(
+                offset.x,
+                self.scroll_size.width,
+                bounds.size.width,
+                layout.text_align,
+            )
+        } else {
+            // The text changed since the last frame, whose width no longer
+            // describes it, and the new width is only known once it is laid
+            // out: keep the offset (never right of the start), and let paint
+            // clamp it.
+            offset.x.min(px(0.))
+        };
         offset
     }
 
@@ -3302,9 +3325,7 @@ impl<M: InputModeKind> InputBaseState<M> {
     /// The offset will be clamped to the valid range, and applied after the next layout.
     pub fn set_scroll_offset(&mut self, offset: gpui::Point<gpui::Pixels>, cx: &mut Context<Self>) {
         // The newest scroll request wins over one kept for after layout.
-        self.pending_scroll = None;
-        self.deferred_scroll_offset = Some(offset);
-        self.deferred_scroll_is_reveal = false;
+        self.queue_scroll_offset(offset, false);
         cx.notify();
     }
 
@@ -3410,9 +3431,12 @@ impl<M: InputModeKind> InputBaseState<M> {
     /// Every selection, the active (primary) one first, the rest in document
     /// order.
     pub fn selections(&self) -> Vec<SelectionRange> {
-        // The active selection is always first in `self.selections`.
+        // The active selection is always first in `self.selections`. Ties
+        // on start (a caret at a selection's start, which adding a cursor
+        // above or below doesn't merge) are ordered by end, so the order
+        // doesn't depend on how the selections were added.
         let mut out: Vec<SelectionRange> = self.selections.iter().map(Self::selection_range).collect();
-        out[1..].sort_by_key(|sel| sel.range.start);
+        out[1..].sort_by_key(|sel| (sel.range.start, sel.range.end));
         out
     }
 
@@ -3509,7 +3533,7 @@ impl<M: InputModeKind> InputBaseState<M> {
     /// Scroll selection `id`'s caret into view now, or after the first layout.
     fn reveal_caret(&mut self, id: super::selection::CursorId, cx: &mut Context<Self>) {
         if self.last_layout.is_none() || self.last_bounds.is_none() {
-            self.pending_scroll = Some(PendingScroll::Caret(id));
+            self.queued_scroll = Some(QueuedScroll::Caret(id));
             return;
         }
         self.scroll_to(self.caret_of(id), None, cx);
@@ -3522,11 +3546,13 @@ impl<M: InputModeKind> InputBaseState<M> {
     pub fn scroll_to_row(&mut self, row: usize, align: RowScrollAlign, cx: &mut Context<Self>) {
         let (Some(layout), Some(bounds)) = (self.last_layout.as_ref(), self.last_bounds) else {
             // Clamp when applied: the text may still change before layout.
-            self.pending_scroll = Some(PendingScroll::Row(row, align));
+            self.queued_scroll = Some(QueuedScroll::Row(row, align));
             cx.notify();
             return;
         };
-        self.pending_scroll = None;
+        if matches!(self.queued_scroll, Some(QueuedScroll::Row(..) | QueuedScroll::Caret(_))) {
+            self.queued_scroll = None;
+        }
         let row = row.min(self.text.lines_len().saturating_sub(1));
         let line_height = layout.line_height;
         let rows = self
@@ -3536,7 +3562,14 @@ impl<M: InputModeKind> InputBaseState<M> {
                 let start = self.display_map.buffer_line_to_display_row(row);
                 start..start + 1
             });
-        let top = line_height * rows.start;
+        let mut top = line_height * rows.start;
+        // Rows below an inline completion are drawn under its ghost lines,
+        // as `row_bounds` measures them.
+        if let Some((ghost_row, ghost_height)) = self.last_ghost_block
+            && row > ghost_row
+        {
+            top += ghost_height;
+        }
         let height = line_height * rows.len();
         // Measure against a scroll already queued this frame, so "nearest"
         // can't keep an earlier target that would hide the row.
@@ -3555,8 +3588,7 @@ impl<M: InputModeKind> InputBaseState<M> {
         };
         let safe_y_min = self.safe_scroll_y_min(line_height);
         scroll_offset.y = (-target).clamp(safe_y_min, px(0.));
-        self.deferred_scroll_offset = Some(scroll_offset);
-        self.deferred_scroll_is_reveal = false;
+        self.queue_scroll_offset(scroll_offset, false);
         cx.notify();
     }
 
@@ -3575,13 +3607,15 @@ impl<M: InputModeKind> InputBaseState<M> {
         }
     }
 
-    /// Whether `position` (window coordinates) is in the line-number gutter.
-    /// Fold chevrons take their own presses before the input sees them.
+    /// Whether `position` (window coordinates) is on the line numbers: in
+    /// the gutter, right of its left padding (where the decoration bars
+    /// paint).
     fn is_in_gutter(&self, position: Point<Pixels>) -> bool {
         let Some(layout) = self.last_layout.as_ref() else {
             return false;
         };
         self.mode.line_number()
+            && position.x >= self.input_bounds.origin.x
             && super::element::editor_gutter_bounds(
                 self.input_bounds,
                 layout.line_number_width,
@@ -3591,14 +3625,16 @@ impl<M: InputModeKind> InputBaseState<M> {
             .contains(&position)
     }
 
-    /// The buffer row whose line number is under `position`: `None` outside
-    /// the gutter, on a fold chevron (it takes its own presses), or off every
-    /// laid-out row (the padding, the ghost lines of an inline completion, or
-    /// the empty space below the last line). Rows are measured like
-    /// [`Self::resolve_mouse_position`], so it matches where the caret goes.
-    pub(super) fn gutter_row_at(&self, position: Point<Pixels>) -> Option<usize> {
+    /// The buffer row whose line number a `button` press at `position` is
+    /// on: `None` outside the gutter or in its padding, for a left press on a
+    /// fold chevron (it takes those itself), or off every laid-out row (the
+    /// ghost lines of an inline completion, or the empty space below the
+    /// last line). Rows are measured like [`Self::resolve_mouse_position`],
+    /// so it matches where the caret goes.
+    pub(super) fn gutter_row_at(&self, position: Point<Pixels>, button: MouseButton) -> Option<usize> {
         if !self.is_in_gutter(position)
-            || self.last_fold_icon_bounds.iter().any(|icon| icon.contains(&position))
+            || (button == MouseButton::Left
+                && self.last_fold_icon_bounds.iter().any(|icon| icon.contains(&position)))
         {
             return None;
         }
@@ -3638,7 +3674,8 @@ impl<M: InputModeKind> InputBaseState<M> {
         if reported.len() != self.selections.len() {
             return false;
         }
-        // `reported` is in `selections()` order: active first, then by start.
+        // `reported` is in `selections()` order: active first, then by
+        // (start, end).
         let mut rest = self.selections.iter();
         let Some(active) = rest.next() else {
             return reported.is_empty();
@@ -3648,12 +3685,15 @@ impl<M: InputModeKind> InputBaseState<M> {
         }
         rest.all(|sel| {
             reported[1..]
-                .binary_search_by_key(&sel.start, |r| r.range.start)
+                .binary_search_by_key(&(sel.start, sel.end), |r| (r.range.start, r.range.end))
                 .is_ok_and(|i| reported[1 + i] == Self::selection_range(sel))
         })
     }
 
     fn mark_selections_reported(&mut self) {
+        if !M::CODE_EDITOR {
+            return;
+        }
         self.reported_selections_generation = self.selections.generation();
         if !self.selections_match_reported() {
             self.reported_selections = self.selections();
@@ -3681,12 +3721,25 @@ impl<M: InputModeKind> InputBaseState<M> {
         cx.emit(InputEvent::SelectionChange);
     }
 
-    /// Apply a scroll asked for before layout.
-    pub(super) fn apply_pending_scroll(&mut self, cx: &mut Context<Self>) {
-        match self.pending_scroll.take() {
-            Some(PendingScroll::Row(row, align)) => self.scroll_to_row(row, align, cx),
-            Some(PendingScroll::Caret(id)) => self.scroll_to(self.caret_of(id), None, cx),
-            None => {}
+    /// The offset the next paint applies, if one is queued.
+    pub(crate) fn deferred_scroll_offset(&self) -> Option<Point<Pixels>> {
+        match self.queued_scroll {
+            Some(QueuedScroll::Offset { offset, .. }) => Some(offset),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn queue_scroll_offset(&mut self, offset: Point<Pixels>, reveal: bool) {
+        self.queued_scroll = Some(QueuedScroll::Offset { offset, reveal });
+    }
+
+    /// After a paint: drop the offset it applied, and apply a scroll asked
+    /// for before layout.
+    pub(super) fn apply_queued_scroll(&mut self, cx: &mut Context<Self>) {
+        match self.queued_scroll.take() {
+            Some(QueuedScroll::Row(row, align)) => self.scroll_to_row(row, align, cx),
+            Some(QueuedScroll::Caret(id)) => self.scroll_to(self.caret_of(id), None, cx),
+            Some(QueuedScroll::Offset { .. }) | None => {}
         }
     }
 
@@ -6788,7 +6841,7 @@ mod tests {
                 state.move_to(end, Some(MoveDirection::Down), cx);
 
                 let deferred = state
-                    .deferred_scroll_offset
+                    .deferred_scroll_offset()
                     .expect("scroll_to should populate deferred_scroll_offset");
                 let safe_y_min =
                     (-state.scroll_size.height + state.input_bounds.size.height).min(px(0.));
@@ -7935,7 +7988,7 @@ mod tests {
                     "single-line caret should be at the end after set_value"
                 );
                 assert_eq!(
-                    state.deferred_scroll_offset,
+                    state.deferred_scroll_offset(),
                     Some(point(px(0.), px(0.))),
                     "the view should be forced back to the start"
                 );
@@ -7992,7 +8045,7 @@ mod tests {
                     "the scroll offset should be reset to the start"
                 );
                 assert_eq!(
-                    state.deferred_scroll_offset,
+                    state.deferred_scroll_offset(),
                     Some(point(px(0.), px(0.))),
                     "single-line should set a deferred scroll offset to keep the start visible"
                 );
@@ -8046,6 +8099,60 @@ mod tests {
         cx.run_until_parked();
     }
 
+    /// HERDR: selections that share a start (a caret added at a selection's
+    /// start, which isn't merged) still match their report.
+    #[gpui::test]
+    fn selections_sharing_a_start_match_their_report(cx: &mut TestAppContext) {
+        let input_view = InputView::build_textarea(cx, |state| state.default_value("alpha beta gamma"));
+        let mut cx = VisualTestContext::from_window(input_view.window_handle.into(), cx);
+        for caret_first in [true, false] {
+            input_view.input.update_in(&mut cx, |state, _, cx| {
+                state.set_selected_range(0..0, cx);
+                let mut add = |state: &mut InputBaseState<TextareaMode>, start, end| {
+                    let id = state.selections.generate_id();
+                    state.selections.add(CursorSelection::new(id, start, end));
+                };
+                if caret_first {
+                    add(state, 5, 5);
+                    add(state, 5, 10);
+                } else {
+                    add(state, 5, 10);
+                    add(state, 5, 5);
+                }
+                add(state, 12, 12);
+                state.reported_selections = state.selections();
+                assert!(state.selections_match_reported(), "caret first: {caret_first}");
+            });
+        }
+    }
+
+    /// HERDR: only code editors report selection changes and scrolls.
+    #[gpui::test]
+    fn textareas_report_no_selection_changes_or_scrolls(cx: &mut TestAppContext) {
+        let text = (0..60).map(|i| format!("line {i}")).collect::<Vec<_>>().join("\n");
+        let input_view = InputView::build_textarea(cx, |state| state.default_value(text));
+        let mut cx = VisualTestContext::from_window(input_view.window_handle.into(), cx);
+        let input = input_view.input;
+        let seen = std::rc::Rc::new(std::cell::Cell::new(0));
+        cx.update(|window, cx| {
+            let seen = seen.clone();
+            window
+                .subscribe(&input, cx, move |_, event: &InputEvent, _, _| {
+                    if matches!(event, InputEvent::SelectionChange | InputEvent::Scroll) {
+                        seen.set(seen.get() + 1);
+                    }
+                })
+                .detach();
+        });
+        cx.run_until_parked();
+        input.update_in(&mut cx, |state, _, cx| {
+            state.set_selected_range(2..4, cx);
+            state.scroll_to_row(40, RowScrollAlign::Top, cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(seen.get(), 0);
+    }
+
     /// `replace_all` on a multi-line (non-code-editor) input clears the
     /// selection to `0..0` and resets the scroll offset, but does not set a
     /// deferred scroll offset (single-line only).
@@ -8071,7 +8178,7 @@ mod tests {
                     "the scroll offset should be reset to the start"
                 );
                 assert!(
-                    state.deferred_scroll_offset.is_none(),
+                    state.deferred_scroll_offset().is_none(),
                     "multi-line should not set a deferred scroll offset"
                 );
             });

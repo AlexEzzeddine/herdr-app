@@ -750,7 +750,7 @@ impl<M: InputModeKind> TextElement<M> {
             });
         }
 
-        if let Some(deferred_scroll_offset) = state.deferred_scroll_offset {
+        if let Some(deferred_scroll_offset) = state.deferred_scroll_offset() {
             scroll_offset = deferred_scroll_offset;
         }
         scroll_offset.x = clamp_horizontal_scroll_offset(
@@ -1092,7 +1092,7 @@ impl<M: InputModeKind> TextElement<M> {
             return (0..0, Vec::new(), px(0.));
         }
 
-        let mut scroll_top = if let Some(deferred_scroll_offset) = state.deferred_scroll_offset {
+        let mut scroll_top = if let Some(deferred_scroll_offset) = state.deferred_scroll_offset() {
             deferred_scroll_offset.y
         } else {
             state.scroll_handle.offset().y
@@ -3436,17 +3436,18 @@ impl<M: InputModeKind> Element for TextElement<M> {
             state.last_ghost_block = ghost;
             state.last_fold_icon_bounds = fold_icon_bounds;
             state.last_frame_wrap_rows = state.display_map.wrap_row_count();
+            state.last_frame_document_revision = state.document_revision;
             state.update_scroll_offset(Some(prepaint.cursor_scroll_offset), cx);
-            state.deferred_scroll_offset = None;
-            state.apply_pending_scroll(cx);
+            state.apply_queued_scroll(cx);
             // Scrolls are reported here rather than from the setters: code
             // scrolls (`scroll_to_row`, `set_scroll_offset`, caret reveals)
             // only queue a deferred offset that this frame applies, and the
             // scrollbar writes the shared `ScrollHandle` directly. An editor
             // that isn't painted hasn't scrolled yet, so it has nothing to
-            // report until it is.
+            // report until it is. Only code editors report scrolls, as
+            // only they report selection changes.
             let scroll = state.scroll_handle.offset();
-            if scroll != state.reported_scroll {
+            if state.is_code_editor() && scroll != state.reported_scroll {
                 state.reported_scroll = scroll;
                 if state.emit_events {
                     cx.emit(crate::input::InputEvent::Scroll);
@@ -4213,7 +4214,7 @@ mod tests {
         // completion here to draw one.
         cx.update(|_, cx| editor.update(cx, |state, _| state.last_ghost_block = Some((1, ghost))));
         editor.read_with(&cx, |state, _| {
-            let at = |row_y: Pixels| state.gutter_row_at(point(gutter, top + row_y));
+            let at = |row_y: Pixels| state.gutter_row_at(point(gutter, top + row_y), MouseButton::Left);
             assert_eq!(at(line_height * 0.5), Some(0));
             assert_eq!(at(line_height * 1.5), Some(1));
             assert_eq!(at(line_height * 2.5), None, "on the ghost lines");
@@ -4343,7 +4344,7 @@ mod tests {
                 );
                 state.scroll_to_row(9, crate::input::RowScrollAlign::Top, cx);
                 (
-                    state.deferred_scroll_offset.expect("queued"),
+                    state.deferred_scroll_offset().expect("queued"),
                     state.last_layout.as_ref().unwrap().line_height,
                 )
             });
@@ -4392,10 +4393,95 @@ mod tests {
         );
     }
 
-    // HERDR: a press on a painted fold chevron is the chevron's, whichever
-    // button: it is not reported as a gutter click.
+    // HERDR: revealing a caret that is already visible at a code scroll
+    // queued in the same handler leaves that scroll a code scroll, so a
+    // set_value after it keeps it.
     #[gpui::test]
-    fn a_press_on_a_fold_chevron_is_not_a_gutter_click(cx: &mut TestAppContext) {
+    fn a_visible_caret_reveal_keeps_a_code_scroll_through_set_value(cx: &mut TestAppContext) {
+        let (editor, window) = decoration_editor(cx, &sixty_lines("old"), false);
+        let mut cx = VisualTestContext::from_window(window.into(), cx);
+        cx.update(|window, cx| {
+            window.draw(cx).clear(cx);
+            editor.update(cx, |state, cx| {
+                state.scroll_to_row(40, crate::input::RowScrollAlign::Top, cx);
+                let queued = state.queued_scroll_offset();
+                let line_height = state.last_layout.as_ref().unwrap().line_height;
+                let visible = (state.last_bounds.unwrap().size.height / line_height) as usize;
+                let row = 40 + visible / 2;
+                let start: usize = state.value().split('\n').take(row).map(|line| line.len() + 1).sum();
+                state.set_selections(vec![sel(start..start + 2, false)], cx);
+                assert_eq!(state.queued_scroll_offset(), queued, "row {row} is visible there");
+                state.set_value(sixty_lines("new"), window, cx);
+            });
+            window.draw(cx).clear(cx);
+        });
+        let (top, _) = editor.read_with(&cx, |state, _| state.row_bounds(40)).expect("row 40");
+        assert_eq!(top, px(0.), "row 40 stays at the top");
+    }
+
+    // HERDR: scroll_to_row measures rows below an inline completion's ghost
+    // lines where they are drawn, as row_bounds does.
+    #[gpui::test]
+    fn scroll_to_row_counts_ghost_lines_above_the_row(cx: &mut TestAppContext) {
+        let (editor, window) = decoration_editor(cx, &sixty_lines("line"), false);
+        let mut cx = VisualTestContext::from_window(window.into(), cx);
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        editor.update_in(&mut cx, |state, _, cx| {
+            let line_height = state.last_layout.as_ref().unwrap().line_height;
+            // Set after the frame: there is no inline completion here to draw one.
+            state.last_ghost_block = Some((10, line_height * 3.));
+            state.scroll_to_row(20, crate::input::RowScrollAlign::Top, cx);
+            assert_eq!(state.row_bounds(20).expect("row 20").0, px(0.), "row 20 is at the top");
+            state.scroll_to_row(5, crate::input::RowScrollAlign::Top, cx);
+            assert_eq!(state.row_bounds(5).expect("row 5").0, px(0.), "rows above the ghost lines");
+        });
+    }
+
+    // HERDR: a horizontal scroll queued after replacing the text isn't
+    // clamped to the old text's width.
+    #[gpui::test]
+    fn a_horizontal_scroll_after_set_value_reaches_the_new_text(cx: &mut TestAppContext) {
+        let (editor, window) = decoration_editor(cx, "short", false);
+        let mut cx = VisualTestContext::from_window(window.into(), cx);
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        let queued = editor.update_in(&mut cx, |state, window, cx| {
+            state.set_value("x".repeat(600), window, cx);
+            state.set_scroll_offset(point(px(-800.), px(0.)), cx);
+            state.queued_scroll_offset().x
+        });
+        assert_eq!(queued, px(-800.));
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        assert_eq!(editor.read_with(&cx, |state, _| state.scroll_offset().x), px(-800.));
+    }
+
+    // HERDR: presses in the gutter's left padding (where decoration bars
+    // paint) are not on a line number.
+    #[gpui::test]
+    fn gutter_padding_presses_are_not_gutter_clicks(cx: &mut TestAppContext) {
+        let (editor, mut cx) = numbered_editor(cx, "a\nb\nc");
+        cx.update(|_, cx| {
+            editor.update(cx, |state, _| {
+                state.editor_paddings = Edges { left: px(8.), ..Default::default() }
+            })
+        });
+        editor.read_with(&cx, |state, _| {
+            let line_height = state.last_layout.as_ref().unwrap().line_height;
+            let origin = state.input_bounds.origin;
+            let y = origin.y + line_height * 1.5;
+            assert_eq!(
+                state.gutter_row_at(point(origin.x - px(4.), y), MouseButton::Left),
+                None,
+                "in the padding"
+            );
+            assert_eq!(state.gutter_row_at(point(origin.x + px(2.), y), MouseButton::Left), Some(1));
+        });
+    }
+
+    // HERDR: a left press on a painted fold chevron is the chevron's: it is
+    // not reported as a gutter click. The chevron ignores other buttons, so
+    // a right press there is one.
+    #[gpui::test]
+    fn a_left_press_on_a_fold_chevron_is_not_a_gutter_click(cx: &mut TestAppContext) {
         let (editor, mut cx) = numbered_editor(cx, "a\nb\nc");
         let (gutter, top, line_height) = editor.read_with(&cx, |state, _| {
             let layout = state.last_layout.as_ref().unwrap();
@@ -4416,11 +4502,16 @@ mod tests {
         editor.read_with(&cx, |state, _| {
             let y = top + line_height * 1.5;
             assert_eq!(
-                state.gutter_row_at(point(gutter + px(12.), y)),
+                state.gutter_row_at(point(gutter + px(12.), y), MouseButton::Left),
                 None,
                 "on the chevron"
             );
-            assert_eq!(state.gutter_row_at(point(gutter, y)), Some(1), "beside it");
+            assert_eq!(
+                state.gutter_row_at(point(gutter + px(12.), y), MouseButton::Right),
+                Some(1),
+                "a right press on the chevron"
+            );
+            assert_eq!(state.gutter_row_at(point(gutter, y), MouseButton::Left), Some(1), "beside it");
         });
     }
 
@@ -4592,7 +4683,8 @@ mod tests {
             for deferred in [None, Some(point(px(-80.), px(0.)))] {
                 editor.update(cx, |state, _| {
                     state.scroll_handle.set_offset(point(px(-40.), px(0.)));
-                    state.deferred_scroll_offset = deferred;
+                    state.queued_scroll = deferred
+                        .map(|offset| super::super::state::QueuedScroll::Offset { offset, reveal: false });
                 });
                 let mut bounds = input_bounds;
                 let (carets, offset, _) =
@@ -4635,7 +4727,7 @@ mod tests {
                     editor.update(cx, |state, _| {
                         state.text_align = alignment;
                         state.last_selected_range = Some(*state.active_selection());
-                        state.deferred_scroll_offset = Some(point(minimum, px(0.)));
+                        state.queue_scroll_offset(point(minimum, px(0.)), false);
                     });
                     let mut bounds = input_bounds;
                     let (expected, _, _) =
@@ -4643,7 +4735,7 @@ mod tests {
 
                     for target in [minimum - px(100.), px(100.)] {
                         editor.update(cx, |state, _| {
-                            state.deferred_scroll_offset = Some(point(target, px(0.)));
+                            state.queue_scroll_offset(point(target, px(0.)), false);
                         });
                         let mut bounds = input_bounds;
                         let (carets, offset, _) =
@@ -4694,13 +4786,13 @@ mod tests {
                     );
                     state.last_selected_range = Some(*state.active_selection());
                     state.scroll_handle.set_offset(point(px(0.), px(0.)));
-                    state.deferred_scroll_offset = None;
+                    state.queued_scroll = None;
                 });
                 let mut bounds = input_bounds;
                 let (baseline, _, _) =
                     element.layout_cursors(&layout, &mut bounds, scroll_size, window, cx);
                 editor.update(cx, |state, _| {
-                    state.deferred_scroll_offset = Some(point(px(-60.), px(0.)));
+                    state.queue_scroll_offset(point(px(-60.), px(0.)), false);
                 });
                 let mut bounds = input_bounds;
                 let (carets, offset, _) =

@@ -3161,9 +3161,9 @@ const BASE: &str = r#"  /** A row. */
      * `scroll`: the view scrolled; `scroll_position()` and `row_bounds()` are current in the handler.
      * Only editors report these two (inputs and textareas reject them). */
     on(event: "change" | "submit" | "focus" | "blur" | "paste_other" | "selection_change" | "scroll", handler: (event: InputEvent, cx: Context) => void): boolean;
-    /** A press on a line number (not a fold chevron). The press still places the caret,
-     * so dragging down the gutter still selects lines. Presses in the gutter's padding or
-     * below the last line report nothing. Needs line numbers. */
+    /** A press on a line number (a left press on a fold chevron folds instead). The press
+     * still places the caret, so dragging down the gutter still selects lines. Presses in the
+     * gutter's padding or below the last line report nothing. Needs line numbers. */
     on(event: "gutter_click", handler: (event: GutterClickEvent, cx: Context) => void): boolean;
     /** Replaces the line decorations under `key` (each owner uses its own key, so they
      * don't replace each other); an empty list removes them. Rows are fixed: they don't

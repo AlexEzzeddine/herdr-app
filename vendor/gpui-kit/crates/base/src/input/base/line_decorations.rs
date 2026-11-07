@@ -53,7 +53,46 @@ pub(crate) struct RowPaint {
 /// painting, so a set costs the number of decorations, not of decorated rows.
 #[derive(Default)]
 pub(crate) struct LineDecorations {
-    by_key: BTreeMap<SharedString, Vec<LineDecoration>>,
+    by_key: BTreeMap<SharedString, KeyDecorations>,
+}
+
+/// One key's decorations, indexed so painting finds those over the visible
+/// rows without walking the rest.
+struct KeyDecorations {
+    /// In the order they were set: later ones win.
+    list: Vec<LineDecoration>,
+    /// Indices into `list`, sorted by `rows.start`.
+    by_start: Vec<usize>,
+    /// `max_end[i]`: the largest `rows.end` among `by_start[..=i]`. It never
+    /// decreases, so the first decoration that can reach a row is found by
+    /// binary search even when ranges nest or overlap.
+    max_end: Vec<usize>,
+}
+
+impl KeyDecorations {
+    fn new(list: Vec<LineDecoration>) -> Self {
+        let mut by_start: Vec<usize> = (0..list.len()).collect();
+        by_start.sort_by_key(|&i| list[i].rows.start);
+        let max_end = by_start
+            .iter()
+            .scan(0, |max, &i| {
+                *max = (*max).max(list[i].rows.end);
+                Some(*max)
+            })
+            .collect();
+        Self { list, by_start, max_end }
+    }
+
+    /// Indices into `list` of the decorations that overlap `first..=last`,
+    /// in `by_start` order.
+    fn overlapping(&self, first: usize, last: usize) -> impl Iterator<Item = usize> + '_ {
+        let from = self.max_end.partition_point(|&end| end <= first);
+        let to = self.by_start.partition_point(|&i| self.list[i].rows.start <= last);
+        self.by_start[from..to.max(from)]
+            .iter()
+            .copied()
+            .filter(move |&i| self.list[i].rows.end > first)
+    }
 }
 
 impl LineDecorations {
@@ -70,10 +109,10 @@ impl LineDecorations {
             .collect();
         if decorations.is_empty() {
             self.by_key.remove(&key).is_some()
-        } else if self.by_key.get(&key) == Some(&decorations) {
+        } else if self.by_key.get(&key).is_some_and(|set| set.list == decorations) {
             false
         } else {
-            self.by_key.insert(key, decorations);
+            self.by_key.insert(key, KeyDecorations::new(decorations));
             true
         }
     }
@@ -81,23 +120,38 @@ impl LineDecorations {
     /// The paint of each of `rows` (sorted ascending, as laid out: folds
     /// skip rows), one entry per row. Later decorations win, within a key
     /// and across keys (in key order). Only the given rows are resolved, so
-    /// a fold over many rows costs nothing.
+    /// a fold over many rows costs nothing, and only the decorations that
+    /// reach from the first to the last of them are looked at.
     pub(crate) fn resolve(&self, rows: &[usize]) -> Vec<Option<RowPaint>> {
         let mut out = vec![None; rows.len()];
-        for decoration in self.by_key.values().flatten() {
-            let start = rows.partition_point(|&row| row < decoration.rows.start);
-            let end = rows.partition_point(|&row| row < decoration.rows.end);
-            for paint in &mut out[start..end] {
-                let paint = paint.get_or_insert_with(RowPaint::default);
-                if decoration.background.is_some() {
-                    paint.background = decoration.background;
-                }
-                if decoration.gutter.is_some() {
-                    paint.gutter = decoration.gutter;
-                }
+        let (Some(&first), Some(&last)) = (rows.first(), rows.last()) else {
+            return out;
+        };
+        let mut hits = Vec::new();
+        for set in self.by_key.values() {
+            hits.clear();
+            hits.extend(set.overlapping(first, last));
+            // Apply in the order they were set, so later ones win.
+            hits.sort_unstable();
+            for decoration in hits.iter().map(|&i| &set.list[i]) {
+                Self::paint(decoration, rows, &mut out);
             }
         }
         out
+    }
+
+    fn paint(decoration: &LineDecoration, rows: &[usize], out: &mut [Option<RowPaint>]) {
+        let start = rows.partition_point(|&row| row < decoration.rows.start);
+        let end = rows.partition_point(|&row| row < decoration.rows.end);
+        for paint in &mut out[start..end] {
+            let paint = paint.get_or_insert_with(RowPaint::default);
+            if decoration.background.is_some() {
+                paint.background = decoration.background;
+            }
+            if decoration.gutter.is_some() {
+                paint.gutter = decoration.gutter;
+            }
+        }
     }
 
     #[cfg(test)]
@@ -147,6 +201,33 @@ mod tests {
         assert!(!decorations.set("b".into(), vec![LineDecoration::new(0..2)]));
         assert!(!decorations.set("c".into(), vec![LineDecoration::new(4..4).with_gutter(red)]));
         assert!(!decorations.is_empty());
+    }
+
+    #[test]
+    fn overlapping_and_nested_decorations_are_found_and_keep_their_order() {
+        let red = hsla(0., 1., 0.5, 1.);
+        let green = hsla(0.33, 1., 0.5, 1.);
+        let blue = hsla(0.66, 1., 0.5, 1.);
+        let mut decorations = LineDecorations::default();
+        decorations.set(
+            "a".into(),
+            vec![
+                // Set first but starts last: still painted under the others.
+                LineDecoration::new(50..60).with_background(red),
+                LineDecoration::new(0..100).with_background(green),
+                LineDecoration::new(10..12).with_background(blue),
+                LineDecoration::new(20..30).with_gutter(red),
+            ],
+        );
+        let rows: Vec<usize> = (40..70).collect();
+        let resolved = decorations.resolve(&rows);
+        assert_eq!(resolved[0].unwrap().background, Some(green), "only the long range reaches 40");
+        assert_eq!(resolved[0].unwrap().gutter, None);
+        assert_eq!(resolved[15].unwrap().background, Some(green), "55: green was set after red");
+        assert_eq!(decorations.row(11).unwrap().background, Some(blue));
+        assert_eq!(decorations.row(25).unwrap(), RowPaint { background: Some(green), gutter: Some(red) });
+        assert_eq!(decorations.row(100), None);
+        assert!(decorations.resolve(&[]).is_empty());
     }
 
     #[test]
