@@ -944,8 +944,9 @@ and `on("scroll")` report changes. `set_line_decorations(key, [{ row,
 end_row?, background?, gutter? }])` colors whole rows and puts a bar in the
 gutter (a diff: re-set on `change`, rows don't follow edits; set them
 before or after `set_value`);
-`on("gutter_click", ({ row, button }) => …)` reports a press on a line
-number. `show_unfocused_selection: true` keeps
+`on("gutter_click", ({ row, button, click_count }) => …)` reports a press
+on a line number; a double-click reports two presses, so toggle only on
+`click_count === 1`. `show_unfocused_selection: true` keeps
 selections painted while another element has focus. A viewer opens
 beside the shell as a pane: `pane.split {direction, mod, props: { file }}`.
 The full surface is in `gpui-kit.d.ts` next to this file.

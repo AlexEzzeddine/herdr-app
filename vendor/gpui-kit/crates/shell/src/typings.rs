@@ -3036,7 +3036,10 @@ const BASE: &str = r#"  /** A row. */
   export interface GutterClickEvent extends InputEvent {
     /** 0-based buffer row. */
     readonly row: number;
-    readonly button: "left" | "right" | "middle";
+    readonly button: "left" | "right" | "middle" | "back" | "forward";
+    /** 1 for a single press, 2 on the second press of a double-click, 3 for a
+     * triple-click. Every press is reported: act on `click_count === 1` to toggle. */
+    readonly click_count: number;
     readonly secondary: boolean;
     readonly shift: boolean;
   }
@@ -3160,7 +3163,8 @@ const BASE: &str = r#"  /** A row. */
      * `scroll`: the view scrolled; `scroll_position()` and `row_bounds()` are current in the handler. */
     on(event: "change" | "submit" | "focus" | "blur" | "paste_other" | "selection_change" | "scroll", handler: (event: InputEvent, cx: Context) => void): boolean;
     /** A press on a line number (not a fold chevron). The press still places the caret,
-     * so dragging down the gutter still selects lines. Needs line numbers. */
+     * so dragging down the gutter still selects lines. Presses in the gutter's padding or
+     * below the last line report nothing. Needs line numbers. */
     on(event: "gutter_click", handler: (event: GutterClickEvent, cx: Context) => void): boolean;
     /** Replaces the line decorations under `key` (each owner uses its own key, so they
      * don't replace each other); an empty list removes them. Rows are fixed: they don't
@@ -3173,7 +3177,7 @@ const BASE: &str = r#"  /** A row. */
     /** Replaces every selection; the first becomes primary and its caret is scrolled
      * into view (after the first layout, if there is none yet). Overlapping ranges merge.
      * Pass `head` (or `start` after `end`) for a backwards selection, so `selections()`
-     * round-trips. */
+     * round-trips. Throws a `TypeError` when `ranges` is not an array. */
     set_selections(ranges: EditorRange[]): void;
     /** Adds a selection (like Alt-click), keeping the others. */
     add_selection(range: EditorRange): void;

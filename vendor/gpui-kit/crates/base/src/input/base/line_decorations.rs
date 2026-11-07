@@ -80,13 +80,16 @@ impl LineDecorations {
 
     /// What each row in `rows` paints, indexed from `rows.start`. Later
     /// decorations win, within a key and across keys (in key order).
-    pub(crate) fn resolve(&self, rows: Range<usize>) -> Vec<Option<RowPaint>> {
+    /// The paint of each of `rows` (sorted ascending, as laid out: folds
+    /// skip rows), one entry per row. Only the given rows are resolved, so a
+    /// fold over many rows costs nothing.
+    pub(crate) fn resolve(&self, rows: &[usize]) -> Vec<Option<RowPaint>> {
         let mut out = vec![None; rows.len()];
         for decoration in self.by_key.values().flatten() {
-            let start = decoration.rows.start.max(rows.start);
-            let end = decoration.rows.end.min(rows.end);
-            for row in start..end {
-                let paint = out[row - rows.start].get_or_insert_with(RowPaint::default);
+            let start = rows.partition_point(|&row| row < decoration.rows.start);
+            let end = rows.partition_point(|&row| row < decoration.rows.end);
+            for paint in &mut out[start..end] {
+                let paint = paint.get_or_insert_with(RowPaint::default);
                 if decoration.background.is_some() {
                     paint.background = decoration.background;
                 }
@@ -100,7 +103,7 @@ impl LineDecorations {
 
     #[cfg(test)]
     pub(crate) fn row(&self, row: usize) -> Option<RowPaint> {
-        self.resolve(row..row + 1)[0]
+        self.resolve(&[row])[0]
     }
 
     pub(crate) fn is_empty(&self) -> bool {
@@ -152,8 +155,12 @@ mod tests {
         let red = hsla(0., 1., 0.5, 1.);
         let mut decorations = LineDecorations::default();
         decorations.set("a".into(), vec![LineDecoration::new(0..usize::MAX).with_background(red)]);
-        let rows = decorations.resolve(100..103);
+        let rows = decorations.resolve(&[100, 101, 5000]);
         assert_eq!(rows.len(), 3);
         assert!(rows.iter().all(|row| row.unwrap().background == Some(red)));
+        decorations.set("a".into(), vec![LineDecoration::new(3..10).with_background(red)]);
+        // Rows 4..9 folded away: only the laid-out rows are resolved.
+        let rows = decorations.resolve(&[2, 3, 10, 11]);
+        assert_eq!(rows.iter().map(Option::is_some).collect::<Vec<_>>(), [false, true, false, false]);
     }
 }

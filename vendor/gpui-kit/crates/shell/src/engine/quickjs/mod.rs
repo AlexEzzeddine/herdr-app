@@ -3883,14 +3883,20 @@ impl ShellRuntime {
                     row,
                     button,
                     modifiers,
+                    click_count,
                 } => {
                     payload.set("row", *row as f64)?;
                     let button = match button {
+                        gpui::MouseButton::Left => "left",
                         gpui::MouseButton::Right => "right",
                         gpui::MouseButton::Middle => "middle",
-                        _ => "left",
+                        gpui::MouseButton::Navigate(gpui::NavigationDirection::Back) => "back",
+                        gpui::MouseButton::Navigate(gpui::NavigationDirection::Forward) => {
+                            "forward"
+                        }
                     };
                     payload.set("button", button)?;
+                    payload.set("click_count", *click_count as f64)?;
                     payload.set("shift", modifiers.shift)?;
                     payload.set("secondary", modifiers.secondary())?;
                 }
@@ -5582,6 +5588,12 @@ globalThis.__gpui = (() => {
 
   globalThis.__diagnostics = false;
 
+  const editorList = (method, value) => {
+    if (value == null || typeof value === "string" || typeof value[Symbol.iterator] !== "function") {
+      throw new TypeError(`EditorState.${method} expects an array`);
+    }
+    return Array.from(value);
+  };
   const element = (id) => {
     const object = Object.create(globalThis.__diagnostics ? diagnostic : methods);
     object.__id = id;
@@ -7047,6 +7059,8 @@ globalThis.__gpui = (() => {
       new: (state) => element(__number_input_element(state.__handle)),
     },
     // HERDR: code editor uses the same value/event lifecycle as TextareaState.
+    // `editorList` rejects a single object passed for a list: `Array.from` on it
+    // would be an empty list, and the call would silently do nothing.
     EditorState: {
       new: (options = {}) => {
         const handle = __editor_state_new(JSON.stringify(options));
@@ -7057,7 +7071,7 @@ globalThis.__gpui = (() => {
           on: (event, handler) => __editor_on(handle, String(event), handler),
           selections: () => JSON.parse(__editor_selections(handle)),
           set_selections: (ranges) =>
-            __editor_set_selections(handle, JSON.stringify(Array.from(ranges)), false),
+            __editor_set_selections(handle, JSON.stringify(editorList("set_selections", ranges)), false),
           add_selection: (range) =>
             __editor_set_selections(handle, JSON.stringify([range]), true),
           scroll_to_row: (row, align) =>
@@ -7065,7 +7079,11 @@ globalThis.__gpui = (() => {
           scroll_position: () => JSON.parse(__editor_scroll_position(handle)),
           row_bounds: (row) => JSON.parse(__editor_row_bounds(handle, Number(row))),
           set_line_decorations: (key, decorations) =>
-            __editor_set_line_decorations(handle, String(key), JSON.stringify(Array.from(decorations))),
+            __editor_set_line_decorations(
+              handle,
+              String(key),
+              JSON.stringify(editorList("set_line_decorations", decorations)),
+            ),
           release: () => __editor_release(handle),
         };
       },

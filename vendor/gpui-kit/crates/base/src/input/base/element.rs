@@ -3053,21 +3053,19 @@ impl<M: InputModeKind> Element for TextElement<M> {
             let decorations = &self.state.read(cx).line_decorations;
             let mut rows = Vec::new();
             let visible = &prepaint.last_layout.visible_buffer_lines;
-            if let (false, Some(&first), Some(&last)) = (
-                decorations.is_empty(),
-                visible.iter().min(),
-                visible.iter().max(),
-            ) {
-                let resolved = decorations.resolve(first..last + 1);
+            if !decorations.is_empty() && !visible.is_empty() {
+                // One entry per visible row (sorted ascending, folds skipped).
+                let resolved = decorations.resolve(visible);
                 let mut offset_y = invisible_top_padding;
-                for (line, &buffer_line) in prepaint
+                for ((line, &buffer_line), paint) in prepaint
                     .last_layout
                     .lines
                     .iter()
-                    .zip(prepaint.last_layout.visible_buffer_lines.iter())
+                    .zip(visible.iter())
+                    .zip(resolved)
                 {
                     let height = line.size(line_height).height;
-                    if let Some(paint) = resolved[buffer_line - first] {
+                    if let Some(paint) = paint {
                         rows.push((origin.y + offset_y, height, paint));
                     }
                     offset_y += height;
@@ -3173,8 +3171,15 @@ impl<M: InputModeKind> Element for TextElement<M> {
             window.paint_path(path.clone(), *color);
         }
 
-        // Paint selections
-        if window.is_window_active() {
+        // Paint selections. Selections set by code with
+        // `show_unfocused_selection` stay painted in an inactive window too.
+        let window_active = window.is_window_active();
+        if window_active || self.state.read(cx).show_unfocused_selection {
+            for path in prepaint.selection_paths.drain(..) {
+                window.paint_path(path, editor_style.selection);
+            }
+        }
+        if window_active {
             let secondary_selection = Hsla {
                 s: 0.1,
                 ..editor_style.selection
@@ -3185,10 +3190,6 @@ impl<M: InputModeKind> Element for TextElement<M> {
                 if *is_active {
                     window.paint_path(path.clone(), editor_style.selection);
                 }
-            }
-
-            for path in prepaint.selection_paths.drain(..) {
-                window.paint_path(path, editor_style.selection);
             }
 
             // Paint hover highlight
@@ -4014,6 +4015,158 @@ mod tests {
         assert_eq!(scrolls.get(), 0, "set_value stays silent");
     }
 
+    // HERDR: a caret reveal queued before layout follows edits made before
+    // layout (it is kept by selection, not by byte offset), so it never
+    // reveals a stale offset in the new text.
+    #[gpui::test]
+    fn a_queued_caret_reveal_follows_edits_before_layout(cx: &mut TestAppContext) {
+        for edit in ["delete_lines", "replace_all"] {
+            cx.update(crate::init);
+            let text = (0..60).map(|i| format!("é {i}")).collect::<Vec<_>>().join("\n");
+            let far = text.find("é 50").unwrap();
+            // UTF-16 length of the first 40 lines, newlines included.
+            let cut: usize = text.lines().take(40).map(|l| l.encode_utf16().count() + 1).sum();
+            let mut editor = None;
+            let window = cx.open_window(size(px(240.), px(140.)), |window, cx| {
+                let state = cx.new(|cx| {
+                    let mut state = EditorState::new(window, cx).soft_wrap(false);
+                    state.set_value(text, window, cx);
+                    state.set_selections(vec![sel(far..far, false)], cx);
+                    match edit {
+                        "delete_lines" => state.replace_text_in_range_silent(Some(0..cut), "", window, cx),
+                        // Shorter, multi-byte: the old offset is past its end.
+                        _ => state.replace_all("ééé\né", window, cx),
+                    }
+                    state
+                });
+                editor = Some(state.clone());
+                DecorationHarness(state)
+            });
+            let editor = editor.unwrap();
+            let mut cx = VisualTestContext::from_window(window.into(), cx);
+            cx.update(|window, cx| {
+                window.draw(cx).clear(cx);
+                window.draw(cx).clear(cx);
+            });
+            let (row, (top, height), view, scroll) = editor.read_with(&cx, |state, _| {
+                let row = state.text.offset_to_point(state.cursor()).row;
+                (
+                    row,
+                    state.row_bounds(row).unwrap(),
+                    state.last_bounds.unwrap().size.height,
+                    state.scroll_offset().y,
+                )
+            });
+            assert!(top >= px(0.) && top + height <= view, "{edit}: the caret's row {row} is in view");
+            assert_eq!(scroll, px(0.), "{edit}: the old offset is not revealed");
+        }
+    }
+
+    // HERDR: a scroll asked for after a queued caret reveal, still before
+    // layout, wins over it.
+    #[gpui::test]
+    fn a_later_scroll_before_layout_wins_over_a_queued_reveal(cx: &mut TestAppContext) {
+        for later in ["set_scroll_offset", "set_selected_range"] {
+            cx.update(crate::init);
+            let text = sixty_lines("line");
+            let far = text.find("line 50").unwrap();
+            let mut editor = None;
+            let window = cx.open_window(size(px(240.), px(140.)), |window, cx| {
+                let state = cx.new(|cx| {
+                    let mut state = EditorState::new(window, cx).soft_wrap(false);
+                    state.set_value(text, window, cx);
+                    state.set_selections(vec![sel(far..far, false)], cx);
+                    match later {
+                        "set_scroll_offset" => state.set_scroll_offset(point(px(0.), px(0.)), cx),
+                        _ => state.set_selected_range(0..0, cx),
+                    }
+                    state
+                });
+                editor = Some(state.clone());
+                DecorationHarness(state)
+            });
+            let editor = editor.unwrap();
+            let mut cx = VisualTestContext::from_window(window.into(), cx);
+            cx.update(|window, cx| {
+                window.draw(cx).clear(cx);
+                window.draw(cx).clear(cx);
+            });
+            assert_eq!(
+                editor.read_with(&cx, |state, _| state.scroll_offset().y),
+                px(0.),
+                "{later} wins"
+            );
+        }
+    }
+
+    // HERDR: after layout, set_value drops a reveal queued for the old text in
+    // the same handler, like it does before layout.
+    #[gpui::test]
+    fn set_value_after_layout_drops_a_reveal_of_the_old_text(cx: &mut TestAppContext) {
+        let text = sixty_lines("old");
+        let far = text.find("old 50").unwrap();
+        let (editor, window) = decoration_editor(cx, &text, false);
+        let mut cx = VisualTestContext::from_window(window.into(), cx);
+        cx.update(|window, cx| {
+            window.draw(cx).clear(cx);
+            editor.update(cx, |state, cx| {
+                state.set_selections(vec![sel(far..far, false)], cx);
+                state.set_value(sixty_lines("new"), window, cx);
+            });
+            window.draw(cx).clear(cx);
+            window.draw(cx).clear(cx);
+        });
+        assert_eq!(editor.read_with(&cx, |state, _| state.scroll_offset().y), px(0.));
+    }
+
+    // HERDR: gutter presses off every row report nothing; each press of a
+    // double-click is reported with its click count.
+    #[gpui::test]
+    fn gutter_presses_off_the_rows_report_nothing_and_carry_click_count(cx: &mut TestAppContext) {
+        let (editor, mut cx) = numbered_editor(cx, "alpha\nbeta");
+        let seen = Rc::new(std::cell::RefCell::new(Vec::new()));
+        cx.update(|window, cx| {
+            let seen = seen.clone();
+            window
+                .subscribe(&editor, cx, move |_, event: &InputEvent, _, _| {
+                    if let InputEvent::GutterClick { row, click_count, .. } = event {
+                        seen.borrow_mut().push((*row, *click_count));
+                    }
+                })
+                .detach();
+        });
+        let (gutter, top, line_height, height) = editor.read_with(&cx, |state, _| {
+            let layout = state.last_layout.as_ref().unwrap();
+            let origin = state.input_bounds.origin;
+            (origin.x + px(2.), origin.y, layout.line_height, state.input_bounds.size.height)
+        });
+        let press = |cx: &mut VisualTestContext, y: Pixels, click_count: usize| {
+            let position = point(gutter, y);
+            cx.simulate_event(gpui::MouseDownEvent {
+                position,
+                button: MouseButton::Left,
+                modifiers: gpui::Modifiers::default(),
+                click_count,
+                first_mouse: false,
+            });
+            cx.simulate_event(gpui::MouseUpEvent {
+                position,
+                button: MouseButton::Left,
+                modifiers: gpui::Modifiers::default(),
+                click_count,
+            });
+        };
+        // Below the last line, and in the top padding.
+        assert!(line_height * 3. < height, "the editor is taller than its text");
+        press(&mut cx, top + line_height * 3., 1);
+        press(&mut cx, top - px(1.), 1);
+        // A double-click on row 1.
+        press(&mut cx, top + line_height * 1.5, 1);
+        press(&mut cx, top + line_height * 1.5, 2);
+        cx.run_until_parked();
+        assert_eq!(*seen.borrow(), vec![(1, 1), (1, 2)]);
+    }
+
     // HERDR: decorations set before the text arrives paint once it does.
     #[gpui::test]
     fn line_decorations_set_before_the_text_paint_after_it(cx: &mut TestAppContext) {
@@ -4066,7 +4219,7 @@ mod tests {
             let seen = seen.clone();
             window
                 .subscribe(&editor, cx, move |_, event: &InputEvent, _, _| {
-                    if let InputEvent::GutterClick { row, button, modifiers } = event {
+                    if let InputEvent::GutterClick { row, button, modifiers, .. } = event {
                         seen.borrow_mut().push((*row, *button, modifiers.shift));
                     }
                 })

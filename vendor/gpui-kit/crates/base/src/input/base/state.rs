@@ -137,12 +137,14 @@ pub enum RowScrollAlign {
 
 /// A scroll asked for before the first layout, applied once there is one.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum PendingScroll {
+pub(in crate::input) enum PendingScroll {
     /// [`InputBaseState::scroll_to_row`]; the row is clamped when applied,
     /// since the text may still change before layout.
     Row(usize, RowScrollAlign),
-    /// Reveal this byte offset ([`InputBaseState::set_selections`]).
-    Offset(usize),
+    /// Reveal this selection's caret ([`InputBaseState::set_selections`]).
+    /// Kept by id, not offset: selections follow edits made before layout,
+    /// so the caret is still a valid position in the text when applied.
+    Caret(super::selection::CursorId),
 }
 
 /// One selection as a byte range, with the side its caret is on.
@@ -181,6 +183,10 @@ pub enum InputEvent {
         row: usize,
         button: MouseButton,
         modifiers: gpui::Modifiers,
+        /// 1 for a single press, 2 on the second press of a double-click,
+        /// 3 for a triple-click. Each press is reported, so an owner that
+        /// toggles something should act only on `click_count == 1`.
+        click_count: usize,
     },
 }
 
@@ -542,7 +548,7 @@ pub struct InputBaseState<M: InputModeKind> {
     pub(crate) deferred_scroll_offset: Option<Point<Pixels>>,
     /// A scroll asked for by code before the first layout, applied once
     /// there is one. The latest request wins.
-    pub(crate) pending_scroll: Option<PendingScroll>,
+    pub(in crate::input) pending_scroll: Option<PendingScroll>,
     /// Paint selections even while another element has focus.
     pub(crate) show_unfocused_selection: bool,
     /// Whole-row backgrounds and gutter bars set by the application.
@@ -1125,11 +1131,6 @@ impl<M: InputModeKind> InputBaseState<M> {
         self.reset_selection();
         self.reset_lsp_state();
         self.reset_scroll_to_start();
-        // A caret reveal asked for before layout points into the old text;
-        // a row request still applies (rows are clamped when applied).
-        if matches!(self.pending_scroll, Some(PendingScroll::Offset(_))) {
-            self.pending_scroll = None;
-        }
         // Selection and scroll reports run after the update, when
         // `emit_events` is on again; mark the resets as already reported so
         // they stay silent.
@@ -1254,6 +1255,15 @@ impl<M: InputModeKind> InputBaseState<M> {
         self.scroll_handle.set_offset(point(px(0.), px(0.)));
         if self.is_single_line() {
             self.deferred_scroll_offset = Some(point(px(0.), px(0.)));
+        } else {
+            // A reveal queued for the old text (a caret scrolled to in the
+            // same handler, after layout) would scroll the new text there.
+            self.deferred_scroll_offset = None;
+        }
+        // A caret reveal asked for before layout belonged to the old text;
+        // a row request still applies (rows are clamped when applied).
+        if matches!(self.pending_scroll, Some(PendingScroll::Caret(_))) {
+            self.pending_scroll = None;
         }
     }
 
@@ -2531,11 +2541,12 @@ impl<M: InputModeKind> InputBaseState<M> {
         let (offset, line_end_affinity, columns_past_line_end) =
             self.resolve_mouse_position(event.position);
 
-        if self.is_in_gutter(event.position) {
+        if let Some(row) = self.gutter_row_at(event.position) {
             cx.emit(InputEvent::GutterClick {
-                row: self.text.offset_to_point(offset).row,
+                row,
                 button: event.button,
                 modifiers: event.modifiers,
+                click_count: event.click_count,
             });
         }
 
@@ -2746,6 +2757,9 @@ impl<M: InputModeKind> InputBaseState<M> {
         padding: ScrollPadding,
         cx: &mut Context<Self>,
     ) {
+        // The newest scroll request wins over one kept for after layout
+        // (before layout the caret-follow in paint reveals this offset).
+        self.pending_scroll = None;
         let Some(last_layout) = self.last_layout.as_ref() else {
             return;
         };
@@ -3229,6 +3243,8 @@ impl<M: InputModeKind> InputBaseState<M> {
     ///
     /// The offset will be clamped to the valid range, and applied after the next layout.
     pub fn set_scroll_offset(&mut self, offset: gpui::Point<gpui::Pixels>, cx: &mut Context<Self>) {
+        // The newest scroll request wins over one kept for after layout.
+        self.pending_scroll = None;
         self.deferred_scroll_offset = Some(offset);
         cx.notify();
     }
@@ -3316,10 +3332,10 @@ impl<M: InputModeKind> InputBaseState<M> {
         self.begin_programmatic_selection(cx);
         let id = self.selections.generate_id();
         let added = self.build_selection(id, start, end, selection.reversed);
-        let head = added.cursor_offset();
+        let id = added.id;
         self.selections.add(added);
         self.selections.merge_overlapping();
-        self.reveal_offset(head, cx);
+        self.reveal_caret(id, cx);
         cx.notify();
     }
 
@@ -3377,8 +3393,8 @@ impl<M: InputModeKind> InputBaseState<M> {
         self.selections.replace_all(built);
         // Merging may widen the active selection, so read its caret after.
         self.selections.merge_overlapping();
-        let head = self.selections.active().cursor_offset();
-        self.reveal_offset(head, cx);
+        let id = self.selections.active().id;
+        self.reveal_caret(id, cx);
         cx.notify();
     }
 
@@ -3422,14 +3438,22 @@ impl<M: InputModeKind> InputBaseState<M> {
         (start, end)
     }
 
-    /// Scroll `offset` into view now, or after the first layout.
-    fn reveal_offset(&mut self, offset: usize, cx: &mut Context<Self>) {
+    /// Caret of selection `id`; the active caret if merging removed it.
+    fn caret_of(&self, id: super::selection::CursorId) -> usize {
+        self.selections
+            .iter()
+            .find(|sel| sel.id == id)
+            .unwrap_or(self.selections.active())
+            .cursor_offset()
+    }
+
+    /// Scroll selection `id`'s caret into view now, or after the first layout.
+    fn reveal_caret(&mut self, id: super::selection::CursorId, cx: &mut Context<Self>) {
         if self.last_layout.is_none() || self.last_bounds.is_none() {
-            self.pending_scroll = Some(PendingScroll::Offset(offset));
+            self.pending_scroll = Some(PendingScroll::Caret(id));
             return;
         }
-        self.pending_scroll = None;
-        self.scroll_to(offset, None, cx);
+        self.scroll_to(self.caret_of(id), None, cx);
     }
 
     /// Scroll so buffer `row` (0-based, clamped to the document) is in view.
@@ -3507,6 +3531,27 @@ impl<M: InputModeKind> InputBaseState<M> {
             .contains(&position)
     }
 
+    /// The buffer row whose line number is under `position`: `None` outside
+    /// the gutter or off every laid-out row (the padding, or the empty space
+    /// below the last line). Rows are measured like
+    /// [`Self::resolve_mouse_position`], so it matches where the caret goes.
+    fn gutter_row_at(&self, position: Point<Pixels>) -> Option<usize> {
+        if !self.is_in_gutter(position) {
+            return None;
+        }
+        let (bounds, layout) = (self.last_bounds.as_ref()?, self.last_layout.as_ref()?);
+        let y = position.y - bounds.origin.y;
+        let mut top = layout.visible_top;
+        for (line, &row) in layout.lines.iter().zip(layout.visible_buffer_lines.iter()) {
+            let bottom = top + line.size(layout.line_height).height;
+            if y >= top && y < bottom {
+                return Some(row);
+            }
+            top = bottom;
+        }
+        None
+    }
+
     /// Where buffer `row` sits vertically, relative to the top of the visible
     /// text area: `(top, height)`. `top` is negative or past the viewport when
     /// the row is scrolled out of view; a soft-wrapped row is taller than one
@@ -3563,10 +3608,7 @@ impl<M: InputModeKind> InputBaseState<M> {
     pub(super) fn apply_pending_scroll(&mut self, cx: &mut Context<Self>) {
         match self.pending_scroll.take() {
             Some(PendingScroll::Row(row, align)) => self.scroll_to_row(row, align, cx),
-            Some(PendingScroll::Offset(offset)) => {
-                let offset = offset.min(self.text.len());
-                self.scroll_to(offset, None, cx);
-            }
+            Some(PendingScroll::Caret(id)) => self.scroll_to(self.caret_of(id), None, cx),
             None => {}
         }
     }
