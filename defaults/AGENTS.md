@@ -940,12 +940,13 @@ or editor with syntax highlighting, line numbers and folding. Its
 `add_selection(range)` read and set multiple selections (0-based, `col` in
 JS string units); `scroll_to_row(row, "nearest" | "top" | "center")`,
 `scroll_position()` and `row_bounds(row)` scroll and measure; `on("selection_change")`
-and `on("scroll")` report changes. `set_line_decorations(key, [{ row,
+and `on("scroll")` report changes (`set_value` is silent: it resets selections and
+scroll without either event, so re-read them after it). `set_line_decorations(key, [{ row,
 end_row?, background?, gutter? }])` colors whole rows and puts a bar in the
 gutter (a diff: re-set on `change`, rows don't follow edits; set them
 before or after `set_value`);
 `on("gutter_click", ({ row, button, click_count, modifiers }) => …)`
-(editors only) reports a press on a line number; a double-click reports two
+(editors only) reports a press on a line number or its decoration bar; a double-click reports two
 presses, so toggle only on `click_count === 1`. `show_unfocused_selection: true` keeps
 selections painted while another element has focus. A viewer opens
 beside the shell as a pane: `pane.split {direction, mod, props: { file }}`.

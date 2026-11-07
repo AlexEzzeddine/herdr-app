@@ -399,9 +399,17 @@ impl InputBaseState<EditorMode> {
 
             let response = task.await?;
 
-            editor.update_in(cx, |editor, _window, cx| {
+            editor.update_in(cx, |editor, window, cx| {
                 // Only apply if cursor still hasn't moved
                 if editor.cursor() != offset {
+                    return;
+                }
+
+                // HERDR: blur clears the completion, and only a focused
+                // editor draws one; one arriving after blur would count as
+                // ghost lines in `scroll_to_row` and `row_bounds` but not be
+                // drawn.
+                if !editor.focus_handle.is_focused(window) {
                     return;
                 }
 
@@ -432,8 +440,6 @@ impl InputBaseState<EditorMode> {
     /// Clear the inline completion suggestion.
     pub(crate) fn clear_inline_completion(&mut self, cx: &mut Context<Self>) {
         self.extras.inline_completion = InlineCompletion::default();
-        // HERDR: the next frame draws no ghost lines.
-        self.last_ghost_block = None;
         cx.notify();
     }
 
@@ -447,8 +453,6 @@ impl InputBaseState<EditorMode> {
         let Some(completion_item) = self.extras.inline_completion.item.take() else {
             return false;
         };
-        // HERDR: the next frame draws no ghost lines.
-        self.last_ghost_block = None;
 
         let cursor = self.cursor();
         let range_utf16 = self.range_to_utf16(&(cursor..cursor));

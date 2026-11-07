@@ -2061,12 +2061,11 @@ fn editor_row(ctx: &Ctx<'_>, row: f64) -> JsResult<usize> {
     Ok(row as usize)
 }
 
-/// `{ row, col }` of a byte offset, `col` in UTF-16 code units.
+/// `{ row, col }` of a byte offset, `col` in UTF-16 code units: the same
+/// conversion selection-change reports compare.
 fn editor_position(text: &gpui_base::input::Rope, offset: usize) -> serde_json::Value {
-    use gpui_base::input::RopeExt as _;
-    let point = text.offset_to_point(offset);
-    let col = text.slice_line(point.row).byte_to_utf16_idx(point.column);
-    serde_json::json!({ "row": point.row, "col": col })
+    let (row, col) = gpui_base::input::script_position(text, offset);
+    serde_json::json!({ "row": row, "col": col })
 }
 
 /// Byte offset of `{ row, col }`, clamped to the document and the line.

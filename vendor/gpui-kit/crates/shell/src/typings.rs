@@ -3155,7 +3155,9 @@ const BASE: &str = r#"  /** A row. */
   // HERDR: built-in source editing and read-only code viewing.
   export interface EditorState {
     value(): string;
-    /** Programmatic replacement works even in readonly mode. */
+    /** Programmatic replacement works even in readonly mode. It is silent: it resets the
+     * selections to a caret at the start and scrolls to the top without a `change`,
+     * `selection_change` or `scroll`, so read `selections()` / `scroll_position()` after it. */
     set_value(value: string): void;
     /** `selection_change`: selections or carets moved, were added or removed; read `selections()`.
      * `scroll`: the view scrolled; `scroll_position()` and `row_bounds()` are current in the handler.
@@ -3163,7 +3165,8 @@ const BASE: &str = r#"  /** A row. */
     on(event: "change" | "submit" | "focus" | "blur" | "paste_other" | "selection_change" | "scroll", handler: (event: InputEvent, cx: Context) => void): boolean;
     /** A press on a line number (a left press on a fold chevron folds instead). The press
      * still places the caret, so dragging down the gutter still selects lines. Presses in the
-     * gutter's padding or below the last line report nothing. Needs line numbers. */
+     * gutter's left padding (where decoration bars paint) are on their row; presses below
+     * the last line or on an inline completion's extra lines report nothing. Needs line numbers. */
     on(event: "gutter_click", handler: (event: GutterClickEvent, cx: Context) => void): boolean;
     /** Replaces the line decorations under `key` (each owner uses its own key, so they
      * don't replace each other); an empty list removes them. Rows are fixed: they don't

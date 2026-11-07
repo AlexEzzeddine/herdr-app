@@ -155,12 +155,33 @@ pub(in crate::input) enum QueuedScroll {
 }
 
 /// HERDR: one selection as [`InputEvent::SelectionChange`] compares it:
-/// `(row, col)` of each end, `col` in UTF-16 code units as scripts read it.
+/// [`script_position`] of each end.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct ReportedSelection {
     start: (usize, usize),
     end: (usize, usize),
     reversed: bool,
+}
+
+/// HERDR: the selections as [`InputEvent::SelectionChange`] last reported
+/// them.
+#[derive(Debug, Default)]
+struct SelectionReport {
+    /// In [`InputBaseState::selections`] order.
+    ranges: Vec<SelectionRange>,
+    /// `ranges` as scripts see them, in the same order.
+    positions: Vec<ReportedSelection>,
+    /// `document_revision` the positions were measured on.
+    revision: u64,
+}
+
+/// HERDR: `(row, col)` of byte `offset`, 0-based, `col` in UTF-16 code
+/// units so it indexes the line as a JS string: the position scripts read.
+/// The one conversion both the script API and selection-change reports use,
+/// so a report fires exactly when what scripts read changes.
+pub fn script_position(text: &Rope, offset: usize) -> (usize, usize) {
+    let point = text.offset_to_point(offset);
+    (point.row, text.slice_line(point.row).byte_to_utf16_idx(point.column))
 }
 
 /// One selection as a byte range, with the side its caret is on.
@@ -635,22 +656,15 @@ pub struct InputBaseState<M: InputModeKind> {
     pub(super) emit_events: bool,
 
     _subscriptions: Vec<Subscription>,
-    /// The selections last reported by [`InputEvent::SelectionChange`],
-    /// as scripts see them.
-    reported_selections: Vec<ReportedSelection>,
+    /// The selections last reported by [`InputEvent::SelectionChange`].
+    reported_selections: SelectionReport,
     /// Reused for the next comparison, so a selection change doesn't
     /// allocate.
-    selection_report_scratch: Vec<ReportedSelection>,
+    selection_report_scratch: SelectionReport,
     /// [`Selections::generation`] when `reported_selections` was last
     /// checked: an unchanged generation skips the comparison (cursor blinks
     /// notify without touching the selections).
     reported_selections_generation: u64,
-    /// HERDR: the inline-completion ghost block of the last frame: the
-    /// buffer row it is drawn under and its height. Rows after it are drawn
-    /// that much lower. Cleared with the completion, so `scroll_to_row` and
-    /// `row_bounds` in the same handler don't count lines the next frame
-    /// won't draw.
-    pub(in crate::input) last_ghost_block: Option<(usize, Pixels)>,
 
     pub(super) auto_scroll: AutoScroll,
 }
@@ -988,14 +1002,20 @@ impl<M: InputModeKind> InputBaseState<M> {
             silent_replace_text: false,
             emit_events: true,
             _subscriptions,
-            reported_selections: vec![ReportedSelection {
-                start: (0, 0),
-                end: (0, 0),
-                reversed: false,
-            }],
-            selection_report_scratch: Vec::new(),
+            reported_selections: SelectionReport {
+                ranges: vec![SelectionRange {
+                    range: 0..0,
+                    reversed: false,
+                }],
+                positions: vec![ReportedSelection {
+                    start: (0, 0),
+                    end: (0, 0),
+                    reversed: false,
+                }],
+                revision: 0,
+            },
+            selection_report_scratch: SelectionReport::default(),
             reported_selections_generation: 0,
-            last_ghost_block: None,
             _pending_update: false,
             cursor_line_end_affinity: false,
             auto_scroll: AutoScroll::default(),
@@ -1179,7 +1199,7 @@ impl<M: InputModeKind> InputBaseState<M> {
         self.reset_scroll_to_start();
         // Selection and scroll reports run after the update, when
         // `emit_events` is on again; mark the resets as already reported so
-        // they stay silent.
+        // they stay silent, like the rest of `set_value`.
         self.mark_selections_reported();
         self.reported_scroll = self.scroll_handle.offset();
 
@@ -2569,7 +2589,17 @@ impl<M: InputModeKind> InputBaseState<M> {
         // Measured on the frame that was pressed, ghost lines included,
         // before clearing the completion drops them. A left press on a fold
         // chevron never gets here: the chevron stops it.
-        let gutter_row = self.gutter_row_at(event.position);
+        // Reported now, before the early returns below (a tap that reopens
+        // the touch menu is still a press on the line number); subscribers
+        // run after this handler, once the caret is placed.
+        if let Some(row) = self.gutter_row_at(event.position) {
+            cx.emit(InputEvent::GutterClick {
+                row,
+                button: event.button,
+                modifiers: event.modifiers,
+                click_count: event.click_count,
+            });
+        }
         // Clear inline completion on any mouse interaction
         M::clear_inline_completion(self, cx);
         // A tap on the touch selection asks for its menu back. Any other press
@@ -2594,15 +2624,6 @@ impl<M: InputModeKind> InputBaseState<M> {
         self.selecting = true;
         let (offset, line_end_affinity, columns_past_line_end) =
             self.resolve_mouse_position(event.position);
-
-        if let Some(row) = gutter_row {
-            cx.emit(InputEvent::GutterClick {
-                row,
-                button: event.button,
-                modifiers: event.modifiers,
-                click_count: event.click_count,
-            });
-        }
 
         if M::on_click(self, event, offset, window, cx) {
             return;
@@ -3479,13 +3500,27 @@ impl<M: InputModeKind> InputBaseState<M> {
     /// Every selection, the active (primary) one first, the rest in document
     /// order.
     pub fn selections(&self) -> Vec<SelectionRange> {
+        let mut out = Vec::with_capacity(self.selections.len());
+        self.selections_into(&mut out);
+        out
+    }
+
+    /// Fill `out` with [`Self::selections`]: the one place their order is
+    /// decided, shared with selection-change reports.
+    fn selections_into(&self, out: &mut Vec<SelectionRange>) {
+        out.clear();
+        out.extend(self.selections.iter().map(Self::selection_range));
         // The active selection is always first in `self.selections`. Ties
         // on start (a caret at a selection's start, which adding a cursor
         // above or below doesn't merge) are ordered by end, so the order
-        // doesn't depend on how the selections were added.
-        let mut out: Vec<SelectionRange> = self.selections.iter().map(Self::selection_range).collect();
-        out[1..].sort_by_key(|sel| (sel.range.start, sel.range.end));
-        out
+        // doesn't depend on how the selections were added. Selections are
+        // usually kept in document order already: check before sorting.
+        let key = |sel: &SelectionRange| (sel.range.start, sel.range.end, sel.reversed);
+        if let Some(rest) = out.get_mut(1..)
+            && !rest.is_sorted_by_key(key)
+        {
+            rest.sort_unstable_by_key(key);
+        }
     }
 
     fn selection_range(sel: &CursorSelection) -> SelectionRange {
@@ -3609,24 +3644,37 @@ impl<M: InputModeKind> InputBaseState<M> {
                 let start = self.display_map.buffer_line_to_display_row(row);
                 start..start + 1
             });
-        let (top, height) = self.row_span(row, rows, line_height);
         // Measure against a scroll already queued this frame, so "nearest"
         // can't keep an earlier target that would hide the row.
         let mut scroll_offset = self.queued_scroll_offset();
+        let (top, height) = self.row_span(row, rows.clone(), line_height, scroll_offset.y);
         let view_top = -scroll_offset.y;
         let view_height = bounds.size.height;
-        let target = match align {
-            RowScrollAlign::Top => top,
-            RowScrollAlign::Center => top - (view_height - height) / 2.,
-            RowScrollAlign::Nearest if top < view_top => top,
-            RowScrollAlign::Nearest if top + height > view_top + view_height => {
-                // Taller than the view: show its start.
-                (top + height - view_height).min(top)
-            }
-            RowScrollAlign::Nearest => return,
-        };
         let safe_y_min = self.safe_scroll_y_min(line_height);
-        scroll_offset.y = (-target).clamp(safe_y_min, px(0.));
+        let target_y = |top: Pixels| -> Option<Pixels> {
+            let target = match align {
+                RowScrollAlign::Top => top,
+                RowScrollAlign::Center => top - (view_height - height) / 2.,
+                RowScrollAlign::Nearest if top < view_top => top,
+                RowScrollAlign::Nearest if top + height > view_top + view_height => {
+                    // Taller than the view: show its start.
+                    (top + height - view_height).min(top)
+                }
+                RowScrollAlign::Nearest => return None,
+            };
+            Some((-target).clamp(safe_y_min, px(0.)))
+        };
+        let Some(mut y) = target_y(top) else {
+            return;
+        };
+        // Ghost lines above the row push it down only if the frame at the
+        // target still draws them (the caret row is laid out there): measure
+        // the row again at the target.
+        let (top_there, _) = self.row_span(row, rows, line_height, y);
+        if top_there != top {
+            y = target_y(top_there).unwrap_or(scroll_offset.y);
+        }
+        scroll_offset.y = y;
         self.queue_scroll_offset(scroll_offset, false);
         cx.notify();
     }
@@ -3646,15 +3694,14 @@ impl<M: InputModeKind> InputBaseState<M> {
         }
     }
 
-    /// Whether `position` (window coordinates) is on the line numbers: in
-    /// the gutter, right of its left padding (where the decoration bars
-    /// paint).
+    /// Whether `position` (window coordinates) is in the line-number gutter,
+    /// its left padding included: the decoration bars paint there, and a
+    /// press on one is a press on its row.
     fn is_in_gutter(&self, position: Point<Pixels>) -> bool {
         let Some(layout) = self.last_layout.as_ref() else {
             return false;
         };
         self.mode.line_number()
-            && position.x >= self.input_bounds.origin.x
             && super::element::editor_gutter_bounds(
                 self.input_bounds,
                 layout.line_number_width,
@@ -3665,7 +3712,7 @@ impl<M: InputModeKind> InputBaseState<M> {
     }
 
     /// The buffer row whose line number a press at `position` is on: `None`
-    /// outside the gutter or in its padding, or off every laid-out row (the
+    /// outside the gutter, or off every laid-out row (the
     /// ghost lines of an inline completion, or the empty space below the
     /// last line). Rows are measured like [`Self::resolve_mouse_position`],
     /// so it matches where the caret goes.
@@ -3675,7 +3722,7 @@ impl<M: InputModeKind> InputBaseState<M> {
         }
         let (bounds, layout) = (self.last_bounds.as_ref()?, self.last_layout.as_ref()?);
         let y = position.y - bounds.origin.y;
-        super::element::visible_row_spans(layout, self.last_ghost_block)
+        super::element::visible_row_spans(layout, self.ghost_block())
             .find(|span| y >= span.top && y < span.top + span.height)
             .map(|span| span.row)
     }
@@ -3692,22 +3739,70 @@ impl<M: InputModeKind> InputBaseState<M> {
             return None;
         }
         let rows = self.display_map.buffer_line_to_display_row_range(row)?;
-        let (top, height) = self.row_span(row, rows, line_height);
-        Some((top + self.queued_scroll_offset().y, height))
+        let scroll_y = self.queued_scroll_offset().y;
+        let (top, height) = self.row_span(row, rows, line_height, scroll_y);
+        Some((top + scroll_y, height))
     }
 
     /// Where buffer `row`, laid out on display `rows`, sits in the content
-    /// (unscrolled): `(top, height)`. Rows below an inline completion are
-    /// drawn under its ghost lines. Shared by [`Self::scroll_to_row`] and
+    /// (unscrolled) of a frame scrolled to `scroll_y`: `(top, height)`. Rows
+    /// below an inline completion are drawn under its ghost lines when that
+    /// frame draws them. Shared by [`Self::scroll_to_row`] and
     /// [`Self::row_bounds`], so scrolling to a row and measuring it agree.
-    fn row_span(&self, row: usize, rows: Range<usize>, line_height: Pixels) -> (Pixels, Pixels) {
+    fn row_span(
+        &self,
+        row: usize,
+        rows: Range<usize>,
+        line_height: Pixels,
+        scroll_y: Pixels,
+    ) -> (Pixels, Pixels) {
         let mut top = line_height * rows.start;
-        if let Some((ghost_row, ghost_height)) = self.last_ghost_block
+        if let Some((ghost_row, ghost_height)) = self.ghost_block_at(scroll_y)
             && row > ghost_row
         {
             top += ghost_height;
         }
         (top, line_height * rows.len())
+    }
+
+    /// HERDR: the inline-completion ghost block a frame showing buffer
+    /// lines `visible` draws: the buffer row it is drawn under and its height
+    /// (rows after it are drawn that much lower). Derived from the current
+    /// completion and caret, as `TextElement::layout_inline_completion` lays
+    /// it out, so a completion shown, replaced or cleared, or a caret moved,
+    /// earlier in the same handler is already counted.
+    fn ghost_block_in(&self, visible: Range<usize>, line_height: Pixels) -> Option<(usize, Pixels)> {
+        let item = self.extras.inline_completion_item()?;
+        let ghost_lines = item.insert_text.split('\n').count() - 1;
+        let row = self.cursor_position().line as usize;
+        (ghost_lines > 0 && visible.contains(&row)).then(|| (row, ghost_lines as f32 * line_height))
+    }
+
+    /// HERDR: [`Self::ghost_block_in`] the last frame, which a press lands
+    /// on.
+    pub(in crate::input) fn ghost_block(&self) -> Option<(usize, Pixels)> {
+        let layout = self.last_layout.as_ref()?;
+        self.ghost_block_in(layout.visible_range.clone(), layout.line_height)
+    }
+
+    /// HERDR: [`Self::ghost_block_in`] a frame scrolled to `scroll_y`: the
+    /// ghost lines are drawn only while the caret row is laid out.
+    fn ghost_block_at(&self, scroll_y: Pixels) -> Option<(usize, Pixels)> {
+        let (layout, bounds) = (self.last_layout.as_ref()?, self.last_bounds?);
+        let height = bounds.size.height;
+        let scroll_top = super::element::clamp_auto_grow_vertical_scroll_offset(
+            &self.mode,
+            scroll_y,
+            layout.line_height * self.display_map.wrap_row_count(),
+            height,
+        );
+        let (visible, _) = super::element::visible_buffer_range(
+            &self.display_map,
+            layout.line_height,
+            height,
+            scroll_top,
+        );
+        self.ghost_block_in(visible, layout.line_height)
     }
 
     /// Drop a row or caret scroll kept for after the first layout: a newer
@@ -3718,57 +3813,62 @@ impl<M: InputModeKind> InputBaseState<M> {
         }
     }
 
-    /// Whether the selections still match the last report.
+    /// Whether the selections still match the last report, as scripts
+    /// see them.
     #[cfg(test)]
     fn selections_match_reported(&self) -> bool {
-        let mut current = Vec::new();
-        self.selection_report_into(&mut current);
-        self.reported_selections == current
+        let mut current = SelectionReport::default();
+        self.selections_into(&mut current.ranges);
+        self.measure_selection_report(&mut current, None);
+        self.reported_selections.positions == current.positions
     }
 
-    /// The selections as scripts see them, in [`Self::selections`] order.
-    #[cfg(test)]
-    fn selection_report(&self) -> Vec<ReportedSelection> {
-        let mut out = Vec::new();
-        self.selection_report_into(&mut out);
-        out
-    }
-
-    /// Fill `out` with every selection as `{ row, col }` positions (`col` in
-    /// UTF-16 units, what scripts read), the active one first and the rest
-    /// in document order. Compared in that space, an edit that keeps a
-    /// caret's byte offset but moves its row or column is still a change,
-    /// and one that shifts bytes without moving any position isn't.
-    fn selection_report_into(&self, out: &mut Vec<ReportedSelection>) {
-        let point = |offset: usize| {
-            let point = self.text.offset_to_point(offset);
-            let col = self.text.slice_line(point.row).byte_to_utf16_idx(point.column);
-            (point.row, col)
-        };
-        out.clear();
-        out.extend(self.selections.iter().map(|sel| ReportedSelection {
-            start: point(sel.start),
-            end: point(sel.end),
-            reversed: sel.reversed,
+    /// Measure `report.ranges` as scripts see them on the current text.
+    /// Positions of `previous` measured on the same text are reused for
+    /// ranges it has at the same index, so moving one caret of many
+    /// converts only that one.
+    fn measure_selection_report(&self, report: &mut SelectionReport, previous: Option<&SelectionReport>) {
+        let previous = previous.filter(|previous| previous.revision == self.document_revision);
+        report.revision = self.document_revision;
+        report.positions.clear();
+        report.positions.extend(report.ranges.iter().enumerate().map(|(index, sel)| {
+            previous
+                .filter(|previous| previous.ranges.get(index) == Some(sel))
+                .map(|previous| previous.positions[index])
+                .unwrap_or_else(|| ReportedSelection {
+                    start: script_position(&self.text, sel.range.start),
+                    end: script_position(&self.text, sel.range.end),
+                    reversed: sel.reversed,
+                })
         }));
-        // Selections are usually kept in document order already: check
-        // before sorting.
-        let key = |sel: &ReportedSelection| (sel.start, sel.end, sel.reversed);
-        if let Some(rest) = out.get_mut(1..)
-            && !rest.is_sorted_by_key(key)
-        {
-            rest.sort_unstable_by_key(key);
-        }
     }
 
     fn mark_selections_reported(&mut self) {
-        if !M::CODE_EDITOR {
-            return;
+        if M::CODE_EDITOR {
+            self.take_selection_report();
         }
+    }
+
+    /// Record the current selections as reported; returns whether scripts
+    /// would see them differently from the last report.
+    fn take_selection_report(&mut self) -> bool {
         self.reported_selections_generation = self.selections.generation();
-        let mut current = std::mem::take(&mut self.reported_selections);
-        self.selection_report_into(&mut current);
-        self.reported_selections = current;
+        let mut current = std::mem::take(&mut self.selection_report_scratch);
+        self.selections_into(&mut current.ranges);
+        let same_text = self.reported_selections.revision == self.document_revision;
+        if same_text && current.ranges == self.reported_selections.ranges {
+            self.selection_report_scratch = current;
+            return false;
+        }
+        self.measure_selection_report(&mut current, Some(&self.reported_selections));
+        // On unchanged text, byte offsets and positions map one to one, so
+        // differing ranges are a change without comparing positions.
+        let changed = same_text || current.positions != self.reported_selections.positions;
+        // Kept even when unchanged: the ranges and revision must describe
+        // the current text for the next comparison.
+        std::mem::swap(&mut current, &mut self.reported_selections);
+        self.selection_report_scratch = current;
+        changed
     }
 
     /// Runs on every notify. Every selection mutation goes through
@@ -3779,23 +3879,15 @@ impl<M: InputModeKind> InputBaseState<M> {
     /// It runs after the update that changed the selections, when
     /// `emit_events` is on again, so `emit_events` can't silence it: a
     /// silent path calls [`Self::mark_selections_reported`] instead.
+    ///
+    /// Compared whole, in `selections()` order, so two equal carets can't
+    /// both stand for one reported entry; byte ranges first, and positions
+    /// (UTF-16 conversion) only where the text or a range changed.
     fn report_selection_change(&mut self, cx: &mut Context<Self>) {
-        let generation = self.selections.generation();
-        if generation == self.reported_selections_generation {
+        if self.selections.generation() == self.reported_selections_generation {
             return;
         }
-        self.reported_selections_generation = generation;
-        // Compared whole, in `selections()` order, so two equal carets can't
-        // both stand for one reported entry. Only a selection mutation gets
-        // here, so a cursor blink doesn't pay for it.
-        let mut current = std::mem::take(&mut self.selection_report_scratch);
-        self.selection_report_into(&mut current);
-        let changed = current != self.reported_selections;
-        if changed {
-            std::mem::swap(&mut current, &mut self.reported_selections);
-        }
-        self.selection_report_scratch = current;
-        if changed {
+        if self.take_selection_report() {
             cx.emit(InputEvent::SelectionChange);
         }
     }
@@ -8179,30 +8271,32 @@ mod tests {
     }
 
     /// HERDR: selections that share a start (a caret added at a selection's
-    /// start, which isn't merged) still match their report.
+    /// start, which isn't merged) are ordered the same however they were
+    /// added, so reordering them is not a change.
     #[gpui::test]
     fn selections_sharing_a_start_match_their_report(cx: &mut TestAppContext) {
         let input_view = InputView::build_textarea(cx, |state| state.default_value("alpha beta gamma"));
         let mut cx = VisualTestContext::from_window(input_view.window_handle.into(), cx);
-        for caret_first in [true, false] {
-            input_view.input.update_in(&mut cx, |state, _, cx| {
-                state.set_selected_range(0..0, cx);
-                let add = |state: &mut InputBaseState<TextareaMode>, start, end| {
-                    let id = state.selections.generate_id();
-                    state.selections.add(CursorSelection::new(id, start, end));
-                };
-                if caret_first {
-                    add(state, 5, 5);
-                    add(state, 5, 10);
-                } else {
-                    add(state, 5, 10);
-                    add(state, 5, 5);
-                }
-                add(state, 12, 12);
-                state.reported_selections = state.selection_report();
-                assert!(state.selections_match_reported(), "caret first: {caret_first}");
-            });
-        }
+        input_view.input.update_in(&mut cx, |state, _, cx| {
+            let add = |state: &mut InputBaseState<TextareaMode>, start, end| {
+                let id = state.selections.generate_id();
+                state.selections.add(CursorSelection::new(id, start, end));
+            };
+            state.set_selected_range(0..0, cx);
+            add(state, 5, 5);
+            add(state, 5, 10);
+            add(state, 12, 12);
+            let caret_first = state.selections();
+            state.take_selection_report();
+
+            state.set_selected_range(0..0, cx);
+            add(state, 5, 10);
+            add(state, 5, 5);
+            add(state, 12, 12);
+            assert_eq!(state.selections(), caret_first);
+            assert!(state.selections_match_reported());
+            assert!(!state.take_selection_report(), "no change to report");
+        });
     }
 
     /// HERDR: two equal carets don't both stand for one reported entry, so
@@ -8219,7 +8313,7 @@ mod tests {
             };
             add(state, 5);
             add(state, 12);
-            state.reported_selections = state.selection_report();
+            state.take_selection_report();
             state.selections.remove_all_but_active();
             add(state, 5);
             add(state, 5);

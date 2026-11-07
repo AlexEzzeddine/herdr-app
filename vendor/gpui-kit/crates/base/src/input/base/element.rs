@@ -330,6 +330,40 @@ pub(super) fn ghost_block(
         .map(|row| (row, ghost_lines_height))
 }
 
+/// The buffer lines a frame scrolled to `scroll_top` lays out (plus one
+/// extra, so scrolling to the bottom shows no empty space), and the first
+/// visible display row. Display rows are uniformly `line_height` tall, so the
+/// visible window maps directly to a display-row range. HERDR: shared with
+/// [`InputBaseState::ghost_block_at`], which must agree on whether the
+/// caret row (and so an inline completion's ghost lines) is drawn.
+pub(super) fn visible_buffer_range(
+    display_map: &super::DisplayMap,
+    line_height: Pixels,
+    input_height: Pixels,
+    scroll_top: Pixels,
+) -> (Range<usize>, usize) {
+    let extra_rows = 1;
+    let display_count = display_map.display_row_count();
+    let buffer_line_count = display_map.buffer_line_count();
+    if display_count == 0 || buffer_line_count == 0 {
+        return (0..0, 0);
+    }
+    let viewport_top = (-scroll_top).max(px(0.));
+    let viewport_bottom = viewport_top + input_height;
+    let line_height_f = f32::from(line_height);
+    let first_display =
+        ((f32::from(viewport_top) / line_height_f).floor() as usize).min(display_count - 1);
+    let last_display =
+        ((f32::from(viewport_bottom) / line_height_f).ceil() as usize).min(display_count - 1);
+
+    let start_line = display_map.display_row_to_buffer_line(first_display);
+    let end_line = display_map.display_row_to_buffer_line(last_display);
+    (
+        start_line..(end_line + 1 + extra_rows).min(buffer_line_count),
+        first_display,
+    )
+}
+
 /// HERDR: where each visible row of `layout` is drawn. Rows after the ghost
 /// block are pushed down by it; the block itself belongs to no row. Line
 /// decorations and gutter presses share this walk; it matches the upstream
@@ -359,7 +393,7 @@ pub(super) fn visible_row_spans(
         })
 }
 
-fn clamp_auto_grow_vertical_scroll_offset(
+pub(super) fn clamp_auto_grow_vertical_scroll_offset(
     mode: &LayoutMode,
     scroll_top: Pixels,
     scroll_height: Pixels,
@@ -1078,8 +1112,6 @@ impl<M: InputModeKind> TextElement<M> {
         line_height: Pixels,
         input_height: Pixels,
     ) -> (Range<usize>, Vec<usize>, Pixels) {
-        // Add extra rows to avoid showing empty space when scroll to bottom.
-        let extra_rows = 1;
         if state.is_single_line() {
             return (0..1, vec![0], px(0.));
         }
@@ -1103,18 +1135,9 @@ impl<M: InputModeKind> TextElement<M> {
             input_height,
         );
 
-        // Display rows are uniformly `line_height` tall, so the visible window maps
-        // directly to a display-row range.
-        let viewport_top = (-scroll_top).max(px(0.));
-        let viewport_bottom = viewport_top + input_height;
-        let line_height_f = f32::from(line_height);
-        let first_display =
-            ((f32::from(viewport_top) / line_height_f).floor() as usize).min(display_count - 1);
-        let last_display =
-            ((f32::from(viewport_bottom) / line_height_f).ceil() as usize).min(display_count - 1);
-
-        let start_line = state.display_map.display_row_to_buffer_line(first_display);
-        let end_line = state.display_map.display_row_to_buffer_line(last_display);
+        let (visible_range, first_display) =
+            visible_buffer_range(&state.display_map, line_height, input_height, scroll_top);
+        let start_line = visible_range.start;
 
         // y of the top of the first visible buffer line (in content space).
         let visible_top = match state
@@ -1124,8 +1147,6 @@ impl<M: InputModeKind> TextElement<M> {
             Some(range) => line_height * range.start,
             None => line_height * first_display,
         };
-
-        let visible_range = start_line..(end_line + 1 + extra_rows).min(buffer_line_count);
 
         // Collect non-hidden buffer lines within the visible range
         let mut visible_buffer_lines = Vec::with_capacity(visible_range.len());
@@ -3415,7 +3436,6 @@ impl<M: InputModeKind> Element for TextElement<M> {
             state.set_input_bounds(input_bounds, cx);
             state.last_selected_range = Some(selected_range);
             state.scroll_size = prepaint.scroll_size;
-            state.last_ghost_block = ghost;
             state.last_frame_wrap_rows = state.display_map.wrap_row_count();
             state.last_frame_document_revision = state.document_revision;
             state.update_scroll_offset(Some(prepaint.cursor_scroll_offset), cx);
@@ -4033,6 +4053,26 @@ mod tests {
         (0..60).map(|i| format!("{prefix} {i}")).collect::<Vec<_>>().join("\n")
     }
 
+    /// HERDR: put the caret at the start of `row` and show an inline
+    /// completion there with `ghost_lines` lines below it, as one arriving
+    /// in a handler (no frame has drawn it yet).
+    fn show_inline_completion(
+        state: &mut EditorState,
+        row: usize,
+        ghost_lines: usize,
+        cx: &mut gpui::Context<EditorState>,
+    ) {
+        let start = state.text.line_start_offset(row);
+        state.set_selected_range(start..start, cx);
+        state.extras.inline_completion.item = Some(lsp_types::InlineCompletionItem {
+            insert_text: format!("x{}", "\nx".repeat(ghost_lines)),
+            filter_text: None,
+            range: None,
+            command: None,
+            insert_text_format: None,
+        });
+    }
+
     // HERDR: text loaded and scrolled to in one handler is reachable, though
     // the last frame laid out a shorter text.
     #[gpui::test]
@@ -4259,9 +4299,7 @@ mod tests {
             (state.input_bounds.origin.x + px(2.), state.input_bounds.origin.y, layout.line_height)
         });
         let ghost = line_height * 2.;
-        // Set after the frame: paint records the block, and there is no inline
-        // completion here to draw one.
-        cx.update(|_, cx| editor.update(cx, |state, _| state.last_ghost_block = Some((1, ghost))));
+        cx.update(|_, cx| editor.update(cx, |state, cx| show_inline_completion(state, 1, 2, cx)));
         editor.read_with(&cx, |state, _| {
             let at = |row_y: Pixels| state.gutter_row_at(point(gutter, top + row_y));
             assert_eq!(at(line_height * 0.5), Some(0));
@@ -4320,6 +4358,47 @@ mod tests {
         press(&mut cx, top + line_height * 1.5, 2);
         cx.run_until_parked();
         assert_eq!(*seen.borrow(), vec![(1, 1), (1, 2)]);
+    }
+
+    // HERDR: a tap on a line number inside a touch selection reopens its
+    // menu and is still reported as a gutter click.
+    #[gpui::test]
+    fn a_gutter_tap_that_reopens_the_touch_menu_is_reported(cx: &mut TestAppContext) {
+        let (editor, mut cx) = numbered_editor(cx, "alpha\nbeta\ngamma");
+        let seen = Rc::new(std::cell::RefCell::new(Vec::new()));
+        cx.update(|window, cx| {
+            let seen = seen.clone();
+            window
+                .subscribe(&editor, cx, move |_, event: &InputEvent, _, _| {
+                    if let InputEvent::GutterClick { row, .. } = event {
+                        seen.borrow_mut().push(*row);
+                    }
+                })
+                .detach();
+            editor.update(cx, |state, cx| {
+                state.set_selected_range(2..14, cx);
+                state.keep_touch_selection(cx);
+            });
+        });
+        let position = editor.read_with(&cx, |state, _| {
+            let line_height = state.last_layout.as_ref().unwrap().line_height;
+            let origin = state.input_bounds.origin;
+            point(origin.x + px(2.), origin.y + line_height * 1.5)
+        });
+        cx.simulate_event(gpui::MouseDownEvent {
+            position,
+            button: MouseButton::Left,
+            modifiers: gpui::Modifiers::default(),
+            click_count: 1,
+            first_mouse: false,
+        });
+        cx.run_until_parked();
+        editor.read_with(&cx, |state, _| {
+            // The tap took the menu path: the selection stays, no caret placed.
+            assert!(state.touch_selection().is_some_and(|touch| touch.is_menu_open()));
+            assert_eq!(state.selected_range(), 2..14);
+        });
+        assert_eq!(*seen.borrow(), vec![1]);
     }
 
     // HERDR: decorations set before the text arrives paint once it does.
@@ -4477,12 +4556,39 @@ mod tests {
         cx.update(|window, cx| window.draw(cx).clear(cx));
         editor.update_in(&mut cx, |state, _, cx| {
             let line_height = state.last_layout.as_ref().unwrap().line_height;
-            // Set after the frame: there is no inline completion here to draw one.
-            state.last_ghost_block = Some((10, line_height * 3.));
+            show_inline_completion(state, 2, 3, cx);
+            assert_eq!(
+                state.row_bounds(4).expect("row 4").0,
+                line_height * 7.,
+                "below the visible ghost lines"
+            );
+            state.scroll_to_row(1, crate::input::RowScrollAlign::Top, cx);
+            assert_eq!(state.row_bounds(1).expect("row 1").0, px(0.), "rows above the ghost lines");
+            // At the top of the view, row 20 is far below the caret row, which
+            // that frame doesn't lay out, so it draws no ghost lines.
             state.scroll_to_row(20, crate::input::RowScrollAlign::Top, cx);
+            assert_eq!(state.queued_scroll_offset().y, -(line_height * 20.));
             assert_eq!(state.row_bounds(20).expect("row 20").0, px(0.), "row 20 is at the top");
-            state.scroll_to_row(5, crate::input::RowScrollAlign::Top, cx);
-            assert_eq!(state.row_bounds(5).expect("row 5").0, px(0.), "rows above the ghost lines");
+        });
+    }
+
+    // HERDR: a completion replaced in the same handler is measured with its
+    // own ghost lines, not the ones the last frame drew.
+    #[gpui::test]
+    fn a_replaced_completion_is_measured_with_its_own_ghost_lines(cx: &mut TestAppContext) {
+        let (editor, window) = decoration_editor(cx, &sixty_lines("line"), false);
+        let mut cx = VisualTestContext::from_window(window.into(), cx);
+        cx.update(|window, cx| {
+            editor.update(cx, |state, cx| show_inline_completion(state, 1, 1, cx));
+            window.draw(cx).clear(cx);
+        });
+        editor.update_in(&mut cx, |state, _, cx| {
+            let line_height = state.last_layout.as_ref().unwrap().line_height;
+            assert_eq!(state.row_bounds(2).expect("row 2").0, line_height * 3.);
+            show_inline_completion(state, 1, 4, cx);
+            assert_eq!(state.row_bounds(2).expect("row 2").0, line_height * 6.);
+            show_inline_completion(state, 3, 4, cx);
+            assert_eq!(state.row_bounds(2).expect("row 2").0, line_height * 2., "the caret moved below it");
         });
     }
 
@@ -4496,7 +4602,7 @@ mod tests {
         cx.update(|window, cx| window.draw(cx).clear(cx));
         editor.update_in(&mut cx, |state, _, cx| {
             let line_height = state.last_layout.as_ref().unwrap().line_height;
-            state.last_ghost_block = Some((10, line_height * 3.));
+            show_inline_completion(state, 2, 3, cx);
             state.set_selections(vec![sel(0..0, false)], cx);
             state.scroll_to_row(20, crate::input::RowScrollAlign::Top, cx);
             assert_eq!(state.queued_scroll_offset().y, -(line_height * 20.), "no ghost lines in the target");
@@ -4521,10 +4627,10 @@ mod tests {
         assert_eq!(editor.read_with(&cx, |state, _| state.scroll_offset().x), px(-800.));
     }
 
-    // HERDR: presses in the gutter's left padding (where decoration bars
-    // paint) are not on a line number.
+    // HERDR: presses in the gutter's left padding, where decoration bars
+    // paint, are on their row.
     #[gpui::test]
-    fn gutter_padding_presses_are_not_gutter_clicks(cx: &mut TestAppContext) {
+    fn gutter_padding_presses_are_gutter_clicks(cx: &mut TestAppContext) {
         let (editor, mut cx) = numbered_editor(cx, "a\nb\nc");
         cx.update(|_, cx| {
             editor.update(cx, |state, _| {
@@ -4536,10 +4642,11 @@ mod tests {
             let origin = state.input_bounds.origin;
             let y = origin.y + line_height * 1.5;
             assert_eq!(
-                state.gutter_row_at(point(origin.x - px(4.), y)),
-                None,
-                "in the padding"
+                state.gutter_row_at(point(origin.x - px(7.), y)),
+                Some(1),
+                "on the decoration bar, in the padding"
             );
+            assert_eq!(state.gutter_row_at(point(origin.x - px(9.), y)), None, "left of the gutter");
             assert_eq!(state.gutter_row_at(point(origin.x + px(2.), y)), Some(1));
         });
     }
