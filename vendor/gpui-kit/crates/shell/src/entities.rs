@@ -1277,10 +1277,10 @@ pub enum InputEventName {
 }
 
 impl InputEventName {
-    /// The event called `name`, among those `names` accepts (pass
-    /// [`Self::NAMES`] or [`Self::EDITOR_NAMES`]).
-    pub fn from_name(name: &str, names: &[&str]) -> Option<Self> {
-        if !names.contains(&name) {
+    /// The event called `name`, if a state of this kind reports it:
+    /// [`Self::EDITOR_ONLY`] events only on an `EditorState`.
+    pub fn from_name(name: &str, editor: bool) -> Option<Self> {
+        if !editor && Self::EDITOR_ONLY.contains(&name) {
             return None;
         }
         match name {
@@ -1296,29 +1296,21 @@ impl InputEventName {
         }
     }
 
-    pub const NAMES: &'static [&'static str] = &[
-        "change",
-        "submit",
-        "focus",
-        "blur",
-        "paste_other",
-        "selection_change",
-        "scroll",
-    ];
+    pub const NAMES: &'static [&'static str] =
+        &["change", "submit", "focus", "blur", "paste_other"];
 
-    /// HERDR: an `EditorState` also reports presses on its line numbers;
-    /// inputs and textareas have no gutter, so they reject `gutter_click`
-    /// instead of accepting a handler that never runs.
-    pub const EDITOR_NAMES: &'static [&'static str] = &[
-        "change",
-        "submit",
-        "focus",
-        "blur",
-        "paste_other",
-        "selection_change",
-        "scroll",
-        "gutter_click",
-    ];
+    /// HERDR: events only an `EditorState` reports to scripts. Inputs and
+    /// textareas reject them instead of accepting a handler they can't act
+    /// on: they have no gutter, and no `selections()` or `scroll_position()`
+    /// to read after a `selection_change` or `scroll`.
+    pub const EDITOR_ONLY: &'static [&'static str] =
+        &["selection_change", "scroll", "gutter_click"];
+
+    /// The names [`Self::from_name`] accepts, for an error message.
+    pub fn names(editor: bool) -> Vec<&'static str> {
+        let extra: &[&str] = if editor { Self::EDITOR_ONLY } else { &[] };
+        Self::NAMES.iter().chain(extra).copied().collect()
+    }
 
     fn matches(self, event: &InputEvent) -> bool {
         matches!(

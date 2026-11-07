@@ -309,6 +309,56 @@ pub(super) fn clamp_horizontal_scroll_offset(
     offset.clamp(min_offset, px(0.))
 }
 
+/// HERDR: one visible buffer row and where it is drawn.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) struct RowSpan {
+    pub row: usize,
+    /// From the top of the element's bounds.
+    pub top: Pixels,
+    pub height: Pixels,
+}
+
+/// HERDR: the inline-completion ghost block drawn under `current_row`:
+/// its row and height. `None` when there are no ghost lines.
+pub(super) fn ghost_block(
+    current_row: Option<usize>,
+    ghost_line_count: usize,
+    ghost_lines_height: Pixels,
+) -> Option<(usize, Pixels)> {
+    current_row
+        .filter(|_| ghost_line_count > 0)
+        .map(|row| (row, ghost_lines_height))
+}
+
+/// HERDR: where each visible row of `layout` is drawn. Rows after the ghost
+/// block are pushed down by it; the block itself belongs to no row. Line
+/// decorations and gutter presses share this walk; it matches the upstream
+/// text, line-number and background paint loops.
+pub(super) fn visible_row_spans(
+    layout: &LastLayout,
+    ghost: Option<(usize, Pixels)>,
+) -> impl Iterator<Item = RowSpan> + '_ {
+    let mut top = layout.visible_top;
+    layout
+        .lines
+        .iter()
+        .zip(layout.visible_buffer_lines.iter())
+        .map(move |(line, &row)| {
+            let span = RowSpan {
+                row,
+                top,
+                height: line.size(layout.line_height).height,
+            };
+            top += span.height;
+            if let Some((ghost_row, height)) = ghost
+                && ghost_row == row
+            {
+                top += height;
+            }
+            span
+        })
+}
+
 fn clamp_auto_grow_vertical_scroll_offset(
     mode: &LayoutMode,
     scroll_top: Pixels,
@@ -435,8 +485,9 @@ pub(super) fn empty_bottom_height(
 struct FoldIconLayout {
     /// Hitbox for the line number area (used for hover detection)
     line_number_hitbox: Hitbox,
-    /// List of (display_row, is_folded, icon_element) pairs for each fold candidate
-    icons: Vec<(usize, bool, gpui::AnyElement)>,
+    /// List of (display_row, is_folded, icon_element, HERDR: where it takes
+    /// presses) for each fold candidate
+    icons: Vec<(usize, bool, gpui::AnyElement, Bounds<Pixels>)>,
 }
 
 pub(super) struct TextElement<M: InputModeKind> {
@@ -1411,9 +1462,14 @@ impl<M: InputModeKind> TextElement<M> {
                 cx,
             );
 
+            // The icon element is FOLD_ICON_WIDTH square at the hitbox origin.
+            let pressable = Bounds::new(
+                fold_icon_bounds.origin,
+                size(FOLD_ICON_WIDTH, FOLD_ICON_WIDTH),
+            );
             icon_layout
                 .icons
-                .push((info.display_row, info.is_folded, icon));
+                .push((info.display_row, info.is_folded, icon, pressable));
         }
 
         icon_layout
@@ -1432,7 +1488,7 @@ impl<M: InputModeKind> TextElement<M> {
         current_row: Option<usize>,
         window: &mut Window,
         cx: &mut App,
-    ) {
+    ) -> Vec<Bounds<Pixels>> {
         let is_hovered = fold_icon_layout.line_number_hitbox.is_hovered(window);
         if !fold_icon_layout.icons.is_empty() {
             // Mouse moves do not repaint the editor, so repaint when the pointer
@@ -1445,7 +1501,8 @@ impl<M: InputModeKind> TextElement<M> {
                 }
             });
         }
-        for (display_row, is_folded, icon) in fold_icon_layout.icons.iter_mut() {
+        let mut painted = Vec::new();
+        for (display_row, is_folded, icon, pressable) in fold_icon_layout.icons.iter_mut() {
             let is_current_line = current_row == Some(*display_row);
 
             if !is_hovered && !is_current_line && !*is_folded {
@@ -1453,7 +1510,9 @@ impl<M: InputModeKind> TextElement<M> {
             }
 
             icon.paint(window, cx);
+            painted.push(*pressable);
         }
+        painted
     }
 
     fn token_element(
@@ -3049,32 +3108,23 @@ impl<M: InputModeKind> Element for TextElement<M> {
 
         // HERDR: application row decorations: where each decorated visible row
         // is drawn, walked like the glyph backgrounds below (ghost lines included).
+        let ghost = ghost_block(
+            prepaint.current_row,
+            prepaint.ghost_lines.len(),
+            prepaint.ghost_lines_height,
+        );
         let decorated_rows: Vec<(Pixels, Pixels, super::line_decorations::RowPaint)> = {
             let decorations = &self.state.read(cx).line_decorations;
-            let mut rows = Vec::new();
             let visible = &prepaint.last_layout.visible_buffer_lines;
-            if !decorations.is_empty() && !visible.is_empty() {
+            if decorations.is_empty() || visible.is_empty() {
+                Vec::new()
+            } else {
                 // One entry per visible row (sorted ascending, folds skipped).
-                let resolved = decorations.resolve(visible);
-                let mut offset_y = invisible_top_padding;
-                for ((line, &buffer_line), paint) in prepaint
-                    .last_layout
-                    .lines
-                    .iter()
-                    .zip(visible.iter())
-                    .zip(resolved)
-                {
-                    let height = line.size(line_height).height;
-                    if let Some(paint) = paint {
-                        rows.push((origin.y + offset_y, height, paint));
-                    }
-                    offset_y += height;
-                    if Some(buffer_line) == prepaint.current_row {
-                        offset_y += prepaint.ghost_lines_height;
-                    }
-                }
+                visible_row_spans(&prepaint.last_layout, ghost)
+                    .zip(decorations.resolve(visible))
+                    .filter_map(|(span, paint)| Some((origin.y + span.top, span.height, paint?)))
+                    .collect()
             }
-            rows
         };
 
         // HERDR: row backgrounds sit under the active line, selections and text.
@@ -3362,7 +3412,7 @@ impl<M: InputModeKind> Element for TextElement<M> {
         }
 
         // Paint fold icons (only visible on hover or for current line)
-        self.paint_fold_icons(
+        let fold_icon_bounds = self.paint_fold_icons(
             &mut prepaint.fold_icon_layout,
             prepaint.current_row,
             window,
@@ -3383,10 +3433,9 @@ impl<M: InputModeKind> Element for TextElement<M> {
             state.set_input_bounds(input_bounds, cx);
             state.last_selected_range = Some(selected_range);
             state.scroll_size = prepaint.scroll_size;
-            state.last_ghost_block = prepaint
-                .current_row
-                .filter(|_| !prepaint.ghost_lines.is_empty())
-                .map(|row| (row, prepaint.ghost_lines_height));
+            state.last_ghost_block = ghost;
+            state.last_fold_icon_bounds = fold_icon_bounds;
+            state.last_frame_wrap_rows = state.display_map.wrap_row_count();
             state.update_scroll_offset(Some(prepaint.cursor_scroll_offset), cx);
             state.deferred_scroll_offset = None;
             state.apply_pending_scroll(cx);
@@ -4242,6 +4291,136 @@ mod tests {
         editor.read_with(&cx, |state, _| {
             assert_eq!(state.line_decorations.row(2).unwrap().gutter, Some(red));
             assert!(state.line_decorations.row(4).is_none());
+        });
+    }
+
+    // HERDR: set_value after layout keeps a scroll asked for by code in the
+    // same handler (only a caret reveal, which points into the old text, is dropped).
+    #[gpui::test]
+    fn set_value_after_layout_keeps_a_code_scroll(cx: &mut TestAppContext) {
+        for scroll in ["scroll_to_row", "set_scroll_offset"] {
+            let (editor, window) = decoration_editor(cx, &sixty_lines("old"), false);
+            let mut cx = VisualTestContext::from_window(window.into(), cx);
+            cx.update(|window, cx| {
+                window.draw(cx).clear(cx);
+                editor.update(cx, |state, cx| {
+                    match scroll {
+                        "scroll_to_row" => {
+                            state.scroll_to_row(40, crate::input::RowScrollAlign::Top, cx)
+                        }
+                        _ => {
+                            let line_height = state.last_layout.as_ref().unwrap().line_height;
+                            state.set_scroll_offset(point(px(0.), -(line_height * 40.)), cx)
+                        }
+                    }
+                    state.set_value(sixty_lines("new"), window, cx);
+                });
+                window.draw(cx).clear(cx);
+            });
+            let (top, _) = editor
+                .read_with(&cx, |state, _| state.row_bounds(40))
+                .expect("row 40");
+            assert_eq!(top, px(0.), "{scroll}: row 40 stays at the top");
+        }
+    }
+
+    // HERDR: a scroll asked for after the text got shorter in the same handler
+    // is clamped to the new text, so paint doesn't have to pull it back.
+    #[gpui::test]
+    fn a_scroll_after_shortening_the_text_is_clamped_to_it(cx: &mut TestAppContext) {
+        let (editor, window) = decoration_editor(cx, &sixty_lines("line"), false);
+        let mut cx = VisualTestContext::from_window(window.into(), cx);
+        let (queued, line_height) = cx.update(|window, cx| {
+            window.draw(cx).clear(cx);
+            let queued = editor.update(cx, |state, cx| {
+                state.set_value(
+                    (0..10)
+                        .map(|i| format!("short {i}"))
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                    window,
+                    cx,
+                );
+                state.scroll_to_row(9, crate::input::RowScrollAlign::Top, cx);
+                (
+                    state.deferred_scroll_offset.expect("queued"),
+                    state.last_layout.as_ref().unwrap().line_height,
+                )
+            });
+            window.draw(cx).clear(cx);
+            queued
+        });
+        assert!(
+            queued.y > -(line_height * 9.),
+            "row 9 can't reach the top of a 10-line text"
+        );
+        assert_eq!(
+            editor.read_with(&cx, |state, _| state.scroll_offset()),
+            queued
+        );
+    }
+
+    // HERDR: reads made in the handler that queued a scroll see it, clamped to
+    // what the text can reach (`set_scroll_offset` stores any offset).
+    #[gpui::test]
+    fn reads_after_a_queued_scroll_see_it_clamped(cx: &mut TestAppContext) {
+        let (editor, window) = decoration_editor(cx, &sixty_lines("line"), false);
+        let mut cx = VisualTestContext::from_window(window.into(), cx);
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        editor.update_in(&mut cx, |state, _, cx| {
+            state.scroll_to_row(40, crate::input::RowScrollAlign::Top, cx);
+            assert_eq!(
+                state.row_bounds(40).expect("row 40").0,
+                px(0.),
+                "row 40 is at the top"
+            );
+            state.set_scroll_offset(point(px(0.), px(500.)), cx);
+            assert_eq!(
+                state.queued_scroll_offset().y,
+                px(0.),
+                "nothing above the first row"
+            );
+        });
+        let lowest = editor.update_in(&mut cx, |state, _, cx| {
+            state.set_scroll_offset(point(px(-1000.), px(-100_000.)), cx);
+            state.queued_scroll_offset()
+        });
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        assert_eq!(
+            editor.read_with(&cx, |state, _| state.scroll_offset()),
+            lowest
+        );
+    }
+
+    // HERDR: a press on a painted fold chevron is the chevron's, whichever
+    // button: it is not reported as a gutter click.
+    #[gpui::test]
+    fn a_press_on_a_fold_chevron_is_not_a_gutter_click(cx: &mut TestAppContext) {
+        let (editor, mut cx) = numbered_editor(cx, "a\nb\nc");
+        let (gutter, top, line_height) = editor.read_with(&cx, |state, _| {
+            let layout = state.last_layout.as_ref().unwrap();
+            (
+                state.input_bounds.origin.x + px(2.),
+                state.input_bounds.origin.y,
+                layout.line_height,
+            )
+        });
+        let chevron = Bounds::new(
+            point(gutter + px(10.), top + line_height),
+            size(px(14.), line_height),
+        );
+        // Set after the frame: these rows have no fold for paint to record.
+        cx.update(|_, cx| {
+            editor.update(cx, |state, _| state.last_fold_icon_bounds = vec![chevron])
+        });
+        editor.read_with(&cx, |state, _| {
+            let y = top + line_height * 1.5;
+            assert_eq!(
+                state.gutter_row_at(point(gutter + px(12.), y)),
+                None,
+                "on the chevron"
+            );
+            assert_eq!(state.gutter_row_at(point(gutter, y)), Some(1), "beside it");
         });
     }
 

@@ -3036,8 +3036,8 @@ const BASE: &str = r#"  /** A row. */
   export interface GutterClickEvent {
     /** 0-based buffer row. */
     readonly row: number;
-    /** As in `on_mouse_down`. */
-    readonly button: "left" | "right" | "middle";
+    /** As in `on_mouse_down`; a middle press is not reported. */
+    readonly button: "left" | "right";
     /** 1 for a single press, 2 on the second press of a double-click, 3 for a
      * triple-click. Every press is reported: act on `click_count === 1` to toggle. */
     readonly click_count: number;
@@ -3063,9 +3063,8 @@ const BASE: &str = r#"  /** A row. */
     value(): string;
     /** Plain text, or a content snapshot to restore its tokens as well. */
     set_value(next: string | InputContent): void;
-    /** `change`, `submit`, `focus`, `blur`, `paste_other`: a paste found no text (an image, say),
-     * `selection_change`: the selection or caret moved, or `scroll`: the view scrolled. */
-    on(event: "change" | "submit" | "focus" | "blur" | "paste_other" | "selection_change" | "scroll", handler: (event: InputEvent, cx: Context) => void): boolean;
+    /** `change`, `submit`, `focus`, `blur`, or `paste_other`: a paste found no text (an image, say). */
+    on(event: "change" | "submit" | "focus" | "blur" | "paste_other", handler: (event: InputEvent, cx: Context) => void): boolean;
     /**
      * How much one step moves the value in a `NumberInput`. Default is 1;
      * `null` gives up stepping entirely.
@@ -3133,9 +3132,8 @@ const BASE: &str = r#"  /** A row. */
     value(): string;
     /** Plain text, or a content snapshot to restore its tokens as well. */
     set_value(next: string | InputContent): void;
-    /** `change`, `submit`, `focus`, `blur`, `paste_other`: a paste found no text (an image, say),
-     * `selection_change`: the selection or caret moved, or `scroll`: the view scrolled. */
-    on(event: "change" | "submit" | "focus" | "blur" | "paste_other" | "selection_change" | "scroll", handler: (event: InputEvent, cx: Context) => void): boolean;
+    /** `change`, `submit`, `focus`, `blur`, or `paste_other`: a paste found no text (an image, say). */
+    on(event: "change" | "submit" | "focus" | "blur" | "paste_other", handler: (event: InputEvent, cx: Context) => void): boolean;
     /** Shows this many rows. */
     set_rows(rows: number): void;
     /** Grows with the content, between the two row counts. */
@@ -3160,7 +3158,8 @@ const BASE: &str = r#"  /** A row. */
     /** Programmatic replacement works even in readonly mode. */
     set_value(value: string): void;
     /** `selection_change`: selections or carets moved, were added or removed; read `selections()`.
-     * `scroll`: the view scrolled; `scroll_position()` and `row_bounds()` are current in the handler. */
+     * `scroll`: the view scrolled; `scroll_position()` and `row_bounds()` are current in the handler.
+     * Only editors report these two (inputs and textareas reject them). */
     on(event: "change" | "submit" | "focus" | "blur" | "paste_other" | "selection_change" | "scroll", handler: (event: InputEvent, cx: Context) => void): boolean;
     /** A press on a line number (not a fold chevron). The press still places the caret,
      * so dragging down the gutter still selects lines. Presses in the gutter's padding or
@@ -3184,10 +3183,12 @@ const BASE: &str = r#"  /** A row. */
     /** Scrolls vertically only. Before the first layout the request waits for it.
      * Defaults to "nearest". */
     scroll_to_row(row: number, align?: "nearest" | "top" | "center"): void;
-    /** Pixels scrolled from the top left; `line_height` is null before the first layout. */
+    /** Pixels scrolled from the top left, counting a scroll asked for earlier in the same
+     * handler (`scroll_to_row`, `set_selections`); `line_height` is null before the first layout. */
     scroll_position(): { top: number; left: number; line_height: number | null };
     /** Pixels from the top of the visible text area; null before layout or inside a fold.
-     * A soft-wrapped row is taller than one line. */
+     * A soft-wrapped row is taller than one line. Counts a scroll asked for earlier in the
+     * same handler, like `scroll_position()`. */
     row_bounds(row: number): { top: number; height: number } | null;
     release(): boolean;
   }
@@ -4781,6 +4782,19 @@ mod tests {
             "on(event: {}, handler: (event: InputEvent, cx: Context)",
             union(crate::entities::InputEventName::NAMES)
         )));
+        // HERDR: editors add `selection_change` and `scroll` to the same
+        // handler type, and `gutter_click` with its own payload.
+        let editor_names: Vec<_> = crate::entities::InputEventName::names(true)
+            .into_iter()
+            .filter(|name| *name != "gutter_click")
+            .collect();
+        assert!(declarations.contains(&format!(
+            "on(event: {}, handler: (event: InputEvent, cx: Context)",
+            union(&editor_names)
+        )));
+        assert!(declarations.contains(
+            "on(event: \"gutter_click\", handler: (event: GutterClickEvent, cx: Context)"
+        ));
         assert!(declarations.contains(&format!(
             "on(event: {}, handler: (event: OtpEvent, cx: Context)",
             union(crate::entities::OtpEventName::NAMES)

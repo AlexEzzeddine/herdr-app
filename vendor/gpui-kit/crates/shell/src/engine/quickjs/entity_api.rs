@@ -256,7 +256,14 @@ pub fn install(ctx: &Ctx<'_>, module: &Object<'_>, runtime: Weak<ShellRuntime>) 
                   name: String,
                   handler: Handler|
                   -> JsResult<bool> {
-                subscribe(&ctx, &subscribe_runtime, handle, &name, handler, "input")
+                subscribe(
+                    &ctx,
+                    &subscribe_runtime,
+                    handle,
+                    &name,
+                    handler,
+                    StateKind::Input,
+                )
             },
         ),
     )?;
@@ -336,7 +343,7 @@ pub fn install(ctx: &Ctx<'_>, module: &Object<'_>, runtime: Weak<ShellRuntime>) 
                     handle,
                     &name,
                     handler,
-                    "textarea",
+                    StateKind::Textarea,
                 )
             },
         ),
@@ -594,7 +601,8 @@ pub fn install(ctx: &Ctx<'_>, module: &Object<'_>, runtime: Weak<ShellRuntime>) 
                 let state = live_editor(&ctx, &read_scroll, handle)?;
                 scope::with_current_app(|cx| {
                     let state = state.read(cx);
-                    let offset = state.scroll_offset();
+                    // A scroll queued in this handler counts, like `row_bounds`.
+                    let offset = state.queued_scroll_offset();
                     serde_json::json!({
                         "top": -f32::from(offset.y),
                         "left": -f32::from(offset.x),
@@ -678,7 +686,14 @@ pub fn install(ctx: &Ctx<'_>, module: &Object<'_>, runtime: Weak<ShellRuntime>) 
                   name: String,
                   handler: Handler|
                   -> JsResult<bool> {
-                subscribe(&ctx, &subscribe_editor, handle, &name, handler, "editor")
+                subscribe(
+                    &ctx,
+                    &subscribe_editor,
+                    handle,
+                    &name,
+                    handler,
+                    StateKind::Editor,
+                )
             },
         ),
     )?;
@@ -1495,24 +1510,25 @@ fn write_value<M: InputModeKind>(
 ///
 /// The store resolves the handle to whichever entity it names, so the whole of
 /// this — the event-name check, the captured grant, the released-state report —
-/// is shared; `what` only names the state in the error a script sees.
+/// is shared; `what` decides which events it reports (editors report a few
+/// more) and names the state in the error a script sees.
 fn subscribe(
     ctx: &Ctx<'_>,
     runtime: &Weak<ShellRuntime>,
     handle: EntityHandle,
     name: &str,
     handler: Handler,
-    what: &str,
+    what: StateKind,
 ) -> JsResult<bool> {
-    let names = if what == "editor" {
-        InputEventName::EDITOR_NAMES
-    } else {
-        InputEventName::NAMES
-    };
-    let event = InputEventName::from_name(name, names).ok_or_else(|| {
+    let editor = what == StateKind::Editor;
+    let event = InputEventName::from_name(name, editor).ok_or_else(|| {
         Exception::throw_type(
             ctx,
-            &format!("unknown {what} event `{name}`; expected one of: {}", names.join(", ")),
+            &format!(
+                "unknown {} event `{name}`; expected one of: {}",
+                what.name(),
+                InputEventName::names(editor).join(", ")
+            ),
         )
     })?;
 
@@ -1549,7 +1565,7 @@ fn subscribe(
     if !subscribed {
         return Err(Exception::throw_type(
             ctx,
-            &format!("this {what} state has been released"),
+            &format!("this {} state has been released", what.name()),
         ));
     }
     Ok(true)
@@ -1958,6 +1974,24 @@ fn subscribe_calendar(
         ));
     }
     Ok(subscribed)
+}
+
+/// Which text state [`subscribe`] is called for.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum StateKind {
+    Input,
+    Textarea,
+    Editor,
+}
+
+impl StateKind {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Input => "input",
+            Self::Textarea => "textarea",
+            Self::Editor => "editor",
+        }
+    }
 }
 
 fn alive(ctx: &Ctx<'_>, runtime: &Weak<ShellRuntime>) -> JsResult<std::rc::Rc<ShellRuntime>> {

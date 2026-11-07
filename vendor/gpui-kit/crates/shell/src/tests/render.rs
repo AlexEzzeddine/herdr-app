@@ -5824,7 +5824,8 @@ export default class Code extends View {
 }
 
 // HERDR: a gutter click carries the same `modifiers` object as element mouse
-// events, and only editors accept `gutter_click` (inputs have no gutter).
+// events, and only editors accept `gutter_click` (inputs have no gutter),
+// `selection_change` and `scroll` (inputs have nothing to read them with).
 #[gpui::test]
 fn gutter_clicks_carry_modifiers_and_only_editors_accept_them(cx: &mut TestAppContext) {
     cx.update(|cx| crate::init(cx));
@@ -5838,19 +5839,25 @@ export default class Code extends View {
     this.code = EditorState.new({ language: "rust", value: "a\nb\nc", line_numbers: true });
     this.seen = "none";
     this.code.on("gutter_click", (event) => { this.seen = JSON.stringify(event); });
-    const rejects = (state) => {
-      try { state.on("gutter_click", () => {}); return "accepted"; }
+    const rejects = (state, event = "gutter_click") => {
+      try { state.on(event, () => {}); return "accepted"; }
       catch (error) { return String(error.message); }
     };
     this.textarea = rejects(TextareaState.new({ value: "x" }));
     this.input = rejects(InputState.new({ value: "x" }));
+    this.textarea_scroll = rejects(TextareaState.new({ value: "x" }), "scroll");
+    this.input_selection = rejects(InputState.new({ value: "x" }), "selection_change");
+    this.editor_scroll = rejects(this.code, "scroll");
   }
   render(cx) {
     return div()
       .child(Editor.new(this.code).h(200))
       .child("seen=" + this.seen)
       .child("textarea=" + this.textarea)
-      .child("input=" + this.input);
+      .child("input=" + this.input)
+      .child("textarea_scroll=" + this.textarea_scroll)
+      .child("input_selection=" + this.input_selection)
+      .child("editor_scroll=" + this.editor_scroll);
   }
 }
 "##;
@@ -5889,6 +5896,9 @@ export default class Code extends View {
     assert!(!tree.contains("textarea=accepted"), "{tree}");
     assert!(tree.contains("textarea=unknown textarea event `gutter_click`"), "{tree}");
     assert!(tree.contains("input=unknown input event `gutter_click`"), "{tree}");
+    assert!(tree.contains("textarea_scroll=unknown textarea event `scroll`"), "{tree}");
+    assert!(tree.contains("input_selection=unknown input event `selection_change`"), "{tree}");
+    assert!(tree.contains("editor_scroll=accepted"), "{tree}");
 }
 
 // HERDR: readonly rejects keyboard edits without disabling selection or programmatic refresh.
