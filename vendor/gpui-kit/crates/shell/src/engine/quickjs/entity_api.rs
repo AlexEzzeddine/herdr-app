@@ -1504,13 +1504,15 @@ fn subscribe(
     handler: Handler,
     what: &str,
 ) -> JsResult<bool> {
-    let event = InputEventName::from_name(name).ok_or_else(|| {
+    let names = if what == "editor" {
+        InputEventName::EDITOR_NAMES
+    } else {
+        InputEventName::NAMES
+    };
+    let event = InputEventName::from_name(name, names).ok_or_else(|| {
         Exception::throw_type(
             ctx,
-            &format!(
-                "unknown input event `{name}`; expected one of: {}",
-                InputEventName::NAMES.join(", ")
-            ),
+            &format!("unknown {what} event `{name}`; expected one of: {}", names.join(", ")),
         )
     })?;
 

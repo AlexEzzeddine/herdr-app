@@ -3885,20 +3885,12 @@ impl ShellRuntime {
                     modifiers,
                     click_count,
                 } => {
+                    // HERDR: the same button names and `modifiers` object as
+                    // element mouse events, so one handler reads both.
                     payload.set("row", *row as f64)?;
-                    let button = match button {
-                        gpui::MouseButton::Left => "left",
-                        gpui::MouseButton::Right => "right",
-                        gpui::MouseButton::Middle => "middle",
-                        gpui::MouseButton::Navigate(gpui::NavigationDirection::Back) => "back",
-                        gpui::MouseButton::Navigate(gpui::NavigationDirection::Forward) => {
-                            "forward"
-                        }
-                    };
-                    payload.set("button", button)?;
-                    payload.set("click_count", *click_count as f64)?;
-                    payload.set("shift", modifiers.shift)?;
-                    payload.set("secondary", modifiers.secondary())?;
+                    payload.set("button", mouse_button_name(*button))?;
+                    payload.set("click_count", *click_count as u32)?;
+                    payload.set("modifiers", modifiers_object(ctx, *modifiers)?)?;
                 }
                 InputEvent::Change
                 | InputEvent::Focus
@@ -9667,18 +9659,21 @@ fn mouse_button_payload<'js>(
     bounds: Option<gpui::Bounds<gpui::Pixels>>,
 ) -> JsResult<Object<'js>> {
     let payload = Object::new(ctx.clone())?;
-    payload.set(
-        "button",
-        match button {
-            gpui::MouseButton::Right => "right",
-            gpui::MouseButton::Middle => "middle",
-            _ => "left",
-        },
-    )?;
+    payload.set("button", mouse_button_name(button))?;
     payload.set("click_count", click_count as u32)?;
     set_pointer_geometry(ctx, &payload, position, bounds)?;
     payload.set("modifiers", modifiers_object(ctx, modifiers)?)?;
     Ok(payload)
+}
+
+/// The name scripts see for a mouse button. Back and forward report as
+/// `"left"`, as they always have for element mouse events.
+fn mouse_button_name(button: gpui::MouseButton) -> &'static str {
+    match button {
+        gpui::MouseButton::Right => "right",
+        gpui::MouseButton::Middle => "middle",
+        _ => "left",
+    }
 }
 
 fn set_pointer_geometry<'js>(

@@ -3033,15 +3033,15 @@ const BASE: &str = r#"  /** A row. */
   }
 
   /** An `EditorState` `gutter_click`: a press on a line number. */
-  export interface GutterClickEvent extends InputEvent {
+  export interface GutterClickEvent {
     /** 0-based buffer row. */
     readonly row: number;
-    readonly button: "left" | "right" | "middle" | "back" | "forward";
+    /** As in `on_mouse_down`. */
+    readonly button: "left" | "right" | "middle";
     /** 1 for a single press, 2 on the second press of a double-click, 3 for a
      * triple-click. Every press is reported: act on `click_count === 1` to toggle. */
     readonly click_count: number;
-    readonly secondary: boolean;
-    readonly shift: boolean;
+    readonly modifiers: Modifiers;
   }
 
   /** The OTP event payload is currently empty; read the value from the state. */

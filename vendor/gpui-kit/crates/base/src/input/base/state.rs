@@ -617,6 +617,14 @@ pub struct InputBaseState<M: InputModeKind> {
     _subscriptions: Vec<Subscription>,
     /// The selections last reported by [`InputEvent::SelectionChange`].
     reported_selections: Vec<SelectionRange>,
+    /// [`Selections::generation`] when `reported_selections` was last
+    /// checked: an unchanged generation skips the comparison (cursor blinks
+    /// notify without touching the selections).
+    reported_selections_generation: u64,
+    /// HERDR: the inline-completion ghost block of the last frame: the
+    /// buffer row it is drawn under and its height. Rows after it are drawn
+    /// that much lower.
+    pub(super) last_ghost_block: Option<(usize, Pixels)>,
 
     pub(super) auto_scroll: AutoScroll,
 }
@@ -950,6 +958,8 @@ impl<M: InputModeKind> InputBaseState<M> {
             emit_events: true,
             _subscriptions,
             reported_selections: vec![SelectionRange { range: 0..0, reversed: false }],
+            reported_selections_generation: 0,
+            last_ghost_block: None,
             _pending_update: false,
             cursor_line_end_affinity: false,
             auto_scroll: AutoScroll::default(),
@@ -2767,7 +2777,11 @@ impl<M: InputModeKind> InputBaseState<M> {
             return;
         };
 
-        let mut scroll_offset = self.scroll_handle.offset();
+        // HERDR: measure against a scroll already queued this frame (a
+        // `scroll_to_row` earlier in the same handler), so revealing an
+        // offset that is visible there keeps that scroll instead of
+        // replacing it with the current one.
+        let mut scroll_offset = self.deferred_scroll_offset.unwrap_or(self.scroll_handle.offset());
         let was_offset = scroll_offset;
         let line_height = last_layout.line_height;
 
@@ -3535,7 +3549,7 @@ impl<M: InputModeKind> InputBaseState<M> {
     /// the gutter or off every laid-out row (the padding, or the empty space
     /// below the last line). Rows are measured like
     /// [`Self::resolve_mouse_position`], so it matches where the caret goes.
-    fn gutter_row_at(&self, position: Point<Pixels>) -> Option<usize> {
+    pub(super) fn gutter_row_at(&self, position: Point<Pixels>) -> Option<usize> {
         if !self.is_in_gutter(position) {
             return None;
         }
@@ -3548,6 +3562,16 @@ impl<M: InputModeKind> InputBaseState<M> {
                 return Some(row);
             }
             top = bottom;
+            // Ghost lines are drawn under their row and push the rest down;
+            // a press on them is on no row.
+            if let Some((ghost_row, height)) = self.last_ghost_block
+                && ghost_row == row
+            {
+                if y >= top && y < top + height {
+                    return None;
+                }
+                top += height;
+            }
         }
         None
     }
@@ -3562,7 +3586,13 @@ impl<M: InputModeKind> InputBaseState<M> {
             return None;
         }
         let rows = self.display_map.buffer_line_to_display_row_range(row)?;
-        let top = line_height * rows.start + self.scroll_handle.offset().y;
+        let mut top = line_height * rows.start + self.scroll_handle.offset().y;
+        // Rows below an inline completion are drawn under its ghost lines.
+        if let Some((ghost_row, height)) = self.last_ghost_block
+            && row > ghost_row
+        {
+            top += height;
+        }
         Some((top, line_height * rows.len()))
     }
 
@@ -3589,12 +3619,22 @@ impl<M: InputModeKind> InputBaseState<M> {
     }
 
     fn mark_selections_reported(&mut self) {
+        self.reported_selections_generation = self.selections.generation();
         if !self.selections_match_reported() {
             self.reported_selections = self.selections();
         }
     }
 
+    /// Runs on every notify. Every selection mutation goes through
+    /// [`Selections`]' mutating methods, which bump its generation, so a
+    /// notify that touched no selection (a cursor blink, a hover) returns
+    /// after one integer compare.
     fn report_selection_change(&mut self, cx: &mut Context<Self>) {
+        let generation = self.selections.generation();
+        if generation == self.reported_selections_generation {
+            return;
+        }
+        self.reported_selections_generation = generation;
         if self.selections_match_reported() {
             return;
         }

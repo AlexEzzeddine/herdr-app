@@ -5823,6 +5823,74 @@ export default class Code extends View {
     assert!(tree.contains(r#"sel=[{"start":{"row":0,"col":0},"end":{"row":0,"col":0}"#), "{tree}");
 }
 
+// HERDR: a gutter click carries the same `modifiers` object as element mouse
+// events, and only editors accept `gutter_click` (inputs have no gutter).
+#[gpui::test]
+fn gutter_clicks_carry_modifiers_and_only_editors_accept_them(cx: &mut TestAppContext) {
+    cx.update(|cx| crate::init(cx));
+    let runtime = ShellRuntime::new_isolated().expect("runtime");
+    cx.update(|cx| runtime.set_global(cx));
+    let source = r##"
+import { View, div } from "gpui-kit";
+import { Editor, EditorState, TextareaState, InputState } from "gpui-base";
+export default class Code extends View {
+  init() {
+    this.code = EditorState.new({ language: "rust", value: "a\nb\nc", line_numbers: true });
+    this.seen = "none";
+    this.code.on("gutter_click", (event) => { this.seen = JSON.stringify(event); });
+    const rejects = (state) => {
+      try { state.on("gutter_click", () => {}); return "accepted"; }
+      catch (error) { return String(error.message); }
+    };
+    this.textarea = rejects(TextareaState.new({ value: "x" }));
+    this.input = rejects(InputState.new({ value: "x" }));
+  }
+  render(cx) {
+    return div()
+      .child(Editor.new(this.code).h(200))
+      .child("seen=" + this.seen)
+      .child("textarea=" + this.textarea)
+      .child("input=" + this.input);
+  }
+}
+"##;
+    let view_type = runtime.load_source("gutter", source).expect("load");
+    let window = cx.add_window(|_, _| Empty);
+    let mut context = VisualTestContext::from_window(*window.deref(), cx);
+    let object = context
+        .update(|window, cx| runtime.instantiate(&view_type, window, cx))
+        .expect("instantiate");
+    let view = context.update(|_, cx| cx.new(|_| ScriptView::new(runtime.clone(), object.clone())));
+    draw(&mut context, &view);
+    let editor = runtime.entities().first_editor().expect("editor");
+    context.update(|_, cx| {
+        editor.update(cx, |_, cx| {
+            cx.emit(gpui_base::input::InputEvent::GutterClick {
+                row: 1,
+                button: gpui::MouseButton::Right,
+                modifiers: Modifiers { alt: true, ..Default::default() },
+                click_count: 1,
+            })
+        })
+    });
+    context.run_until_parked();
+    draw(&mut context, &view);
+    let tree = context
+        .update(|window, cx| runtime.render_to_spec(&object, None, window, cx))
+        .expect("render")
+        .replace("\\\"", "\"");
+    assert!(tree.contains(r#""row":1"#), "{tree}");
+    assert!(tree.contains(r#""button":"right""#), "{tree}");
+    assert!(tree.contains(r#""click_count":1"#), "{tree}");
+    assert!(
+        tree.contains(r#""modifiers":{"shift":false,"control":false,"alt":true,"platform":false,"function":false}"#),
+        "{tree}"
+    );
+    assert!(!tree.contains("textarea=accepted"), "{tree}");
+    assert!(tree.contains("textarea=unknown textarea event `gutter_click`"), "{tree}");
+    assert!(tree.contains("input=unknown input event `gutter_click`"), "{tree}");
+}
+
 // HERDR: readonly rejects keyboard edits without disabling selection or programmatic refresh.
 #[gpui::test]
 fn a_readonly_script_editor_remains_selectable(cx: &mut TestAppContext) {

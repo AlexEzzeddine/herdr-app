@@ -3171,19 +3171,15 @@ impl<M: InputModeKind> Element for TextElement<M> {
             window.paint_path(path.clone(), *color);
         }
 
-        // Paint selections. Selections set by code with
-        // `show_unfocused_selection` stay painted in an inactive window too.
+        // Paint search matches, then selections on top of them. Selections set
+        // by code with `show_unfocused_selection` stay painted in an inactive
+        // window too (search matches and hover don't).
         let window_active = window.is_window_active();
-        if window_active || self.state.read(cx).show_unfocused_selection {
-            for path in prepaint.selection_paths.drain(..) {
-                window.paint_path(path, editor_style.selection);
-            }
-        }
+        let secondary_selection = Hsla {
+            s: 0.1,
+            ..editor_style.selection
+        };
         if window_active {
-            let secondary_selection = Hsla {
-                s: 0.1,
-                ..editor_style.selection
-            };
             for (path, is_active) in prepaint.search_match_paths.iter() {
                 window.paint_path(path.clone(), secondary_selection);
 
@@ -3191,7 +3187,13 @@ impl<M: InputModeKind> Element for TextElement<M> {
                     window.paint_path(path.clone(), editor_style.selection);
                 }
             }
-
+        }
+        if window_active || self.state.read(cx).show_unfocused_selection {
+            for path in prepaint.selection_paths.drain(..) {
+                window.paint_path(path, editor_style.selection);
+            }
+        }
+        if window_active {
             // Paint hover highlight
             if let Some(path) = prepaint.hover_highlight_path.take() {
                 window.paint_path(path, secondary_selection);
@@ -3381,9 +3383,19 @@ impl<M: InputModeKind> Element for TextElement<M> {
             state.set_input_bounds(input_bounds, cx);
             state.last_selected_range = Some(selected_range);
             state.scroll_size = prepaint.scroll_size;
+            state.last_ghost_block = prepaint
+                .current_row
+                .filter(|_| !prepaint.ghost_lines.is_empty())
+                .map(|row| (row, prepaint.ghost_lines_height));
             state.update_scroll_offset(Some(prepaint.cursor_scroll_offset), cx);
             state.deferred_scroll_offset = None;
             state.apply_pending_scroll(cx);
+            // Scrolls are reported here rather than from the setters: code
+            // scrolls (`scroll_to_row`, `set_scroll_offset`, caret reveals)
+            // only queue a deferred offset that this frame applies, and the
+            // scrollbar writes the shared `ScrollHandle` directly. An editor
+            // that isn't painted hasn't scrolled yet, so it has nothing to
+            // report until it is.
             let scroll = state.scroll_handle.offset();
             if scroll != state.reported_scroll {
                 state.reported_scroll = scroll;
@@ -4117,6 +4129,50 @@ mod tests {
             window.draw(cx).clear(cx);
         });
         assert_eq!(editor.read_with(&cx, |state, _| state.scroll_offset().y), px(0.));
+    }
+
+    // HERDR: revealing a selection that is visible at a scroll queued earlier
+    // in the same handler keeps that scroll.
+    #[gpui::test]
+    fn set_selections_keeps_a_row_scroll_queued_in_the_same_handler(cx: &mut TestAppContext) {
+        let (editor, window) = decoration_editor(cx, &sixty_lines("line"), false);
+        let mut cx = VisualTestContext::from_window(window.into(), cx);
+        let far = sixty_lines("line").find("line 40").unwrap();
+        cx.update(|window, cx| {
+            window.draw(cx).clear(cx);
+            editor.update(cx, |state, cx| {
+                state.scroll_to_row(40, crate::input::RowScrollAlign::Top, cx);
+                state.set_selections(vec![sel(far..far, false)], cx);
+            });
+            window.draw(cx).clear(cx);
+        });
+        let (top, _) = editor.read_with(&cx, |state, _| state.row_bounds(40)).expect("row 40");
+        assert_eq!(top, px(0.), "row 40 stays at the top");
+    }
+
+    // HERDR: rows below an inline completion's ghost lines are measured and
+    // hit where they are drawn; a press on the ghost lines is on no row.
+    #[gpui::test]
+    fn rows_below_ghost_lines_are_measured_where_they_are_drawn(cx: &mut TestAppContext) {
+        let (editor, mut cx) = numbered_editor(cx, "a\nb\nc\nd\ne");
+        let (gutter, top, line_height) = editor.read_with(&cx, |state, _| {
+            let layout = state.last_layout.as_ref().unwrap();
+            (state.input_bounds.origin.x + px(2.), state.input_bounds.origin.y, layout.line_height)
+        });
+        let ghost = line_height * 2.;
+        // Set after the frame: paint records the block, and there is no inline
+        // completion here to draw one.
+        cx.update(|_, cx| editor.update(cx, |state, _| state.last_ghost_block = Some((1, ghost))));
+        editor.read_with(&cx, |state, _| {
+            let at = |row_y: Pixels| state.gutter_row_at(point(gutter, top + row_y));
+            assert_eq!(at(line_height * 0.5), Some(0));
+            assert_eq!(at(line_height * 1.5), Some(1));
+            assert_eq!(at(line_height * 2.5), None, "on the ghost lines");
+            assert_eq!(at(line_height * 4.5), Some(2), "row 2 is drawn below them");
+            let (row0, _) = state.row_bounds(0).unwrap();
+            let (row2, _) = state.row_bounds(2).unwrap();
+            assert_eq!(row2 - row0, line_height * 2. + ghost);
+        });
     }
 
     // HERDR: gutter presses off every row report nothing; each press of a

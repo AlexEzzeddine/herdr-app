@@ -134,6 +134,10 @@ impl RangeBounds<usize> for CursorSelection {
 pub(super) struct Selections {
     selections: Vec<CursorSelection>,
     next_id: usize,
+    /// HERDR: bumped by every mutating method, so the owner can tell cheaply
+    /// that the selections may have changed (see `InputBaseState`'s
+    /// selection-change report).
+    generation: u64,
 }
 
 impl Selections {
@@ -141,6 +145,7 @@ impl Selections {
         Self {
             selections: vec![CursorSelection::new(CursorId::new(0), 0, 0)],
             next_id: 1,
+            generation: 0,
         }
     }
 
@@ -153,9 +158,16 @@ impl Selections {
 
     /// Returns a mutable reference to the active selection.
     pub(super) fn active_mut(&mut self) -> &mut CursorSelection {
+        self.generation += 1;
         self.selections
             .first_mut()
             .expect("Selections always has at least one selection")
+    }
+
+    /// HERDR: changes whenever a mutating method ran (it may not have
+    /// changed anything; equal generations mean nothing changed).
+    pub(super) fn generation(&self) -> u64 {
+        self.generation
     }
 
     pub(super) fn iter(&self) -> impl Iterator<Item = &CursorSelection> {
@@ -181,6 +193,7 @@ impl Selections {
 
     /// Adds an additional selection.
     pub(super) fn add(&mut self, selection: CursorSelection) {
+        self.generation += 1;
         self.selections.push(selection);
     }
 
@@ -188,12 +201,14 @@ impl Selections {
     /// "always at least one selection" invariant.
     pub(super) fn replace_all(&mut self, selections: Vec<CursorSelection>) {
         if !selections.is_empty() {
+            self.generation += 1;
             self.selections = selections;
         }
     }
 
     /// Removes every selection except the active one (index 0).
     pub(super) fn remove_all_but_active(&mut self) {
+        self.generation += 1;
         self.selections.truncate(1);
     }
 
@@ -207,6 +222,7 @@ impl Selections {
             return;
         }
 
+        self.generation += 1;
         let active_id = self.active().id;
 
         self.selections.sort_by_key(|s| s.start);

@@ -1277,7 +1277,12 @@ pub enum InputEventName {
 }
 
 impl InputEventName {
-    pub fn from_name(name: &str) -> Option<Self> {
+    /// The event called `name`, among those `names` accepts (pass
+    /// [`Self::NAMES`] or [`Self::EDITOR_NAMES`]).
+    pub fn from_name(name: &str, names: &[&str]) -> Option<Self> {
+        if !names.contains(&name) {
+            return None;
+        }
         match name {
             "change" => Some(Self::Change),
             "submit" => Some(Self::Submit),
@@ -1292,6 +1297,19 @@ impl InputEventName {
     }
 
     pub const NAMES: &'static [&'static str] = &[
+        "change",
+        "submit",
+        "focus",
+        "blur",
+        "paste_other",
+        "selection_change",
+        "scroll",
+    ];
+
+    /// HERDR: an `EditorState` also reports presses on its line numbers;
+    /// inputs and textareas have no gutter, so they reject `gutter_click`
+    /// instead of accepting a handler that never runs.
+    pub const EDITOR_NAMES: &'static [&'static str] = &[
         "change",
         "submit",
         "focus",
