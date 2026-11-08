@@ -344,9 +344,14 @@ pub(super) fn reveal_x(
         TextAlign::Center => CURSOR_WIDTH,
     };
     let left = if left_margin { margin } else { px(0.) };
-    if caret_x - left < -scroll_x {
+    let past_left = caret_x - left < -scroll_x;
+    let past_right = caret_x + margin > -scroll_x + view_width;
+    // Both hold only in a view narrower than the margins. Upstream's two
+    // copies settle that differently, and each is kept: `scroll_to` checks
+    // the left edge first, cursor-follow the right one.
+    if past_left && (left_margin || !past_right) {
         (-caret_x + left).min(px(0.))
-    } else if caret_x + margin > -scroll_x + view_width {
+    } else if past_right {
         -(caret_x - view_width + margin)
     } else {
         scroll_x
@@ -4091,6 +4096,54 @@ mod tests {
         });
     }
 
+    // HERDR: in a view narrower than the margin, where a caret is past
+    // both edges, cursor-follow keeps upstream's right edge and the reveal
+    // (`scroll_to`) its left edge, as their upstream copies did.
+    #[test]
+    fn a_caret_past_both_edges_follows_upstream_per_path() {
+        let (caret_x, scroll_x, width) = (px(20.), px(-25.), px(4.));
+        assert_eq!(
+            reveal_x(caret_x, scroll_x, width, TextAlign::Left, false),
+            width - RIGHT_MARGIN - caret_x,
+            "cursor-follow: the right edge"
+        );
+        assert_eq!(
+            reveal_x(caret_x, scroll_x, width, TextAlign::Left, true),
+            -caret_x + RIGHT_MARGIN,
+            "scroll_to: the left edge"
+        );
+    }
+
+    // HERDR: a row scroll after `set_scroll_offset` in the same handler
+    // keeps that offset's x: only the vertical part changes.
+    #[gpui::test]
+    fn a_row_scroll_keeps_a_queued_horizontal_offset(cx: &mut TestAppContext) {
+        let (text, _) = text_with_a_far_column();
+        let (editor, window) = decoration_editor(cx, &text, false);
+        let mut cx = VisualTestContext::from_window(window.into(), cx);
+        cx.update(|window, cx| {
+            window.draw(cx).clear(cx);
+            editor.update(cx, |state, cx| {
+                let line_height = state.last_layout.as_ref().unwrap().line_height;
+                // Row 50 is laid out, so the text is wide enough to scroll right.
+                state.scroll_handle.set_offset(point(px(0.), -(line_height * 46.)));
+                cx.notify();
+            });
+            window.draw(cx).clear(cx);
+            editor.update(cx, |state, cx| {
+                state.set_scroll_offset(point(px(-100.), state.scroll_handle.offset().y), cx);
+                state.scroll_to_row(48, crate::input::RowScrollAlign::Top, window, cx);
+                assert_eq!(state.deferred_scroll_offset().unwrap().x, px(-100.), "the queued x is kept");
+            });
+            window.draw(cx).clear(cx);
+        });
+        editor.update_in(&mut cx, |state, window, _| {
+            assert_eq!(state.scroll_handle.offset().x, px(-100.), "scrolled right");
+            let (top, _) = state.row_bounds(48, window).unwrap();
+            assert_eq!(top, px(0.), "row 48 is at the top");
+        });
+    }
+
     // HERDR: an upstream reveal (here `set_selected_range`) while the view
     // has no height yet keeps a row scroll waiting for a usable layout: the
     // view opens on that row once it is sized. The editor's padding keeps
@@ -4511,31 +4564,55 @@ mod tests {
         assert_eq!(seen.get(), 2, "the caret's column moved");
     }
 
-    // HERDR: the selection-change report skips its comparison while the
-    // selections' generation is unchanged, so every edit path has to bump
-    // it, even when the caret keeps its byte offset (only its UTF-16 column
-    // moves): otherwise that move would never be reported.
+    // HERDR: an edit since the last report is always compared, so a report
+    // doesn't depend on the edit path bumping the selections' generation.
+    // Here the generation is marked seen after an edit that keeps the
+    // caret's byte offset but moves its UTF-16 column, as a path that wrote
+    // the caret with its old value would leave it: the move is still
+    // reported.
     #[gpui::test]
-    fn every_edit_path_bumps_the_selection_generation(cx: &mut TestAppContext) {
-        for path in ["ranges", "range", "range_silent"] {
-            let (editor, window) = decoration_editor(cx, "aa\néx", false);
-            let mut cx = VisualTestContext::from_window(window.into(), cx);
-            cx.update(|window, cx| {
-                editor.update(cx, |state, cx| {
-                    state.set_selected_range(5..5, cx);
-                    let seen = state.selections.mark_seen();
-                    // "é" to "ab": the caret stays at byte 5. The single-range
-                    // paths take UTF-16 ranges ("é" is unit 3).
-                    match path {
-                        "ranges" => state.replace_text_in_ranges(&[(3..5, "ab".into())], window, cx),
-                        "range" => state.replace_text_in_range(Some(3..4), "ab", window, cx),
-                        _ => state.replace_text_in_range_silent(Some(3..4), "ab", window, cx),
-                    }
-                    assert_eq!(state.selected_range(), 5..5, "{path}: same byte offset");
-                    assert_ne!(state.selections.generation(), seen, "{path}: generation bumped");
-                })
-            });
-        }
+    fn an_edit_is_compared_without_a_generation_bump(cx: &mut TestAppContext) {
+        let (editor, window) = decoration_editor(cx, "aa\néx", false);
+        let mut cx = VisualTestContext::from_window(window.into(), cx);
+        let seen = cx.update(|window, cx| count_selection_changes(&editor, window, cx));
+        cx.update(|_window, cx| editor.update(cx, |state, cx| state.set_selected_range(5..5, cx)));
+        cx.run_until_parked();
+        assert_eq!(seen.get(), 1);
+        cx.update(|window, cx| {
+            editor.update(cx, |state, cx| {
+                // "é" to "ab": the caret stays at byte 5, col 1 -> 2.
+                state.replace_text_in_ranges(&[(3..5, "ab".into())], window, cx);
+                state.reported_selections_generation = state.selections.mark_seen();
+            })
+        });
+        cx.run_until_parked();
+        assert_eq!(editor.read_with(&cx, |state, _| state.selected_range()), 5..5);
+        assert_eq!(seen.get(), 2, "the caret's column moved");
+    }
+
+    // HERDR: IME composition replacing marked "é" with "ab" keeps the
+    // caret's byte offset and moves its UTF-16 column: reported.
+    #[gpui::test]
+    fn an_ime_composition_that_moves_a_column_is_reported(cx: &mut TestAppContext) {
+        use gpui::EntityInputHandler as _;
+        let (editor, window) = decoration_editor(cx, "aa\nx", false);
+        let mut cx = VisualTestContext::from_window(window.into(), cx);
+        let seen = cx.update(|window, cx| count_selection_changes(&editor, window, cx));
+        cx.update(|window, cx| {
+            editor.update(cx, |state, cx| {
+                state.set_selected_range(3..3, cx);
+                state.replace_and_mark_text_in_range(None, "é", None, window, cx);
+            })
+        });
+        cx.run_until_parked();
+        assert_eq!(editor.read_with(&cx, |state, _| state.selected_range()), 5..5);
+        let before = seen.get();
+        cx.update(|window, cx| {
+            editor.update(cx, |state, cx| state.replace_and_mark_text_in_range(None, "ab", None, window, cx))
+        });
+        cx.run_until_parked();
+        assert_eq!(editor.read_with(&cx, |state, _| state.selected_range()), 5..5);
+        assert_eq!(seen.get(), before + 1, "the caret's column moved");
     }
 
     // HERDR: a row asked for before layout, right after the text is set,

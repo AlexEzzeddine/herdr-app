@@ -242,38 +242,62 @@ impl Selections {
         }
 
         self.generation += 1;
-        let active_id = self.active().id;
-
-        self.selections.sort_by_key(|s| s.start);
-
-        let mut merged: Vec<CursorSelection> = Vec::with_capacity(self.selections.len());
-        for selection in &self.selections {
-            if let Some(last) = merged.last_mut() {
-                if selection.start <= last.end {
-                    // Overlapping or adjacent, extend the last one.
-                    let did_merge = selection.start != last.start || selection.end != last.end;
-                    last.end = last.end.max(selection.end);
-                    if selection.id == active_id {
-                        last.id = active_id;
-                        last.reversed = selection.reversed;
-                    }
-                    // Reset the column anchor on a real merge.
-                    if did_merge {
-                        last.column_anchor = None;
-                    }
-                    continue;
-                }
-            }
-            merged.push(*selection);
-        }
-
-        // Re-front the active selection so it stays at index 0.
-        if let Some(pos) = merged.iter().position(|s| s.id == active_id) {
-            merged.swap(0, pos);
-        }
-
-        self.selections = merged;
+        self.selections = merged(std::mem::take(&mut self.selections));
     }
+}
+
+/// HERDR: `selections` (the active one first) merged as
+/// [`Selections::merge_overlapping`] does: sorted by start, overlapping or
+/// adjacent ones folded together, the active one carried onto the result
+/// it was folded into and put first again. A function of the list alone
+/// (the active one is found by position, not id), so a caller can merge
+/// selections it hasn't installed yet: `set_selections` compares the result
+/// with the current selections before giving them ids.
+pub(super) fn merged(mut selections: Vec<CursorSelection>) -> Vec<CursorSelection> {
+    if selections.len() <= 1 {
+        return selections;
+    }
+    let active = selections[0];
+    // Stable, so selections with equal starts keep their order.
+    selections.sort_by_key(|s| s.start);
+
+    let mut merged: Vec<CursorSelection> = Vec::with_capacity(selections.len());
+    let mut active_at = None;
+    let mut active_seen = false;
+    for selection in selections {
+        // The first selection equal to the active one is it: the sort is
+        // stable and it came first.
+        let is_active = !active_seen && selection == active;
+        active_seen |= is_active;
+        let last_at = merged.len().wrapping_sub(1);
+        if let Some(last) = merged.last_mut() {
+            if selection.start <= last.end {
+                // Overlapping or adjacent, extend the last one.
+                let did_merge = selection.start != last.start || selection.end != last.end;
+                last.end = last.end.max(selection.end);
+                if is_active {
+                    last.id = selection.id;
+                    last.reversed = selection.reversed;
+                    active_at = Some(last_at);
+                }
+                // Reset the column anchor on a real merge.
+                if did_merge {
+                    last.column_anchor = None;
+                }
+                continue;
+            }
+        }
+        if is_active {
+            active_at = Some(merged.len());
+        }
+        merged.push(selection);
+    }
+
+    // Re-front the active selection so it stays at index 0.
+    if let Some(pos) = active_at {
+        merged.swap(0, pos);
+    }
+    merged
 }
 
 impl Default for Selections {
@@ -287,6 +311,21 @@ mod tests {
     use super::*;
     use crate::input::Position;
     use gpui::px;
+
+    // HERDR: `merged` finds the active selection by position, so it
+    // merges selections that share an id (`set_selections` gives ids only
+    // after merging), carrying the active one onto what it was folded into.
+    #[test]
+    fn merged_carries_the_active_selection_without_distinct_ids() {
+        let id = CursorId::new(0);
+        let mut active = CursorSelection::new(id, 5, 10);
+        active.reversed = true;
+        let result = merged(vec![active, CursorSelection::new(id, 0, 5), CursorSelection::new(id, 20, 20)]);
+        assert_eq!(result.iter().map(|s| (s.start, s.end)).collect::<Vec<_>>(), vec![(0, 10), (20, 20)]);
+        assert!(result[0].reversed, "the active selection's side is kept");
+        let result = merged(vec![CursorSelection::new(id, 20, 20), CursorSelection::new(id, 0, 5)]);
+        assert_eq!((result[0].start, result[0].end), (20, 20), "the active one stays first");
+    }
 
     #[test]
     fn selection_keeps_its_public_range_api() {

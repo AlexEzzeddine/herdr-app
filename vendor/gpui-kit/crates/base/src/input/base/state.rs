@@ -807,7 +807,7 @@ pub struct InputBaseState<M: InputModeKind> {
     /// [`Selections::generation`] when `selection_report` was last
     /// checked: an unchanged generation skips the comparison (cursor blinks
     /// notify without touching the selections).
-    reported_selections_generation: u64,
+    pub(super) reported_selections_generation: u64,
     /// HERDR: whether [`InputEvent::SelectionChange`] is reported
     /// ([`Self::report_selection_changes`]). Off until an owner asks, so
     /// editors nobody listens to don't compare selections on every change.
@@ -3796,16 +3796,23 @@ impl<M: InputModeKind> InputBaseState<M> {
         if built.is_empty() || self.selections_equal(&mut built) {
             return;
         }
-        for sel in built.iter_mut().skip(1) {
+        // Merged as installing them would, so input that merges into the
+        // current selections (`[0..5, 5..10]` for `0..10`) changes nothing
+        // either.
+        let mut merged = super::cursor::merged(built);
+        if self.selections_equal(&mut merged) {
+            return;
+        }
+        for sel in merged.iter_mut().skip(1) {
             sel.id = self.selections.generate_id();
         }
 
         self.begin_programmatic_selection(cx);
         // The active caret moves, so its line-end affinity no longer applies.
         self.cursor_line_end_affinity = false;
-        self.selections.replace_all(built);
-        // Merging may widen the active selection, so read its caret after.
-        self.selections.merge_overlapping();
+        // Merging may have widened the active selection: its caret is read
+        // from the merged one.
+        self.selections.replace_all(merged);
         let id = self.selections.active().id;
         self.reveal_caret(id, focused, true, cx);
         cx.notify();
@@ -3815,13 +3822,14 @@ impl<M: InputModeKind> InputBaseState<M> {
     /// the selections already are, in [`Self::selections`] order: then
     /// setting them changes nothing, and a handler that re-applies the
     /// selections it read doesn't close menus, clear the inline completion,
-    /// break undo coalescing or scroll. The current selections are already
-    /// merged, so equal ones need no merging either. A caret's side is
+    /// break undo coalescing or scroll. [`Self::set_selections`] asks twice:
+    /// for the input as given (the current selections may be unmerged, e.g.
+    /// a caret added at a selection's start) and merged. A caret's side is
     /// ignored (it has none scripts can see).
     ///
-    /// Sorts `built` after the active selection, as merging would, and
-    /// reads the current selections into the reused `selection_scratch`,
-    /// so a check that finds nothing changed allocates nothing.
+    /// Sorts `built` after the active selection and reads the current
+    /// selections into the reused `selection_scratch`, so it allocates
+    /// nothing.
     fn selections_equal(&mut self, built: &mut [CursorSelection]) -> bool {
         let key = |start: usize, end: usize, reversed: bool| (start, end, reversed && start != end);
         if let Some(rest) = built.get_mut(1..) {
@@ -3910,10 +3918,11 @@ impl<M: InputModeKind> InputBaseState<M> {
     }
 
     /// Scroll so buffer `row` (0-based, clamped to the document) is in view.
-    /// Only the vertical scroll changes.
+    /// Only the vertical scroll changes, including from an offset queued
+    /// earlier in the same handler.
     ///
     /// Before a usable layout (none yet, or one with no height) the request
-    /// is kept and applied once there is one. Reads focus from `window`:
+    /// replaces any queued scroll, is kept and applied once there is one. Reads focus from `window`:
     /// ghost lines, drawn only while focused, move the rows below them.
     /// A later `set_value` drops it: the new text starts at the top, so
     /// scroll after setting the text.
@@ -3959,13 +3968,17 @@ impl<M: InputModeKind> InputBaseState<M> {
             return;
         };
         scroll_offset.y = y;
-        // Only the vertical part changes. A caret reveal queued earlier keeps
-        // its horizontal step, done by paint only if that frame lays out the
-        // caret's line. Its column measured at the old view is not kept: with
-        // the caret scrolled out of view it would shift the rows shown
-        // sideways.
-        scroll_offset.x = self.scroll_handle.offset().x;
+        // Only the vertical part changes: the x is the one queued earlier in
+        // this handler (`set_scroll_offset`, an upstream reveal), or the
+        // current one. A caret reveal queued earlier is the exception: it
+        // keeps its horizontal step, done by paint only if that frame lays
+        // out the caret's line, but not its column measured at the old view,
+        // which with the caret scrolled out of view would shift the rows
+        // shown sideways.
         let reveal_x = self.queued_scroll.and_then(|queued| queued.reveal_x());
+        if reveal_x.is_some() {
+            scroll_offset.x = self.scroll_handle.offset().x;
+        }
         self.queued_scroll = Some(QueuedScroll::Offset {
             offset: scroll_offset,
             reveal_x,
@@ -4315,6 +4328,12 @@ impl<M: InputModeKind> InputBaseState<M> {
     /// owner that listens for it, once is enough: until then no selection
     /// change is compared, so an editor nobody listens to pays nothing. The
     /// selections at this point are the baseline, not a change.
+    ///
+    /// Reports stay on for the editor's life: there is no off switch, since
+    /// a listener is expected to live as long as the editor. Scripts have no
+    /// way to unsubscribe; their subscriptions are dropped with the editor's
+    /// record, and the editor with them. A Rust owner that stops listening
+    /// keeps paying one compare per notify and per edit.
     pub fn report_selection_changes(&mut self, cx: &mut Context<Self>) {
         if !M::CODE_EDITOR || self.reports_selection_changes {
             return;
@@ -4381,11 +4400,13 @@ impl<M: InputModeKind> InputBaseState<M> {
     /// check that finds no selection touched (a cursor blink, a hover, a
     /// click rewriting the active selection with its own value) returns
     /// after one integer compare. A bump that wrote nothing new costs one
-    /// compare of byte ranges ([`Self::take_selection_report`]). Every edit
-    /// path rewrites the selections through one of those methods
-    /// (`replace_all`, `remove_all_but_active`), so an edit that moves what
-    /// scripts read without moving a byte offset (a column in UTF-16 units)
-    /// is still compared.
+    /// compare of byte ranges ([`Self::take_selection_report`]). An edit
+    /// since the report always compares, touched selections or not: it can
+    /// move what scripts read without moving a byte offset (a column in
+    /// UTF-16 units), and not every edit path rewrites the selections with a
+    /// new value (IME composition sets the caret it already had). Every
+    /// edit goes through `push_history`, which lowers the report's
+    /// `edit_floor`.
     /// A notify sent before the change in the same update is fine: gpui
     /// runs this after the update.
     ///
@@ -4400,7 +4421,8 @@ impl<M: InputModeKind> InputBaseState<M> {
     /// both stand for one reported entry.
     pub(super) fn report_selection_change(&mut self, cx: &mut Context<Self>) {
         if !self.reports_selection_changes
-            || self.selections.generation() == self.reported_selections_generation
+            || (self.selections.generation() == self.reported_selections_generation
+                && self.selection_report.edit_floor == usize::MAX)
         {
             return;
         }
@@ -8996,6 +9018,31 @@ mod tests {
             let number = |id| format!("{id:?}").trim_matches(|c: char| !c.is_ascii_digit()).parse::<usize>().unwrap();
             assert_eq!(number(after), number(before) + 1, "no ids used");
             state.set_selections(vec![caret(4), caret(1)], window, cx);
+            assert_eq!(state.selections().len(), 2, "a different set still applies");
+        });
+    }
+
+    /// HERDR: input that merges into the current selections changes
+    /// nothing either: `[0..2, 2..5]` merges into `0..5`, and setting it
+    /// again neither uses ids nor queues a scroll.
+    #[gpui::test]
+    fn setting_selections_that_merge_into_the_current_ones_changes_nothing(cx: &mut TestAppContext) {
+        let input_view = InputView::build_textarea(cx, |state| state.default_value("ab\ncd\nef"));
+        let mut cx = VisualTestContext::from_window(input_view.window_handle.into(), cx);
+        input_view.input.update_in(&mut cx, |state, window, cx| {
+            let range = |r: Range<usize>| SelectionRange { range: r, reversed: false };
+            state.set_selections(vec![range(0..2), range(2..5)], window, cx);
+            assert_eq!(state.selections(), vec![range(0..5)], "merged");
+            let generation = state.selections.mark_seen();
+            state.queued_scroll = None;
+            let before = state.selections.generate_id();
+            state.set_selections(vec![range(0..2), range(2..5)], window, cx);
+            let after = state.selections.generate_id();
+            let number = |id| format!("{id:?}").trim_matches(|c: char| !c.is_ascii_digit()).parse::<usize>().unwrap();
+            assert_eq!(number(after), number(before) + 1, "no ids used");
+            assert_eq!(state.selections.generation(), generation, "selections untouched");
+            assert_eq!(state.queued_scroll, None, "nothing to reveal");
+            state.set_selections(vec![range(0..2), range(3..5)], window, cx);
             assert_eq!(state.selections().len(), 2, "a different set still applies");
         });
     }
