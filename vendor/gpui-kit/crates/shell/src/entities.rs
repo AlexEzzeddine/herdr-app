@@ -824,11 +824,16 @@ impl EntityStore {
                 subscribe_to_events(&state.clone(), event, window, cx, handler)
             }
             // HERDR: code editors emit the same input events. Selection
-            // changes are compared only once someone listens for them.
+            // changes and scrolls are reported only once someone listens for
+            // them.
             Some(Record::Editor { state, .. }) => {
                 let state = state.clone();
-                if event == InputEventName::SelectionChange {
-                    state.update(cx, |state, cx| state.report_selection_changes(cx));
+                match event {
+                    InputEventName::SelectionChange => {
+                        state.update(cx, |state, cx| state.report_selection_changes(cx))
+                    }
+                    InputEventName::Scroll => state.update(cx, |state, _| state.report_scrolls()),
+                    _ => {}
                 }
                 subscribe_to_events(&state, event, window, cx, handler)
             }

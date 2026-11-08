@@ -2046,7 +2046,7 @@ struct EditorPosition {
     col: usize,
 }
 
-/// A row or column in script input: [`editor_row`]'s rule, so a row too
+/// A row or column in script input: [`script_row`], as [`editor_row`], so a row too
 /// large for `usize` means past the end everywhere (clamped or clipped by
 /// whoever uses it) rather than an error in some calls only. JSON gives a
 /// number past `u64` (`1e20`) as a float, which serde's `usize` refuses.
@@ -2066,10 +2066,8 @@ fn script_index<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<usi
                 .and_then(|value| self.visit_u64(value))
         }
         fn visit_f64<E: serde::de::Error>(self, value: f64) -> Result<usize, E> {
-            if !value.is_finite() || value < 0. || value.fract() != 0. {
-                return Err(E::invalid_value(serde::de::Unexpected::Float(value), &self));
-            }
-            Ok(value as usize)
+            script_row(value)
+                .ok_or_else(|| E::invalid_value(serde::de::Unexpected::Float(value), &self))
         }
     }
     deserializer.deserialize_any(Index)
@@ -2134,10 +2132,15 @@ fn editor_selection(
 }
 
 fn editor_row(ctx: &Ctx<'_>, row: f64) -> JsResult<usize> {
-    if !row.is_finite() || row < 0. || row.fract() != 0. {
-        return Err(Exception::throw_range(ctx, "row must be a non-negative integer"));
-    }
-    Ok(row as usize)
+    script_row(row)
+        .ok_or_else(|| Exception::throw_range(ctx, "row must be a non-negative integer"))
+}
+
+/// The one rule for a row or column number from a script, shared by
+/// [`editor_row`] and [`script_index`]: a finite non-negative integer, one
+/// past `usize` saturated (`as` does), so it means past the end.
+fn script_row(value: f64) -> Option<usize> {
+    (value.is_finite() && value >= 0. && value.fract() == 0.).then_some(value as usize)
 }
 
 /// `{ row, col }` of a byte offset, `col` in UTF-16 code units: the same

@@ -186,9 +186,16 @@ pub(in crate::input) enum PendingScroll {
 /// rewraps the rows above) places it again, so the row the
 /// request was about stays where it asked, until the reader takes over the
 /// view: another scroll (asked for, or the scroll handle moving), a press in
-/// the editor, changing the selections (keys, `set_selections`), an edit, or
-/// `set_value` ([`InputBaseState::resolve_pending_scroll`]).
-#[derive(Clone, Copy, Debug, PartialEq)]
+/// the editor, changing the selections (keys, `set_selections`), folding or
+/// unfolding (by any path, the chevron included), an edit, or `set_value`
+/// ([`InputBaseState::resolve_pending_scroll`]).
+///
+/// Changes to the view are compared as state in that one place (the scroll,
+/// the selections, the folds, the text), so a new path that changes them
+/// needs nothing. Only events that leave no state behind clear it where
+/// they happen: a press, a scroll request that finds its row in view, and
+/// `set_value`/`replace_all` (`reset_scroll_to_start`).
+#[derive(Clone, Debug, PartialEq)]
 struct SettlingScroll {
     /// The row or caret asked for.
     request: PendingScroll,
@@ -200,6 +207,14 @@ struct SettlingScroll {
     /// placed: selections changed since without a scroll (select all
     /// reveals nothing) mean the reader has the view.
     selections: super::cursor::SelectionsStamp,
+    /// The folded ranges when it was placed: a fold changes where rows are
+    /// drawn without scrolling, selecting or editing, so it is compared as
+    /// state rather than cleared by each path that folds (the chevron stops
+    /// the press before [`InputBaseState::on_mouse_down`]). A few ranges at
+    /// most.
+    folds: Vec<crate::input::FoldRange>,
+    /// `document_revision` when it was placed: any edit since moves rows.
+    revision: u64,
 }
 
 /// HERDR: a position the frame applying a queued offset reveals
@@ -431,6 +446,7 @@ pub enum InputEvent {
     SelectionChange,
     /// The view scrolled (by the user, by code, or to follow the caret).
     /// Emitted after the frame that applied it, so layout reads are current.
+    /// Code editors only, once [`InputBaseState::report_scrolls`] is called.
     Scroll,
     /// A left or right press in the line-number gutter. A left press on a
     /// fold chevron folds instead and isn't reported; the chevron ignores a
@@ -890,6 +906,12 @@ pub struct InputBaseState<M: InputModeKind> {
     /// ([`Self::report_selection_changes`]). Off until an owner asks, so
     /// editors nobody listens to don't compare selections on every change.
     reports_selection_changes: bool,
+    /// HERDR: whether [`InputEvent::Scroll`] is reported
+    /// ([`Self::report_scrolls`]). Off until an owner asks, so a paint that
+    /// scrolls an editor nobody listens to emits nothing (a subscriber that
+    /// notifies on every event would otherwise re-render once per frame of
+    /// a smooth scroll).
+    pub(crate) reports_scrolls: bool,
 
     pub(super) auto_scroll: AutoScroll,
 }
@@ -1229,6 +1251,7 @@ impl<M: InputModeKind> InputBaseState<M> {
             selection_scratch: Vec::new(),
             reported_selections: Selections::default().stamp(),
             reports_selection_changes: false,
+            reports_scrolls: false,
             _pending_update: false,
             cursor_line_end_affinity: false,
             auto_scroll: AutoScroll::default(),
@@ -2800,15 +2823,16 @@ impl<M: InputModeKind> InputBaseState<M> {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // HERDR: the reader has the view now: an early scroll is no longer
+        // placed again on a resize. Before the token check: a press a token
+        // consumed is still the reader's.
+        self.settling_scroll = None;
         // A token that consumed the press (a double click selecting it) must
         // not also place the caret.
         if window.default_prevented() {
             return;
         }
         self.undo_manager.break_transaction_coalescing();
-        // HERDR: the reader has the view now: an early scroll is no longer
-        // placed again on a resize.
-        self.settling_scroll = None;
         // Input has its own text selection; suppress the window-level text
         // selection (Root) so it does not start a drag from here.
         crate::global_state::GlobalState::suppress_text_selection(cx);
@@ -3508,9 +3532,8 @@ impl<M: InputModeKind> InputBaseState<M> {
         selection_before: CursorSelection,
         selection_after: Option<CursorSelection>,
     ) -> bool {
+        // HERDR: also ends placing an early scroll again ([`SettlingScroll`]).
         self.document_revision = self.document_revision.wrapping_add(1);
-        // HERDR: an edit ends placing an early scroll again ([`SettlingScroll`]).
-        self.settling_scroll = None;
         // HERDR: `range` is in the text before this edit, whose bytes before
         // `range.start` it leaves alone.
         self.selection_report.record_edit(text, range.start);
@@ -3838,7 +3861,9 @@ impl<M: InputModeKind> InputBaseState<M> {
         // above or below doesn't merge) are ordered by end, so the order
         // doesn't depend on how the selections were added. Selections are
         // usually kept in document order already: check before sorting.
-        let key = |sel: &SelectionRange| (sel.range.start, sel.range.end, sel.reversed);
+        // The same key `sort_after_active` sorts by and `selections_equal`
+        // compares with.
+        let key = |sel: &SelectionRange| selection_key_of(sel.range.start, sel.range.end, sel.reversed);
         if let Some(rest) = out.get_mut(1..)
             && !rest.is_sorted_by_key(key)
         {
@@ -3891,9 +3916,7 @@ impl<M: InputModeKind> InputBaseState<M> {
             .into_iter()
             .map(|selection| {
                 let (start, end) = self.clip_selection_range(selection.range);
-                let mut sel = CursorSelection::new(active_id, start, end);
-                sel.reversed = selection.reversed && start != end;
-                sel
+                Self::code_selection(active_id, start, end, selection.reversed)
             })
             .collect();
         if built.is_empty() {
@@ -3924,7 +3947,7 @@ impl<M: InputModeKind> InputBaseState<M> {
             if i > 0 {
                 sel.id = self.selections.generate_id();
             }
-            sel.column_anchor = self.preferred_column_for(sel.cursor_offset());
+            self.anchor_column(sel);
         }
 
         self.begin_programmatic_selection(cx);
@@ -3951,7 +3974,9 @@ impl<M: InputModeKind> InputBaseState<M> {
     }
 
     /// A selection over clipped `start..end`, with its caret side and the
-    /// column vertical moves keep.
+    /// column vertical moves keep: [`Self::code_selection`], then
+    /// [`Self::anchor_column`]. [`Self::set_selections`] runs the two steps
+    /// apart, looking up the column only for selections it installs.
     fn build_selection(
         &self,
         id: super::selection::CursorId,
@@ -3959,10 +3984,28 @@ impl<M: InputModeKind> InputBaseState<M> {
         end: usize,
         reversed: bool,
     ) -> CursorSelection {
+        let mut sel = Self::code_selection(id, start, end, reversed);
+        self.anchor_column(&mut sel);
+        sel
+    }
+
+    /// A selection set by code over clipped `start..end`: a caret has no
+    /// side, so `reversed` applies only to a range.
+    fn code_selection(
+        id: super::selection::CursorId,
+        start: usize,
+        end: usize,
+        reversed: bool,
+    ) -> CursorSelection {
         let mut sel = CursorSelection::new(id, start, end);
         sel.reversed = reversed && start != end;
-        sel.column_anchor = self.preferred_column_for(sel.cursor_offset());
         sel
+    }
+
+    /// Set the column vertical moves keep for a selection set by code: its
+    /// caret's column (a layout lookup).
+    fn anchor_column(&self, sel: &mut CursorSelection) {
+        sel.column_anchor = self.preferred_column_for(sel.cursor_offset());
     }
 
     /// What every selection set by code does first: end typing coalescing
@@ -4195,15 +4238,17 @@ impl<M: InputModeKind> InputBaseState<M> {
         if self.is_single_line() || view_height <= px(0.) {
             return None;
         }
-        if let Some(settling) = self.settling_scroll
+        if let Some(settling) = &self.settling_scroll
             && let Some(painted) = settling.painted
         {
             if self.queued_scroll.is_some()
                 || self.scroll_handle.offset() != painted
                 || self.selections.stamp() != settling.selections
+                || self.display_map.folded_ranges() != settling.folds.as_slice()
+                || self.document_revision != settling.revision
             {
-                // Something else scrolled, or a caret moved, since: it no
-                // longer applies.
+                // Something else scrolled, a caret moved, or the rows were
+                // folded or edited since: it no longer applies.
                 self.settling_scroll = None;
             } else if settling.view_size != view_size {
                 self.queued_scroll = Some(QueuedScroll::Pending(settling.request));
@@ -4215,6 +4260,8 @@ impl<M: InputModeKind> InputBaseState<M> {
             view_size,
             painted: None,
             selections: self.selections.stamp(),
+            folds: self.display_map.folded_ranges().to_vec(),
+            revision: self.document_revision,
         });
         self.queued_scroll = self.placed_offset(request, line_height, view_height, focused);
         Some(request)
@@ -4498,6 +4545,18 @@ impl<M: InputModeKind> InputBaseState<M> {
         // Every selection mutation notifies; compare once here rather than
         // emitting from each of them.
         self._subscriptions.push(cx.observe_self(Self::report_selection_change));
+    }
+
+    /// HERDR: start reporting [`InputEvent::Scroll`] (code editors only), as
+    /// [`Self::report_selection_changes`] does for selections: called by an
+    /// owner that listens for it, once is enough. The current scroll is the
+    /// baseline, not a change. Stays on for the editor's life.
+    pub fn report_scrolls(&mut self) {
+        if !M::CODE_EDITOR || self.reports_scrolls {
+            return;
+        }
+        self.reports_scrolls = true;
+        self.reported_scroll = self.scroll_handle.offset();
     }
 
     /// Record the current selections as reported; returns whether scripts
@@ -9310,6 +9369,7 @@ mod tests {
         input.update_in(&mut cx, |state, window, cx| {
             // Asking for reports is a no-op outside code editors.
             state.report_selection_changes(cx);
+            state.report_scrolls();
             state.set_selected_range(2..4, cx);
             state.scroll_to_row(40, RowScrollAlign::Top, window, cx);
         });
