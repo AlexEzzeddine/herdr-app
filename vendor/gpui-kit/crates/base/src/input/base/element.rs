@@ -4058,6 +4058,89 @@ mod tests {
         assert_caret_on_row_50_shows(&editor, &mut cx);
     }
 
+    // HERDR: a row scroll after a caret reveal measured in view, to a row
+    // where the caret isn't, doesn't scroll sideways: the column measured
+    // for the caret isn't kept once its line is scrolled out of view.
+    #[gpui::test]
+    fn a_row_scroll_away_from_a_revealed_caret_does_not_scroll_sideways(cx: &mut TestAppContext) {
+        let (text, target) = text_with_a_far_column();
+        let (editor, window) = decoration_editor(cx, &text, false);
+        let mut cx = VisualTestContext::from_window(window.into(), cx);
+        cx.update(|window, cx| {
+            window.draw(cx).clear(cx);
+            editor.update(cx, |state, _| {
+                let line_height = state.last_layout.as_ref().unwrap().line_height;
+                // Row 50 is laid out, so the reveal below measures its column.
+                state.scroll_handle.set_offset(point(px(0.), -(line_height * 46.)));
+            });
+            window.draw(cx).clear(cx);
+            editor.update(cx, |state, cx| {
+                state.set_selections(vec![sel(target..target, false)], window, cx);
+                assert!(
+                    state.deferred_scroll_offset().unwrap().x < px(0.),
+                    "the caret's column was measured"
+                );
+                state.scroll_to_row(5, crate::input::RowScrollAlign::Top, window, cx);
+            });
+            window.draw(cx).clear(cx);
+        });
+        editor.update_in(&mut cx, |state, window, _| {
+            assert_eq!(state.scroll_handle.offset().x, px(0.), "no sideways scroll");
+            let (top, _) = state.row_bounds(5, window).unwrap();
+            assert_eq!(top, px(0.), "row 5 is at the top");
+        });
+    }
+
+    // HERDR: an upstream reveal (here `set_selected_range`) while the view
+    // has no height yet keeps a row scroll waiting for a usable layout: the
+    // view opens on that row once it is sized. The editor's padding keeps
+    // a test harness from laying it out at 0px, so the last frame's height
+    // is set to 0 by hand (an editor styled without padding in a collapsed
+    // pane gets there for real).
+    #[gpui::test]
+    fn an_upstream_reveal_in_a_view_with_no_height_keeps_a_waiting_row_scroll(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(crate::init);
+        let height = Rc::new(std::cell::Cell::new(px(0.)));
+        let mut editor = None;
+        let window = cx.open_window(size(px(240.), px(140.)), {
+            let height = height.clone();
+            |window, cx| {
+                let state = cx.new(|cx| {
+                    EditorState::new(window, cx).soft_wrap(false).default_value(sixty_lines("line"))
+                });
+                editor = Some(state.clone());
+                SizedHarness(state, height)
+            }
+        });
+        let editor = editor.unwrap();
+        let mut cx = VisualTestContext::from_window(window.into(), cx);
+        cx.update(|window, cx| {
+            window.draw(cx).clear(cx);
+            editor.update(cx, |state, cx| {
+                assert!(state.last_layout.is_some(), "laid out");
+                state.last_bounds.as_mut().unwrap().size.height = px(0.);
+                state.scroll_to_row(40, crate::input::RowScrollAlign::Center, window, cx);
+                state.set_selected_range(3..3, cx);
+                assert!(
+                    state.queued_scroll.is_some() && state.deferred_scroll_offset().is_none(),
+                    "the row scroll still waits, with no offset yet"
+                );
+            });
+        });
+        height.set(px(140.));
+        cx.update(|window, cx| {
+            window.refresh();
+            window.draw(cx).clear(cx);
+        });
+        editor.update_in(&mut cx, |state, window, _| {
+            let view = state.last_bounds.unwrap().size.height;
+            let (top, height) = state.row_bounds(40, window).expect("row 40");
+            assert_eq!(top, (view - height) / 2., "row 40 is centered");
+        });
+    }
+
     /// HERDR: an editor that isn't drawn (a pane not shown).
     struct HiddenHarness(#[allow(dead_code)] Entity<EditorState>);
 

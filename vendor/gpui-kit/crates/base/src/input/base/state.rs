@@ -3002,6 +3002,13 @@ impl<M: InputModeKind> InputBaseState<M> {
         if self.last_layout.is_none() || self.last_bounds.is_none() {
             return;
         }
+        // In a view with no height yet (a pane being sized), a waiting row or
+        // caret scroll stays too: an offset measured against no height would
+        // replace it with nothing meaningful. With nothing waiting, this
+        // still queues as upstream does.
+        if !self.has_usable_layout() && self.queued_scroll.is_some_and(|queued| queued.is_pending()) {
+            return;
+        }
         // The newest scroll request wins over one kept for after layout.
         self.drop_pending_scroll();
         let (Some(last_layout), Some(bounds)) = (self.last_layout.as_ref(), self.last_bounds.as_ref())
@@ -3952,8 +3959,12 @@ impl<M: InputModeKind> InputBaseState<M> {
             return;
         };
         scroll_offset.y = y;
-        // Only the vertical part changes: a caret reveal queued earlier
-        // keeps its horizontal step, done if that frame lays out its line.
+        // Only the vertical part changes. A caret reveal queued earlier keeps
+        // its horizontal step, done by paint only if that frame lays out the
+        // caret's line. Its column measured at the old view is not kept: with
+        // the caret scrolled out of view it would shift the rows shown
+        // sideways.
+        scroll_offset.x = self.scroll_handle.offset().x;
         let reveal_x = self.queued_scroll.and_then(|queued| queued.reveal_x());
         self.queued_scroll = Some(QueuedScroll::Offset {
             offset: scroll_offset,

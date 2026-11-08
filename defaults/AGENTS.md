@@ -940,9 +940,10 @@ multiple selections (`selections()`, `set_selections([{ start: { row, col },
 end }])`, `add_selection(range)`; 0-based, `col` in JS string units), scroll
 and measure (`scroll_to_row(row, "center")`, `scroll_position()`,
 `row_bounds(row)`) and report `on("selection_change")` and `on("scroll")`.
-`set_value` is silent and drops earlier scrolls: set the text, then
-`scroll_to_row`. `set_line_decorations(key, [{ row, background?, gutter? }])`
-colors rows and the gutter (a diff); rows don't follow edits, so re-set them
+`set_value` is silent and drops scrolls the script asked for earlier: set
+the text, then `scroll_to_row`. `set_line_decorations(key, [{ row, end_row?,
+background?, gutter? }])` colors rows (`end_row` inclusive, for a range) and
+the gutter (a diff); rows don't follow edits, so re-set them
 on `change`. `on("gutter_click", ({ row, click_count }) => …)` reports presses
 on a line number; toggle only on `click_count === 1`.
 `show_unfocused_selection: true` keeps selections painted while another
