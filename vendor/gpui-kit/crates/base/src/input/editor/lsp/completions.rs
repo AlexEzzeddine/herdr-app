@@ -399,17 +399,9 @@ impl InputBaseState<EditorMode> {
 
             let response = task.await?;
 
-            editor.update_in(cx, |editor, window, cx| {
+            editor.update_in(cx, |editor, _window, cx| {
                 // Only apply if cursor still hasn't moved
                 if editor.cursor() != offset {
-                    return;
-                }
-
-                // HERDR: blur clears the completion, and only a focused
-                // editor draws one; one arriving after blur would count as
-                // ghost lines in `scroll_to_row` and `row_bounds` but not be
-                // drawn.
-                if !editor.focus_handle.is_focused(window) {
                     return;
                 }
 

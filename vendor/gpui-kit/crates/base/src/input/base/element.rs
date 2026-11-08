@@ -2659,6 +2659,12 @@ impl<M: InputModeKind> Element for TextElement<M> {
         }
 
         let line_height = window.line_height();
+        // HERDR: a row or caret scroll asked for before the first layout
+        // becomes an offset now that rows are wrapped and the line height is
+        // known, so this frame is laid out and drawn there.
+        self.state.update(cx, |state, _| {
+            state.resolve_scroll_before_layout(line_height, bounds.size.height);
+        });
         let token_elements = self.measure_tokens(
             (bounds.size.width - line_number_width - RIGHT_MARGIN).max(px(1.)),
             line_height,
@@ -3436,7 +3442,7 @@ impl<M: InputModeKind> Element for TextElement<M> {
             state.set_input_bounds(input_bounds, cx);
             state.last_selected_range = Some(selected_range);
             state.scroll_size = prepaint.scroll_size;
-            state.last_frame_wrap_rows = state.display_map.wrap_row_count();
+            state.last_frame_focused = focused;
             state.last_frame_document_revision = state.document_revision;
             state.update_scroll_offset(Some(prepaint.cursor_scroll_offset), cx);
             state.apply_queued_scroll(cx);
@@ -4073,6 +4079,15 @@ mod tests {
         });
     }
 
+    /// HERDR: focus the editor and draw a frame: only a focused editor
+    /// draws inline completions, so only then are ghost lines measured.
+    fn focus_and_draw(editor: &Entity<EditorState>, cx: &mut VisualTestContext) {
+        cx.update(|window, cx| {
+            editor.update(cx, |state, cx| state.focus(window, cx));
+            window.draw(cx).clear(cx);
+        });
+    }
+
     // HERDR: text loaded and scrolled to in one handler is reachable, though
     // the last frame laid out a shorter text.
     #[gpui::test]
@@ -4299,6 +4314,7 @@ mod tests {
             (state.input_bounds.origin.x + px(2.), state.input_bounds.origin.y, layout.line_height)
         });
         let ghost = line_height * 2.;
+        focus_and_draw(&editor, &mut cx);
         cx.update(|_, cx| editor.update(cx, |state, cx| show_inline_completion(state, 1, 2, cx)));
         editor.read_with(&cx, |state, _| {
             let at = |row_y: Pixels| state.gutter_row_at(point(gutter, top + row_y));
@@ -4553,7 +4569,7 @@ mod tests {
     fn scroll_to_row_counts_ghost_lines_above_the_row(cx: &mut TestAppContext) {
         let (editor, window) = decoration_editor(cx, &sixty_lines("line"), false);
         let mut cx = VisualTestContext::from_window(window.into(), cx);
-        cx.update(|window, cx| window.draw(cx).clear(cx));
+        focus_and_draw(&editor, &mut cx);
         editor.update_in(&mut cx, |state, _, cx| {
             let line_height = state.last_layout.as_ref().unwrap().line_height;
             show_inline_completion(state, 2, 3, cx);
@@ -4572,6 +4588,124 @@ mod tests {
         });
     }
 
+    // HERDR: "nearest" to a row that ghost lines push below the view
+    // scrolls until it shows, though at that scroll the caret row (and so
+    // the ghost lines) are no longer drawn.
+    #[gpui::test]
+    fn nearest_reveals_a_row_hidden_by_ghost_lines(cx: &mut TestAppContext) {
+        let (editor, window) = decoration_editor(cx, &sixty_lines("line"), false);
+        let mut cx = VisualTestContext::from_window(window.into(), cx);
+        focus_and_draw(&editor, &mut cx);
+        editor.update_in(&mut cx, |state, _, cx| {
+            let line_height = state.last_layout.as_ref().unwrap().line_height;
+            let view = state.last_bounds.unwrap().size.height;
+            let rows_in_view = (view / line_height).floor() as usize;
+            show_inline_completion(state, 0, 3, cx);
+            // Fits in the view without the ghost lines, hidden below with them.
+            let row = rows_in_view - 2;
+            let (top, height) = state.row_bounds(row).unwrap();
+            assert!(top + height > view, "hidden by the ghost lines");
+            state.scroll_to_row(row, crate::input::RowScrollAlign::Nearest, cx);
+            assert!(state.queued_scroll_offset().y < px(0.), "it scrolls");
+            let (top, height) = state.row_bounds(row).unwrap();
+            assert!(top >= px(0.) && top + height <= view, "row {row} shows: {top:?}");
+        });
+    }
+
+    // HERDR: a completion kept while the editor is unfocused isn't drawn,
+    // so its ghost lines aren't measured either.
+    #[gpui::test]
+    fn an_unfocused_completion_is_not_measured(cx: &mut TestAppContext) {
+        let (editor, mut cx) = numbered_editor(cx, "a\nb\nc\nd\ne");
+        let (gutter, top) = editor.read_with(&cx, |state, _| {
+            (state.input_bounds.origin.x + px(2.), state.input_bounds.origin.y)
+        });
+        cx.update(|_, cx| editor.update(cx, |state, cx| show_inline_completion(state, 1, 2, cx)));
+        editor.read_with(&cx, |state, _| {
+            let line_height = state.last_layout.as_ref().unwrap().line_height;
+            let (row0, _) = state.row_bounds(0).unwrap();
+            let (row2, _) = state.row_bounds(2).unwrap();
+            assert_eq!(row2 - row0, line_height * 2., "no ghost lines");
+            assert_eq!(state.gutter_row_at(point(gutter, top + line_height * 2.5)), Some(2));
+        });
+    }
+
+    // HERDR: once a selection set by code clears the completion, a scroll
+    // queued in the same handler reaches only what the next frame can, not
+    // the last frame's reach with the ghost lines.
+    #[gpui::test]
+    fn cleared_ghost_lines_no_longer_extend_the_scroll(cx: &mut TestAppContext) {
+        cx.update(crate::init);
+        let mut editor = None;
+        let window = cx.open_window(size(px(240.), px(140.)), |window, cx| {
+            let state = cx.new(|cx| {
+                EditorState::new(window, cx)
+                    .soft_wrap(false)
+                    .scroll_beyond_last_line(Some(0))
+                    .default_value(sixty_lines("line"))
+            });
+            editor = Some(state.clone());
+            DecorationHarness(state)
+        });
+        let editor = editor.unwrap();
+        let mut cx = VisualTestContext::from_window(window.into(), cx);
+        focus_and_draw(&editor, &mut cx);
+        cx.update(|window, cx| {
+            editor.update(cx, |state, cx| {
+                show_inline_completion(state, 58, 3, cx);
+                state.scroll_to_row(59, crate::input::RowScrollAlign::Top, cx);
+            });
+            window.draw(cx).clear(cx);
+        });
+        let queued = editor.update_in(&mut cx, |state, _, cx| {
+            state.set_selections(vec![sel(0..0, false)], cx);
+            state.scroll_to_row(59, crate::input::RowScrollAlign::Top, cx);
+            state.queued_scroll_offset()
+        });
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        let painted = editor.read_with(&cx, |state, _| state.scroll_handle.offset());
+        assert_eq!(painted.y, queued.y, "the next frame lands where it was reported");
+    }
+
+    // HERDR: a row or caret scroll asked for before the first layout is
+    // drawn by the first frame, not the second.
+    #[gpui::test]
+    fn scrolls_before_layout_are_drawn_by_the_first_frame(cx: &mut TestAppContext) {
+        for caret in [false, true] {
+            cx.update(crate::init);
+            let text = sixty_lines("line");
+            let target = text.find("line 40").unwrap();
+            let mut editor = None;
+            let window = cx.open_window(size(px(240.), px(140.)), |window, cx| {
+                let state = cx.new(|cx| {
+                    let mut state = EditorState::new(window, cx).soft_wrap(false).default_value(text);
+                    if caret {
+                        state.set_selections(vec![sel(target..target, false)], cx);
+                    } else {
+                        state.scroll_to_row(40, crate::input::RowScrollAlign::Top, cx);
+                    }
+                    state
+                });
+                editor = Some(state.clone());
+                DecorationHarness(state)
+            });
+            let editor = editor.unwrap();
+            // Opening the window draws the first frame: read it as drawn.
+            let cx = VisualTestContext::from_window(window.into(), cx);
+            editor.read_with(&cx, |state, _| {
+                let layout = state.last_layout.as_ref().expect("the first frame is drawn");
+                assert!(
+                    layout.visible_range.contains(&40),
+                    "caret {caret}: the first frame lays out row 40, not {:?}",
+                    layout.visible_range
+                );
+                let (top, height) = state.row_bounds(40).unwrap();
+                let view = state.last_bounds.unwrap().size.height;
+                assert!(top >= px(0.) && top + height <= view, "caret {caret}: row 40 shows");
+            });
+        }
+    }
+
     // HERDR: a completion replaced in the same handler is measured with its
     // own ghost lines, not the ones the last frame drew.
     #[gpui::test]
@@ -4579,7 +4713,10 @@ mod tests {
         let (editor, window) = decoration_editor(cx, &sixty_lines("line"), false);
         let mut cx = VisualTestContext::from_window(window.into(), cx);
         cx.update(|window, cx| {
-            editor.update(cx, |state, cx| show_inline_completion(state, 1, 1, cx));
+            editor.update(cx, |state, cx| {
+                state.focus(window, cx);
+                show_inline_completion(state, 1, 1, cx);
+            });
             window.draw(cx).clear(cx);
         });
         editor.update_in(&mut cx, |state, _, cx| {
@@ -4599,7 +4736,7 @@ mod tests {
     fn cleared_ghost_lines_are_not_counted(cx: &mut TestAppContext) {
         let (editor, window) = decoration_editor(cx, &sixty_lines("line"), false);
         let mut cx = VisualTestContext::from_window(window.into(), cx);
-        cx.update(|window, cx| window.draw(cx).clear(cx));
+        focus_and_draw(&editor, &mut cx);
         editor.update_in(&mut cx, |state, _, cx| {
             let line_height = state.last_layout.as_ref().unwrap().line_height;
             show_inline_completion(state, 2, 3, cx);
@@ -4889,7 +5026,11 @@ mod tests {
                 editor.update(cx, |state, _| {
                     state.scroll_handle.set_offset(point(px(-40.), px(0.)));
                     state.queued_scroll = deferred
-                        .map(|offset| super::super::state::QueuedScroll::Offset { offset, reveal: false });
+                        .map(|offset| super::super::state::QueuedScroll::Offset {
+                            offset,
+                            reveal: false,
+                            then_caret: None,
+                        });
                 });
                 let mut bounds = input_bounds;
                 let (carets, offset, _) =

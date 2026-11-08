@@ -520,10 +520,14 @@ pub fn install(ctx: &Ctx<'_>, module: &Object<'_>, runtime: Weak<ShellRuntime>) 
                         .into_iter()
                         .enumerate()
                         .map(|(index, selection)| {
+                            let start = editor_position(text, selection.range.start);
+                            let end = editor_position(text, selection.range.end);
+                            // The caret is one of the ends: reuse its position.
+                            let head = if selection.reversed { start.clone() } else { end.clone() };
                             serde_json::json!({
-                                "start": editor_position(text, selection.range.start),
-                                "end": editor_position(text, selection.range.end),
-                                "head": editor_position(text, selection.head()),
+                                "start": start,
+                                "end": end,
+                                "head": head,
                                 "primary": index == 0,
                             })
                         })
@@ -547,6 +551,15 @@ pub fn install(ctx: &Ctx<'_>, module: &Object<'_>, runtime: Weak<ShellRuntime>) 
                         &format!("expected {{ start: {{ row, col }}, end: {{ row, col }} }}: {error}"),
                     )
                 })?;
+                // `set_selections([])` would leave no caret; the editor keeps
+                // its selections then, which a caller clearing them wouldn't
+                // expect, so it is refused rather than silently ignored.
+                if !add && ranges.is_empty() {
+                    return Err(Exception::throw_range(
+                        &ctx,
+                        "set_selections needs at least one range (a caret is an empty range)",
+                    ));
+                }
                 scope::with_current(|_, cx| {
                     state.update(cx, |state, cx| {
                         let selections: Vec<_> = ranges
@@ -2068,14 +2081,8 @@ fn editor_position(text: &gpui_base::input::Rope, offset: usize) -> serde_json::
     serde_json::json!({ "row": row, "col": col })
 }
 
-/// Byte offset of `{ row, col }`, clamped to the document and the line.
+/// Byte offset of `{ row, col }`, clamped to the document and the line: the
+/// inverse of [`editor_position`].
 fn editor_offset(text: &gpui_base::input::Rope, position: EditorPosition) -> usize {
-    use gpui_base::input::RopeExt as _;
-    let lines = text.lines_len().max(1);
-    if position.row >= lines {
-        return text.len();
-    }
-    let line = text.slice_line(position.row);
-    let col = position.col.min(line.len_utf16());
-    text.line_start_offset(position.row) + line.utf16_to_byte_idx(col)
+    gpui_base::input::script_offset(text, position.row, position.col)
 }

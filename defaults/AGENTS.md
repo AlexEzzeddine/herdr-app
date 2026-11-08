@@ -944,7 +944,8 @@ and `on("scroll")` report changes (`set_value` is silent: it resets selections a
 scroll without either event, so re-read them after it). `set_line_decorations(key, [{ row,
 end_row?, background?, gutter? }])` colors whole rows and puts a bar in the
 gutter (a diff: re-set on `change`, rows don't follow edits; set them
-before or after `set_value`);
+before or after `set_value`; where keys overlap, the alphabetically later key
+wins, not the one set last);
 `on("gutter_click", ({ row, button, click_count, modifiers }) => …)`
 (editors only) reports a press on a line number or its decoration bar; a double-click reports two
 presses, so toggle only on `click_count === 1`. `show_unfocused_selection: true` keeps

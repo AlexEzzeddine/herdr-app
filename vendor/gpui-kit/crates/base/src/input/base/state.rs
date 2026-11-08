@@ -143,14 +143,24 @@ pub(in crate::input) enum QueuedScroll {
     /// caret (cursor-follow) rather than being a scroll asked for by code
     /// (`scroll_to_row`, `set_scroll_offset`). Replacing the text drops a
     /// reveal, which points into the old text, but keeps a code scroll.
-    Offset { offset: Point<Pixels>, reveal: bool },
-    /// [`InputBaseState::scroll_to_row`] before the first layout, applied
-    /// once there is one; the row is clamped when applied, since the text
-    /// may still change before layout.
+    ///
+    /// `then_caret`: once this offset is painted, reveal this selection's
+    /// caret horizontally as well. Set when a [`Self::Caret`] is resolved
+    /// in the first prepaint, where the line height is known but the caret's
+    /// line isn't shaped yet.
+    Offset {
+        offset: Point<Pixels>,
+        reveal: bool,
+        then_caret: Option<super::selection::CursorId>,
+    },
+    /// [`InputBaseState::scroll_to_row`] before the first layout, resolved
+    /// in the first prepaint ([`InputBaseState::resolve_scroll_before_layout`]),
+    /// so the first frame is drawn there; the row is clamped then, since the
+    /// text may still change before layout.
     Row(usize, RowScrollAlign),
     /// Reveal this selection's caret ([`InputBaseState::set_selections`]).
     /// Kept by id, not offset: selections follow edits made before layout,
-    /// so the caret is still a valid position in the text when applied.
+    /// so the caret is still a valid position in the text when resolved.
     Caret(super::selection::CursorId),
 }
 
@@ -182,6 +192,19 @@ struct SelectionReport {
 pub fn script_position(text: &Rope, offset: usize) -> (usize, usize) {
     let point = text.offset_to_point(offset);
     (point.row, text.slice_line(point.row).byte_to_utf16_idx(point.column))
+}
+
+/// HERDR: byte offset of script position `(row, col)` ([`script_position`]'s
+/// inverse), clamped to the document and the line: a row past the end is
+/// the end of the text, a column past the end of its line the line's end.
+/// Kept next to [`script_position`] so the two stay one conversion.
+pub fn script_offset(text: &Rope, row: usize, col: usize) -> usize {
+    if row >= text.lines_len().max(1) {
+        return text.len();
+    }
+    let line = text.slice_line(row);
+    let col = col.min(line.len_utf16());
+    text.line_start_offset(row) + line.utf16_to_byte_idx(col)
 }
 
 /// One selection as a byte range, with the side its caret is on.
@@ -583,10 +606,11 @@ pub struct InputBaseState<M: InputModeKind> {
     pub(crate) scroll_handle: ScrollHandle,
     /// HERDR: the scroll the next paint applies, if any.
     pub(in crate::input) queued_scroll: Option<QueuedScroll>,
-    /// HERDR: [`DisplayMap::wrap_row_count`] when the last frame was painted:
-    /// while it is unchanged, the last frame's `scroll_size` (ghost lines
-    /// included) still describes the text.
-    pub(crate) last_frame_wrap_rows: usize,
+    /// HERDR: whether the editor was focused when the last frame was
+    /// painted. Only a focused editor draws an inline completion, so the
+    /// ghost-line measurement ([`Self::ghost_block_in`]) asks this rather
+    /// than whether a completion exists.
+    pub(crate) last_frame_focused: bool,
     /// HERDR: `document_revision` when the last frame was painted: while it
     /// is unchanged, the last frame's `scroll_size.width` is the text's.
     pub(crate) last_frame_document_revision: u64,
@@ -983,7 +1007,7 @@ impl<M: InputModeKind> InputBaseState<M> {
             longest_line_width: Cell::new(None),
             editor_paddings: Edges::default(),
             queued_scroll: None,
-            last_frame_wrap_rows: 0,
+            last_frame_focused: false,
             last_frame_document_revision: 0,
             show_unfocused_selection: false,
             line_decorations: Default::default(),
@@ -2919,7 +2943,7 @@ impl<M: InputModeKind> InputBaseState<M> {
         // Clamp the deferred target into the same safe range that
         // `update_scroll_offset` enforces on persist, so paint never shows an
         // over-scrolled frame before the post-paint clamp pulls it back.
-        let safe_y_min = self.safe_scroll_y_min(line_height);
+        let safe_y_min = self.safe_scroll_y_min(line_height, bounds.size.height, scroll_offset.y);
         scroll_offset.x = scroll_offset.x.min(px(0.));
         scroll_offset.y = scroll_offset.y.clamp(safe_y_min, px(0.));
         // Revealing an offset that is visible at a code scroll queued earlier
@@ -2933,27 +2957,19 @@ impl<M: InputModeKind> InputBaseState<M> {
         cx.notify();
     }
 
-    /// The lowest vertical scroll offset, from the current text rather than
-    /// the last frame's `scroll_size`: text set since that frame (a file
-    /// loaded and scrolled to in one handler) must be reachable, and text
-    /// shortened since must not be scrolled past. Uses the height
-    /// `TextElement` lays out ([`Self::content_height`]), minus transient
-    /// ghost lines.
-    /// While the rows are those of the last frame, never tighter than its
-    /// range (ghost lines included), so existing scrolls keep their reach.
-    fn safe_scroll_y_min(&self, line_height: Pixels) -> Pixels {
-        let last_frame = (-self.scroll_size.height + self.input_bounds.size.height).min(px(0.));
-        let Some(bounds) = self.last_bounds else {
-            return last_frame;
-        };
-        let rows = self.display_map.wrap_row_count();
-        let content = self.content_height(bounds.size.height, line_height, px(0.));
-        let current = (-content + self.input_bounds.size.height).min(px(0.));
-        if rows == self.last_frame_wrap_rows {
-            current.min(last_frame)
-        } else {
-            current
-        }
+    /// The lowest vertical scroll offset a `view_height` view scrolled to
+    /// `scroll_y` reaches, from the current text rather than the last
+    /// frame's `scroll_size`: text set since that frame (a file loaded and
+    /// scrolled to in one handler) must be reachable, and text shortened
+    /// since must not be scrolled past. Uses the height `TextElement` lays
+    /// out ([`Self::content_height`]), with the ghost lines of the current
+    /// completion when that frame draws them ([`Self::ghost_block_at`]), so
+    /// a completion cleared earlier in the same handler no longer extends
+    /// the reach.
+    fn safe_scroll_y_min(&self, line_height: Pixels, view_height: Pixels, scroll_y: Pixels) -> Pixels {
+        let ghost_height = self.ghost_block_at(scroll_y).map_or(px(0.), |(_, height)| height);
+        let content = self.content_height(view_height, line_height, ghost_height);
+        (-content + view_height).min(px(0.))
     }
 
     /// HERDR: the scrollable height `TextElement` lays out for the current
@@ -2991,7 +3007,9 @@ impl<M: InputModeKind> InputBaseState<M> {
         let (Some(layout), Some(bounds)) = (self.last_layout.as_ref(), self.last_bounds) else {
             return offset;
         };
-        offset.y = offset.y.clamp(self.safe_scroll_y_min(layout.line_height), px(0.));
+        offset.y = offset
+            .y
+            .clamp(self.safe_scroll_y_min(layout.line_height, bounds.size.height, offset.y), px(0.));
         offset.x = if self.document_revision == self.last_frame_document_revision {
             super::element::clamp_horizontal_scroll_offset(
                 offset.x,
@@ -3636,6 +3654,30 @@ impl<M: InputModeKind> InputBaseState<M> {
             return;
         };
         self.drop_pending_row_scroll();
+        // Measure against a scroll already queued this frame, so "nearest"
+        // can't keep an earlier target that would hide the row.
+        let mut scroll_offset = self.queued_scroll_offset();
+        let Some(y) = self.row_scroll_y(row, align, line_height, bounds.size.height, scroll_offset.y)
+        else {
+            return;
+        };
+        scroll_offset.y = y;
+        self.queue_scroll_offset(scroll_offset, false);
+        cx.notify();
+    }
+
+    /// HERDR: the vertical scroll that places buffer `row` (clamped to the
+    /// document) as `align` asks in a `view_height` view now scrolled to
+    /// `scroll_y`; `None` when "nearest" finds it already in view. Shared by
+    /// [`Self::scroll_to_row`] and [`Self::resolve_scroll_before_layout`].
+    fn row_scroll_y(
+        &self,
+        row: usize,
+        align: RowScrollAlign,
+        line_height: Pixels,
+        view_height: Pixels,
+        scroll_y: Pixels,
+    ) -> Option<Pixels> {
         let row = row.min(self.text.lines_len().saturating_sub(1));
         let rows = self
             .display_map
@@ -3644,14 +3686,10 @@ impl<M: InputModeKind> InputBaseState<M> {
                 let start = self.display_map.buffer_line_to_display_row(row);
                 start..start + 1
             });
-        // Measure against a scroll already queued this frame, so "nearest"
-        // can't keep an earlier target that would hide the row.
-        let mut scroll_offset = self.queued_scroll_offset();
-        let (top, height) = self.row_span(row, rows.clone(), line_height, scroll_offset.y);
-        let view_top = -scroll_offset.y;
-        let view_height = bounds.size.height;
-        let safe_y_min = self.safe_scroll_y_min(line_height);
-        let target_y = |top: Pixels| -> Option<Pixels> {
+        let (top, height) = self.row_span(row, rows.clone(), line_height, scroll_y);
+        // The scroll that shows a row drawn at `top` in a view whose top is
+        // at `view_top`.
+        let target_y = |top: Pixels, view_top: Pixels| -> Option<Pixels> {
             let target = match align {
                 RowScrollAlign::Top => top,
                 RowScrollAlign::Center => top - (view_height - height) / 2.,
@@ -3662,21 +3700,73 @@ impl<M: InputModeKind> InputBaseState<M> {
                 }
                 RowScrollAlign::Nearest => return None,
             };
-            Some((-target).clamp(safe_y_min, px(0.)))
+            let y = -target;
+            Some(y.clamp(self.safe_scroll_y_min(line_height, view_height, y), px(0.)))
         };
-        let Some(mut y) = target_y(top) else {
-            return;
-        };
+        let mut y = target_y(top, -scroll_y)?;
         // Ghost lines above the row push it down only if the frame at the
         // target still draws them (the caret row is laid out there): measure
-        // the row again at the target.
+        // the row again at the target, and aim at where it is drawn there.
+        // "Nearest" checks that against the view at the target, not the
+        // current one: a row the ghost lines hid now may show at the target
+        // without them, and is then left where it is.
         let (top_there, _) = self.row_span(row, rows, line_height, y);
-        if top_there != top {
-            y = target_y(top_there).unwrap_or(scroll_offset.y);
+        if top_there != top
+            && let Some(refined) = target_y(top_there, -y)
+        {
+            y = refined;
         }
-        scroll_offset.y = y;
-        self.queue_scroll_offset(scroll_offset, false);
-        cx.notify();
+        Some(y)
+    }
+
+    /// HERDR: in the first prepaint, once the line height and view height
+    /// are known: turn a [`QueuedScroll::Row`] or [`QueuedScroll::Caret`]
+    /// asked for before any layout into an offset, so the first frame is
+    /// drawn there instead of at the top and jumping on the next one.
+    pub(super) fn resolve_scroll_before_layout(&mut self, line_height: Pixels, view_height: Pixels) {
+        if self.last_layout.is_some() || self.is_single_line() {
+            return;
+        }
+        let scroll = self.scroll_handle.offset();
+        let resolved = match self.queued_scroll {
+            Some(QueuedScroll::Row(row, align)) => {
+                self.row_scroll_y(row, align, line_height, view_height, scroll.y).map(|y| {
+                    QueuedScroll::Offset {
+                        offset: point(scroll.x, y),
+                        reveal: false,
+                        then_caret: None,
+                    }
+                })
+            }
+            Some(QueuedScroll::Caret(id)) => {
+                // Vertically as `scroll_to` reveals it (minimal padding); the
+                // caret's line isn't shaped yet, so the horizontal part
+                // follows once it is (`then_caret`).
+                let point_at = self.text.offset_to_point(self.caret_of(id));
+                let display_row = self
+                    .display_map
+                    .buffer_pos_to_display_pos(crate::input::BufferPoint::new(
+                        point_at.row,
+                        point_at.column,
+                    ))
+                    .row;
+                let caret_y = line_height * display_row;
+                let mut y = scroll.y;
+                if caret_y < -y {
+                    y = -caret_y;
+                } else if caret_y + line_height > -y + view_height {
+                    y = -(caret_y - view_height + line_height);
+                }
+                let y = y.clamp(self.safe_scroll_y_min(line_height, view_height, y), px(0.));
+                Some(QueuedScroll::Offset {
+                    offset: point(scroll.x, y),
+                    reveal: true,
+                    then_caret: Some(id),
+                })
+            }
+            _ => return,
+        };
+        self.queued_scroll = resolved;
     }
 
     /// Replace the line decorations under `key` (an owner's name, so owners
@@ -3767,15 +3857,26 @@ impl<M: InputModeKind> InputBaseState<M> {
 
     /// HERDR: the inline-completion ghost block a frame showing buffer
     /// lines `visible` draws: the buffer row it is drawn under and its height
-    /// (rows after it are drawn that much lower). Derived from the current
-    /// completion and caret, as `TextElement::layout_inline_completion` lays
-    /// it out, so a completion shown, replaced or cleared, or a caret moved,
-    /// earlier in the same handler is already counted.
+    /// (rows after it are drawn that much lower).
     fn ghost_block_in(&self, visible: Range<usize>, line_height: Pixels) -> Option<(usize, Pixels)> {
+        self.ghost_lines(line_height).filter(|(row, _)| visible.contains(row))
+    }
+
+    /// HERDR: the caret row and height of the current completion's ghost
+    /// lines, wherever the view is. Derived from the current completion and
+    /// caret as `TextElement::layout_inline_completion` lays it out (only in
+    /// a focused editor, so only when the last frame was painted focused),
+    /// so a completion shown, replaced or cleared, or a caret moved, earlier
+    /// in the same handler is already counted, and a completion kept while
+    /// unfocused is not.
+    fn ghost_lines(&self, line_height: Pixels) -> Option<(usize, Pixels)> {
+        if !self.last_frame_focused {
+            return None;
+        }
         let item = self.extras.inline_completion_item()?;
         let ghost_lines = item.insert_text.split('\n').count() - 1;
-        let row = self.cursor_position().line as usize;
-        (ghost_lines > 0 && visible.contains(&row)).then(|| (row, ghost_lines as f32 * line_height))
+        (ghost_lines > 0)
+            .then(|| (self.cursor_position().line as usize, ghost_lines as f32 * line_height))
     }
 
     /// HERDR: [`Self::ghost_block_in`] the last frame, which a press lands
@@ -3786,9 +3887,12 @@ impl<M: InputModeKind> InputBaseState<M> {
     }
 
     /// HERDR: [`Self::ghost_block_in`] a frame scrolled to `scroll_y`: the
-    /// ghost lines are drawn only while the caret row is laid out.
+    /// ghost lines are drawn only while the caret row is laid out. Returns
+    /// before measuring the visible range when there are no ghost lines, the
+    /// usual case.
     fn ghost_block_at(&self, scroll_y: Pixels) -> Option<(usize, Pixels)> {
         let (layout, bounds) = (self.last_layout.as_ref()?, self.last_bounds?);
+        let block = self.ghost_lines(layout.line_height)?;
         let height = bounds.size.height;
         let scroll_top = super::element::clamp_auto_grow_vertical_scroll_offset(
             &self.mode,
@@ -3802,7 +3906,7 @@ impl<M: InputModeKind> InputBaseState<M> {
             height,
             scroll_top,
         );
-        self.ghost_block_in(visible, layout.line_height)
+        visible.contains(&block.0).then_some(block)
     }
 
     /// Drop a row or caret scroll kept for after the first layout: a newer
@@ -3901,15 +4005,27 @@ impl<M: InputModeKind> InputBaseState<M> {
     }
 
     pub(crate) fn queue_scroll_offset(&mut self, offset: Point<Pixels>, reveal: bool) {
-        self.queued_scroll = Some(QueuedScroll::Offset { offset, reveal });
+        self.queued_scroll = Some(QueuedScroll::Offset {
+            offset,
+            reveal,
+            then_caret: None,
+        });
     }
 
-    /// After a paint: drop the offset it applied, and apply a scroll asked
-    /// for before layout.
+    /// After a paint: drop the offset it applied, and finish a scroll asked
+    /// for before layout. The first prepaint resolves those
+    /// ([`Self::resolve_scroll_before_layout`]); a caret's horizontal part
+    /// needs its line shaped, and so waits for this paint.
     pub(super) fn apply_queued_scroll(&mut self, cx: &mut Context<Self>) {
         match self.queued_scroll.take() {
             Some(QueuedScroll::Row(row, align)) => self.scroll_to_row(row, align, cx),
-            Some(QueuedScroll::Caret(id)) => self.scroll_to(self.caret_of(id), None, cx),
+            Some(
+                QueuedScroll::Caret(id)
+                | QueuedScroll::Offset {
+                    then_caret: Some(id),
+                    ..
+                },
+            ) => self.scroll_to(self.caret_of(id), None, cx),
             Some(QueuedScroll::Offset { .. }) | None => {}
         }
     }

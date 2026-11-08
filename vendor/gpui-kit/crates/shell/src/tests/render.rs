@@ -5761,10 +5761,12 @@ export default class Code extends View {
     this.code.on("selection_change", () => { this.selection_events += 1; });
     this.code.set_selections([
       { start: { row: 3, col: 3 }, end: { row: 3, col: 5 } },
-      { start: { row: 10, col: 0 }, end: { row: 12, col: 2 } },
+      { start: { row: 10, col: 0 }, end: { row: 12, col: 2 }, head: { row: 10, col: 0 } },
     ]);
     this.code.add_selection({ start: { row: 20, col: 1 }, end: { row: 20, col: 1 } });
     this.code.scroll_to_row(60, "top");
+    try { this.code.set_selections([]); this.empty = "accepted"; }
+    catch (error) { this.empty = error.name; }
   }
   render(cx) {
     return div()
@@ -5773,7 +5775,8 @@ export default class Code extends View {
       .child("events=" + this.selection_events)
       .child("row60=" + JSON.stringify(this.code.row_bounds(60)))
       .child("scrolled=" + (this.code.scroll_position().top > 0))
-      .child("scroll_seen=" + JSON.stringify(this.scroll_seen));
+      .child("scroll_seen=" + JSON.stringify(this.scroll_seen))
+      .child("empty=" + this.empty);
   }
 }
 "##;
@@ -5806,12 +5809,16 @@ export default class Code extends View {
         "{tree}"
     );
     assert!(tree.contains(r#"{"start":{"row":20,"col":1},"end":{"row":20,"col":1},"head":{"row":20,"col":1},"primary":false}"#), "{tree}");
+    // A backwards selection's head is its start.
+    assert!(tree.contains(r#"{"start":{"row":10,"col":0},"end":{"row":12,"col":2},"head":{"row":10,"col":0},"primary":false}"#), "{tree}");
     assert!(tree.contains("scrolled=true"), "{tree}");
     // Scrolled to the top, row 60 starts the visible text.
     assert!(tree.contains(r#"row60={"top":0,"#), "{tree}");
     assert!(!tree.contains("events=0"), "{tree}");
     // The scroll handler already saw row 60 at the top.
     assert!(tree.contains("scroll_seen=[0]"), "{tree}");
+    // An empty list would leave no caret: refused, and the selections kept.
+    assert!(tree.contains("empty=RangeError"), "{tree}");
 
     // A user moving the caret is reported too.
     context.update(|_, cx| editor.update(cx, |state, cx| state.set_selected_range(0..0, cx)));

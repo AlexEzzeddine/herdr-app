@@ -3171,7 +3171,9 @@ const BASE: &str = r#"  /** A row. */
     /** Replaces the line decorations under `key` (each owner uses its own key, so they
      * don't replace each other); an empty list removes them. Rows are fixed: they don't
      * move with edits, so set them again on `change`. Rows past the end of the text
-     * are kept and paint once the text reaches them. Later decorations win. */
+     * are kept and paint once the text reaches them. Where decorations overlap, later
+     * ones in the list win, and keys apply in alphabetical order, so on a row two keys
+     * color the alphabetically later key wins ("review" over "diff"), whichever was set last. */
     set_line_decorations(key: string, decorations: LineDecoration[]): void;
     /** Every selection: the primary one first, then the rest in document order.
      * An empty selection is a caret. `set_value` changes it without a `selection_change`. */
@@ -3179,7 +3181,8 @@ const BASE: &str = r#"  /** A row. */
     /** Replaces every selection; the first becomes primary and its caret is scrolled
      * into view (after the first layout, if there is none yet). Overlapping ranges merge.
      * Pass `head` (or `start` after `end`) for a backwards selection, so `selections()`
-     * round-trips. Throws a `TypeError` when `ranges` is not an array. */
+     * round-trips. Throws a `TypeError` when `ranges` is not an array and a `RangeError`
+     * when it is empty (an editor always has a caret: pass an empty range to reset to one). */
     set_selections(ranges: EditorRange[]): void;
     /** Adds a selection (like Alt-click), keeping the others. */
     add_selection(range: EditorRange): void;
