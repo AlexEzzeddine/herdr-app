@@ -3159,8 +3159,8 @@ const BASE: &str = r#"  /** A row. */
      * selections to a caret at the start and scrolls to the top without a `change`,
      * `selection_change` or `scroll`, so read `selections()` / `scroll_position()` after it.
      * A scroll asked for earlier in the same handler (`scroll_to_row`) is kept instead of
-     * the reset to the top, so a mod can scroll and then load the file; that scroll is
-     * reported by `scroll` like any other. */
+     * the reset to the top, so a mod can scroll and then load the file; the new text still
+     * starts at its left edge. That scroll is reported by `scroll` like any other. */
     set_value(value: string): void;
     /** `selection_change`: selections or carets moved, were added or removed; read `selections()`.
      * `scroll`: the view scrolled; `scroll_position()` and `row_bounds()` are current in the handler.

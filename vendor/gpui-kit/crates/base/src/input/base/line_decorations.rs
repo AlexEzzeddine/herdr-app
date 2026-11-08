@@ -53,10 +53,28 @@ pub(crate) struct RowPaint {
 /// painting, so a set costs the number of decorations, not of decorated rows.
 #[derive(Default)]
 pub(crate) struct LineDecorations {
-    /// Applied in key order, later keys winning: byte order, which for
-    /// the UTF-8 keys is code-point order (what scripts are told: JS
-    /// `sort()` order, uppercase before lowercase).
-    by_key: BTreeMap<SharedString, KeyDecorations>,
+    /// Applied in key order, later keys winning: JS `sort()` order, what
+    /// scripts are told ([`SortKey`]).
+    by_key: BTreeMap<SortKey, KeyDecorations>,
+}
+
+/// A decoration key ordered as JS `sort()` orders strings: by UTF-16 code
+/// unit. Byte (code-point) order agrees except between characters at or
+/// above U+E000 and characters outside the BMP (surrogates sort first in
+/// UTF-16), so the documented order holds for every key.
+#[derive(Clone, PartialEq, Eq)]
+struct SortKey(SharedString);
+
+impl Ord for SortKey {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.0.encode_utf16().cmp(other.0.encode_utf16())
+    }
+}
+
+impl PartialOrd for SortKey {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
 }
 
 /// One key's decorations, indexed so painting finds those over the visible
@@ -103,6 +121,7 @@ impl LineDecorations {
     /// the end of the text are kept (the text may still grow) and simply
     /// don't paint. Returns whether anything changed.
     pub(crate) fn set(&mut self, key: SharedString, decorations: Vec<LineDecoration>) -> bool {
+        let key = SortKey(key);
         let decorations: Vec<LineDecoration> = decorations
             .into_iter()
             .filter(|decoration| {
@@ -206,6 +225,19 @@ mod tests {
         assert_eq!(decorations.row(0).unwrap().background, Some(red), "\"diff\" sorts after \"Review\"");
         decorations.set("review".into(), vec![LineDecoration::new(0..1).with_background(green)]);
         assert_eq!(decorations.row(0).unwrap().background, Some(green), "\"review\" sorts after \"diff\"");
+    }
+
+    /// JS compares UTF-16 code units: a key starting outside the BMP
+    /// (a surrogate, 0xD83D) sorts before one starting at U+FF01, the
+    /// reverse of code-point order.
+    #[test]
+    fn keys_apply_in_utf16_order() {
+        let red = hsla(0., 1., 0.5, 1.);
+        let green = hsla(0.33, 1., 0.5, 1.);
+        let mut decorations = LineDecorations::default();
+        decorations.set("\u{FF01}x".into(), vec![LineDecoration::new(0..1).with_background(red)]);
+        decorations.set("\u{1F600}x".into(), vec![LineDecoration::new(0..1).with_background(green)]);
+        assert_eq!(decorations.row(0).unwrap().background, Some(red), "U+FF01 sorts after the emoji in JS");
     }
 
     #[test]

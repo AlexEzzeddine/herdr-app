@@ -30,6 +30,10 @@ pub(super) struct LastLayout {
     pub(super) cursor_bounds: Option<Bounds<Pixels>>,
     pub(super) text_align: TextAlign,
     pub(super) content_width: Pixels,
+    /// HERDR: the inline-completion ghost block this frame drew: the buffer
+    /// row it is under and its height. Kept with the frame so a press is
+    /// measured against what was drawn, not the current completion.
+    pub(super) ghost_block: Option<(usize, Pixels)>,
 }
 
 impl LastLayout {

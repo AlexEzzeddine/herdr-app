@@ -35,11 +35,8 @@ use super::{
     undo_manager::{EditIntent, UndoManager},
 };
 use crate::actions::{SelectDown, SelectLeft, SelectRight, SelectUp};
-use crate::input::blink_cursor::CURSOR_WIDTH;
 use crate::input::movement::MoveDirection;
-use crate::input::{
-    InputExtras as _, Position, RopeExt as _, element::RIGHT_MARGIN, layout::LastLayout,
-};
+use crate::input::{InputExtras as _, Position, RopeExt as _, layout::LastLayout};
 use crate::{AutoScroll, StepAction};
 
 /// Vertical clearance to retain when revealing a text position.
@@ -222,7 +219,8 @@ pub enum InputEvent {
     /// A paste found no text on the clipboard (an image, say): the owner may read it.
     PasteWithoutText,
     /// The selections or carets moved, were added, or were removed.
-    /// Read them with [`InputBaseState::selections`].
+    /// Read them with [`InputBaseState::selections`]. Code editors only,
+    /// once [`InputBaseState::report_selection_changes`] is called.
     SelectionChange,
     /// The view scrolled (by the user, by code, or to follow the caret).
     /// Emitted after the frame that applied it, so layout reads are current.
@@ -597,11 +595,13 @@ pub struct InputBaseState<M: InputModeKind> {
     pub(crate) scroll_handle: ScrollHandle,
     /// HERDR: the scroll the next paint applies, if any.
     pub(in crate::input) queued_scroll: Option<QueuedScroll>,
-    /// HERDR: whether the editor was focused when the last frame was
-    /// painted. Only a focused editor draws an inline completion, so the
-    /// ghost-line measurement ([`Self::ghost_block_in`]) asks this rather
-    /// than whether a completion exists.
-    pub(crate) last_frame_focused: bool,
+    /// HERDR: whether the editor is focused, as last seen: set by every
+    /// paint and by [`Self::sync_focus`]. Only a focused editor draws an
+    /// inline completion, so the ghost-line measurement
+    /// ([`Self::ghost_block_in`]) asks this rather than whether a completion
+    /// exists. Reading focus needs the window, which the scroll API doesn't
+    /// take.
+    pub(crate) focused: bool,
     /// HERDR: `document_revision` when the last frame was painted: while it
     /// is unchanged, the last frame's `scroll_size.width` is the text's.
     pub(crate) last_frame_document_revision: u64,
@@ -678,6 +678,10 @@ pub struct InputBaseState<M: InputModeKind> {
     /// checked: an unchanged generation skips the comparison (cursor blinks
     /// notify without touching the selections).
     reported_selections_generation: u64,
+    /// HERDR: whether [`InputEvent::SelectionChange`] is reported
+    /// ([`Self::report_selection_changes`]). Off until an owner asks, so
+    /// editors nobody listens to don't compare selections on every change.
+    reports_selection_changes: bool,
 
     pub(super) auto_scroll: AutoScroll,
 }
@@ -927,13 +931,6 @@ impl<M: InputModeKind> InputBaseState<M> {
             cx.on_focus(&focus_handle, window, Self::on_focus),
             cx.on_blur(&focus_handle, window, Self::on_blur),
         ];
-        // HERDR: only code editors report selection changes (scripts can
-        // subscribe to them on an `EditorState` alone). Every selection
-        // mutation notifies; compare once here rather than emitting from
-        // each of them.
-        if M::CODE_EDITOR {
-            _subscriptions.push(cx.observe_self(Self::report_selection_change));
-        }
 
         let text_style = window.text_style();
 
@@ -996,7 +993,7 @@ impl<M: InputModeKind> InputBaseState<M> {
             longest_line_width: Cell::new(None),
             editor_paddings: Edges::default(),
             queued_scroll: None,
-            last_frame_focused: false,
+            focused: false,
             last_frame_document_revision: 0,
             show_unfocused_selection: false,
             line_decorations: Default::default(),
@@ -1021,6 +1018,7 @@ impl<M: InputModeKind> InputBaseState<M> {
                 reversed: false,
             }],
             reported_selections_generation: 0,
+            reports_selection_changes: false,
             _pending_update: false,
             cursor_line_end_affinity: false,
             auto_scroll: AutoScroll::default(),
@@ -1335,15 +1333,17 @@ impl<M: InputModeKind> InputBaseState<M> {
             Some(QueuedScroll::Offset { reveal: true, .. } | QueuedScroll::Caret(_)) => {
                 self.queued_scroll = None;
             }
-            // A code scroll kept by a caret reveal keeps the scroll, not the
-            // old text's caret.
-            Some(QueuedScroll::Offset { reveal: false, ref mut then_caret, .. }) if then_caret.is_some() => {
+            // A scroll asked for by code (`scroll_to_row`, `set_scroll_offset`)
+            // keeps its vertical part; paint clamps it to the new text. The
+            // new text starts at its left edge: the horizontal part was the
+            // old text's (`scroll_to_row` copies the scroll it started from),
+            // and so is the caret a reveal kept with it.
+            Some(QueuedScroll::Offset { reveal: false, ref mut offset, ref mut then_caret }) => {
+                offset.x = px(0.);
                 *then_caret = None;
             }
-            // A scroll asked for by code (`scroll_to_row`, `set_scroll_offset`)
-            // is kept; paint clamps it to the new text, and rows are clamped
-            // when applied.
-            Some(QueuedScroll::Offset { reveal: false, .. } | QueuedScroll::Row(..)) | None => {}
+            // Rows are clamped when applied, at the scroll handle's x (0).
+            Some(QueuedScroll::Row(..)) | None => {}
         }
     }
 
@@ -2863,23 +2863,10 @@ impl<M: InputModeKind> InputBaseState<M> {
         let was_offset = scroll_offset;
         let line_height = last_layout.line_height;
 
-        let point = self.text.offset_to_point(offset);
-
-        let row = point.row;
-
+        let row = self.text.offset_to_point(offset).row;
         // Resolve the wrapped row even when the target is outside the last layout.
-        let display_pos = self
-            .display_map
-            .buffer_pos_to_display_pos(crate::input::BufferPoint::new(row, point.column));
-        let row_offset_y = line_height * display_pos.row;
+        let row_offset_y = self.display_row_y(offset, line_height);
 
-        // For Right alignment use 0 margin: the cursor indicator is clamped inside bounds
-        // in layout_cursors, so shifting the text here would cause a first-click visual jump.
-        let safety_margin = match last_layout.text_align {
-            TextAlign::Left => RIGHT_MARGIN,
-            TextAlign::Right => px(0.),
-            TextAlign::Center => CURSOR_WIDTH,
-        };
         if let Some(vi) = last_layout
             .visible_buffer_lines
             .iter()
@@ -2888,14 +2875,12 @@ impl<M: InputModeKind> InputBaseState<M> {
             let line = &last_layout.lines[vi];
             let local_offset = offset.saturating_sub(last_layout.visible_line_byte_offsets[vi]);
             if let Some(pos) = line.position_for_index(local_offset, last_layout, false) {
-                let bounds_width = bounds.size.width - last_layout.line_number_width;
-                let col_offset_x = pos.x;
-                if col_offset_x - safety_margin < -scroll_offset.x {
-                    // If the position is out of the visible area, scroll to make it visible
-                    scroll_offset.x = -col_offset_x + safety_margin;
-                } else if col_offset_x + safety_margin > -scroll_offset.x + bounds_width {
-                    scroll_offset.x = -(col_offset_x - bounds_width + safety_margin);
-                }
+                scroll_offset.x = super::element::reveal_x(
+                    pos.x,
+                    scroll_offset.x,
+                    bounds.size.width - last_layout.line_number_width,
+                    last_layout.text_align,
+                );
             }
         }
 
@@ -2914,13 +2899,13 @@ impl<M: InputModeKind> InputBaseState<M> {
             } else {
                 line_height
             };
-        if row_offset_y - edge_height + line_height < -scroll_offset.y {
-            // Scroll up
-            scroll_offset.y = -row_offset_y + edge_height - line_height;
-        } else if row_offset_y + edge_height > -scroll_offset.y + bounds.size.height {
-            // Scroll down
-            scroll_offset.y = -(row_offset_y - bounds.size.height + edge_height);
-        }
+        scroll_offset.y = super::element::reveal_y(
+            row_offset_y,
+            scroll_offset.y,
+            bounds.size.height,
+            line_height,
+            edge_height,
+        );
 
         // Avoid necessary scroll, when it was already in the correct position.
         if direction == Some(MoveDirection::Up) {
@@ -2935,13 +2920,18 @@ impl<M: InputModeKind> InputBaseState<M> {
         let safe_y_min = self.safe_scroll_y_min(line_height, bounds.size.height, scroll_offset.y);
         scroll_offset.x = scroll_offset.x.min(px(0.));
         scroll_offset.y = scroll_offset.y.clamp(safe_y_min, px(0.));
-        // Revealing an offset that is visible at a code scroll queued earlier
-        // in this handler keeps that scroll, labelled as asked for by code,
-        // so replacing the text afterwards doesn't drop it.
-        let keeps_code_scroll = scroll_offset == was_offset
-            && matches!(self.queued_scroll, Some(QueuedScroll::Offset { reveal: false, .. }));
-        if !keeps_code_scroll {
-            self.queue_scroll_offset(scroll_offset, true);
+        // Revealing an offset whose row is visible at a code scroll queued
+        // earlier in this handler keeps that scroll, labelled as asked for
+        // by code, so replacing the text afterwards doesn't drop it. Only
+        // the vertical part decides: a reveal that just scrolls sideways
+        // updates the code scroll's x (which `set_value` resets anyway).
+        match &mut self.queued_scroll {
+            Some(QueuedScroll::Offset { reveal: false, offset, .. })
+                if scroll_offset.y == was_offset.y =>
+            {
+                offset.x = scroll_offset.x;
+            }
+            _ => self.queue_scroll_offset(scroll_offset, true),
         }
         cx.notify();
     }
@@ -3708,6 +3698,16 @@ impl<M: InputModeKind> InputBaseState<M> {
         Some(y)
     }
 
+    /// HERDR: how far below the top of the content byte `offset`'s display
+    /// row (soft wrap and folds counted) starts.
+    fn display_row_y(&self, offset: usize, line_height: Pixels) -> Pixels {
+        let point = self.text.offset_to_point(offset);
+        let display_pos = self
+            .display_map
+            .buffer_pos_to_display_pos(crate::input::BufferPoint::new(point.row, point.column));
+        line_height * display_pos.row
+    }
+
     /// HERDR: in the first prepaint, once the line height and view height
     /// are known: turn a [`QueuedScroll::Row`] or [`QueuedScroll::Caret`]
     /// asked for before any layout into an offset, so the first frame is
@@ -3731,21 +3731,13 @@ impl<M: InputModeKind> InputBaseState<M> {
                 // Vertically as `scroll_to` reveals it (minimal padding); the
                 // caret's line isn't shaped yet, so the horizontal part
                 // follows once it is (`then_caret`).
-                let point_at = self.text.offset_to_point(self.caret_of(id));
-                let display_row = self
-                    .display_map
-                    .buffer_pos_to_display_pos(crate::input::BufferPoint::new(
-                        point_at.row,
-                        point_at.column,
-                    ))
-                    .row;
-                let caret_y = line_height * display_row;
-                let mut y = scroll.y;
-                if caret_y < -y {
-                    y = -caret_y;
-                } else if caret_y + line_height > -y + view_height {
-                    y = -(caret_y - view_height + line_height);
-                }
+                let y = super::element::reveal_y(
+                    self.display_row_y(self.caret_of(id), line_height),
+                    scroll.y,
+                    view_height,
+                    line_height,
+                    line_height,
+                );
                 let y = y.clamp(self.safe_scroll_y_min(line_height, view_height, y), px(0.));
                 Some(QueuedScroll::Offset {
                     offset: point(scroll.x, y),
@@ -3848,31 +3840,49 @@ impl<M: InputModeKind> InputBaseState<M> {
     /// lines `visible` draws: the buffer row it is drawn under and its height
     /// (rows after it are drawn that much lower).
     fn ghost_block_in(&self, visible: Range<usize>, line_height: Pixels) -> Option<(usize, Pixels)> {
-        self.ghost_lines(line_height).filter(|(row, _)| visible.contains(row))
+        let (row, text) = self.shown_inline_completion(self.focused, &visible)?;
+        let ghost_lines = text.split('\n').count() - 1;
+        (ghost_lines > 0).then(|| (row, ghost_lines as f32 * line_height))
     }
 
     /// HERDR: the caret row and height of the current completion's ghost
-    /// lines, wherever the view is. Derived from the current completion and
-    /// caret as `TextElement::layout_inline_completion` lays it out (only in
-    /// a focused editor, so only when the last frame was painted focused),
-    /// so a completion shown, replaced or cleared, or a caret moved, earlier
-    /// in the same handler is already counted, and a completion kept while
+    /// lines, wherever the view is ([`Self::ghost_block_in`] every row), so
+    /// a completion shown, replaced or cleared, or a caret moved, earlier in
+    /// the same handler is already counted, and a completion kept while
     /// unfocused is not.
     fn ghost_lines(&self, line_height: Pixels) -> Option<(usize, Pixels)> {
-        if !self.last_frame_focused {
+        self.ghost_block_in(0..usize::MAX, line_height)
+    }
+
+    /// HERDR: the inline completion a frame showing buffer lines `visible`
+    /// draws, in an editor that is `focused`: the caret row it is drawn at
+    /// and its text. The one rule `TextElement::layout_inline_completion`
+    /// and the scroll measurements here share: shown only while focused,
+    /// at the caret, when the caret row is laid out.
+    pub(super) fn shown_inline_completion(
+        &self,
+        focused: bool,
+        visible: &Range<usize>,
+    ) -> Option<(usize, &str)> {
+        if !focused {
             return None;
         }
         let item = self.extras.inline_completion_item()?;
-        let ghost_lines = item.insert_text.split('\n').count() - 1;
-        (ghost_lines > 0)
-            .then(|| (self.cursor_position().line as usize, ghost_lines as f32 * line_height))
+        let row = self.cursor_position().line as usize;
+        visible.contains(&row).then_some((row, item.insert_text.as_str()))
     }
 
-    /// HERDR: [`Self::ghost_block_in`] the last frame, which a press lands
-    /// on.
+    /// HERDR: read focus from `window` for the scroll measurements
+    /// ([`Self::focused`]), so a focus change earlier in the same handler,
+    /// before any paint, is counted. The script API calls this before it
+    /// scrolls or measures.
+    pub fn sync_focus(&mut self, window: &Window) {
+        self.focused = self.focus_handle.is_focused(window);
+    }
+
+    /// HERDR: the ghost block the last frame drew, which a press lands on.
     pub(in crate::input) fn ghost_block(&self) -> Option<(usize, Pixels)> {
-        let layout = self.last_layout.as_ref()?;
-        self.ghost_block_in(layout.visible_range.clone(), layout.line_height)
+        self.last_layout.as_ref()?.ghost_block
     }
 
     /// HERDR: [`Self::ghost_block_in`] a frame scrolled to `scroll_y`: the
@@ -3926,9 +3936,25 @@ impl<M: InputModeKind> InputBaseState<M> {
     }
 
     fn mark_selections_reported(&mut self) {
-        if M::CODE_EDITOR {
+        if self.reports_selection_changes {
             self.take_selection_report();
         }
+    }
+
+    /// HERDR: start reporting [`InputEvent::SelectionChange`] (code editors
+    /// only; scripts subscribe on an `EditorState` alone). Called by an
+    /// owner that listens for it, once is enough: until then no selection
+    /// change is compared, so an editor nobody listens to pays nothing. The
+    /// selections at this point are the baseline, not a change.
+    pub fn report_selection_changes(&mut self, cx: &mut Context<Self>) {
+        if !M::CODE_EDITOR || self.reports_selection_changes {
+            return;
+        }
+        self.reports_selection_changes = true;
+        self.take_selection_report();
+        // Every selection mutation notifies; compare once here rather than
+        // emitting from each of them.
+        self._subscriptions.push(cx.observe_self(Self::report_selection_change));
     }
 
     /// Record the current selections as reported; returns whether scripts
@@ -8450,6 +8476,8 @@ mod tests {
         });
         cx.run_until_parked();
         input.update_in(&mut cx, |state, _, cx| {
+            // Asking for reports is a no-op outside code editors.
+            state.report_selection_changes(cx);
             state.set_selected_range(2..4, cx);
             state.scroll_to_row(40, RowScrollAlign::Top, cx);
         });

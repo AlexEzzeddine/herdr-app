@@ -318,6 +318,56 @@ pub(super) struct RowSpan {
     pub height: Pixels,
 }
 
+/// HERDR: the horizontal scroll that shows a caret `caret_x` from the
+/// text's left edge in a `view_width` view now scrolled to `scroll_x`,
+/// keeping the margin `text_align` asks for. Shared by
+/// [`InputBaseState::scroll_to_with_padding`] and the code-caret reveal in
+/// `TextElement::layout_cursors`, so revealing a caret before and after its
+/// line is shaped lands in the same place.
+pub(super) fn reveal_x(
+    caret_x: Pixels,
+    scroll_x: Pixels,
+    view_width: Pixels,
+    text_align: TextAlign,
+) -> Pixels {
+    // For Right alignment use 0 margin: the cursor indicator is clamped inside
+    // bounds in layout_cursors, so shifting the text here would cause a
+    // first-click visual jump.
+    let margin = match text_align {
+        TextAlign::Left => RIGHT_MARGIN,
+        TextAlign::Right => px(0.),
+        TextAlign::Center => CURSOR_WIDTH,
+    };
+    if caret_x - margin < -scroll_x {
+        (-caret_x + margin).min(px(0.))
+    } else if caret_x + margin > -scroll_x + view_width {
+        -(caret_x - view_width + margin)
+    } else {
+        scroll_x
+    }
+}
+
+/// HERDR: the vertical scroll that shows a display row drawn `row_y` from
+/// the top of the content in a `view_height` view now scrolled to
+/// `scroll_y`, with `edge_height` of clearance (one `line_height` is none).
+/// Shared by [`InputBaseState::scroll_to_with_padding`] and the caret
+/// reveal resolved before the first layout.
+pub(super) fn reveal_y(
+    row_y: Pixels,
+    scroll_y: Pixels,
+    view_height: Pixels,
+    line_height: Pixels,
+    edge_height: Pixels,
+) -> Pixels {
+    if row_y - edge_height + line_height < -scroll_y {
+        -row_y + edge_height - line_height
+    } else if row_y + edge_height > -scroll_y + view_height {
+        -(row_y - view_height + edge_height)
+    } else {
+        scroll_y
+    }
+}
+
 /// HERDR: the inline-completion ghost block drawn under `current_row`:
 /// its row and height. `None` when there are no ghost lines.
 pub(super) fn ghost_block(
@@ -796,18 +846,12 @@ impl<M: InputModeKind> TextElement<M> {
                         caret = masked_display_offset(&state.text, caret);
                     }
                     let affinity = id == active_id && state.cursor_line_end_affinity;
-                    let caret_x = caret_for(row, caret, affinity).x;
-                    let safety_margin = match last_layout.text_align {
-                        TextAlign::Left => RIGHT_MARGIN,
-                        TextAlign::Right => px(0.),
-                        TextAlign::Center => CURSOR_WIDTH,
-                    };
-                    let view_width = bounds.size.width - line_number_width;
-                    if caret_x - safety_margin < -scroll_offset.x {
-                        scroll_offset.x = (-caret_x + safety_margin).min(px(0.));
-                    } else if caret_x + safety_margin > -scroll_offset.x + view_width {
-                        scroll_offset.x = -(caret_x - view_width + safety_margin);
-                    }
+                    scroll_offset.x = reveal_x(
+                        caret_for(row, caret, affinity).x,
+                        scroll_offset.x,
+                        bounds.size.width - line_number_width,
+                        last_layout.text_align,
+                    );
                 }
             }
         }
@@ -1294,24 +1338,13 @@ impl<M: InputModeKind> TextElement<M> {
         window: &mut Window,
         _cx: &App,
     ) -> (Option<ShapedLine>, Vec<ShapedLine>) {
-        // Must be focused to show inline completion
-        if !state.focus_handle.is_focused(window) {
-            return (None, vec![]);
-        }
-
-        let Some(completion_item) = state.extras.inline_completion_item() else {
+        // HERDR: whether and where it shows is decided in one place,
+        // shared with the scroll measurements in `InputBaseState`.
+        let Some((_, completion_text)) =
+            state.shown_inline_completion(state.focus_handle.is_focused(window), visible_range)
+        else {
             return (None, vec![]);
         };
-
-        // Get cursor row from cursor position
-        let cursor_row = state.cursor_position().line as usize;
-
-        // Only show if cursor row is visible
-        if cursor_row < visible_range.start || cursor_row >= visible_range.end {
-            return (None, vec![]);
-        }
-
-        let completion_text = &completion_item.insert_text;
         let completion_color = state.editor_style.muted_foreground.opacity(0.5);
 
         let text_style = window.text_style();
@@ -2752,6 +2785,7 @@ impl<M: InputModeKind> Element for TextElement<M> {
             cursor_bounds: None,
             text_align: state.text_align,
             content_width: bounds.size.width,
+            ghost_block: None,
         };
 
         let run = TextRun {
@@ -2947,6 +2981,7 @@ impl<M: InputModeKind> Element for TextElement<M> {
 
         let (cursor_infos, cursor_scroll_offset, current_row) =
             self.layout_cursors(&last_layout, &mut bounds, scroll_size, window, cx);
+        last_layout.ghost_block = ghost_block(current_row, ghost_line_count, ghost_lines_height);
         // Completion/code-action menus position at the active caret.
         last_layout.cursor_bounds = cursor_infos
             .iter()
@@ -3138,11 +3173,7 @@ impl<M: InputModeKind> Element for TextElement<M> {
 
         // HERDR: application row decorations: where each decorated visible row
         // is drawn, walked like the glyph backgrounds below (ghost lines included).
-        let ghost = ghost_block(
-            prepaint.current_row,
-            prepaint.ghost_lines.len(),
-            prepaint.ghost_lines_height,
-        );
+        let ghost = prepaint.last_layout.ghost_block;
         let decorated_rows: Vec<(Pixels, Pixels, super::line_decorations::RowPaint)> = {
             let decorations = &self.state.read(cx).line_decorations;
             let visible = &prepaint.last_layout.visible_buffer_lines;
@@ -3467,7 +3498,7 @@ impl<M: InputModeKind> Element for TextElement<M> {
             state.set_input_bounds(input_bounds, cx);
             state.last_selected_range = Some(selected_range);
             state.scroll_size = prepaint.scroll_size;
-            state.last_frame_focused = focused;
+            state.focused = focused;
             state.last_frame_document_revision = state.document_revision;
             state.update_scroll_offset(Some(prepaint.cursor_scroll_offset), cx);
             state.apply_queued_scroll(cx);
@@ -3922,6 +3953,7 @@ mod tests {
     ) -> Rc<std::cell::Cell<usize>> {
         let seen = Rc::new(std::cell::Cell::new(0));
         let counter = seen.clone();
+        editor.update(cx, |state, cx| state.report_selection_changes(cx));
         window
             .subscribe(editor, cx, move |_, event: &InputEvent, _, _| {
                 if matches!(event, InputEvent::SelectionChange) {
@@ -4404,7 +4436,10 @@ mod tests {
         });
         let ghost = line_height * 2.;
         focus_and_draw(&editor, &mut cx);
-        cx.update(|_, cx| editor.update(cx, |state, cx| show_inline_completion(state, 1, 2, cx)));
+        cx.update(|window, cx| {
+            editor.update(cx, |state, cx| show_inline_completion(state, 1, 2, cx));
+            window.draw(cx).clear(cx);
+        });
         editor.read_with(&cx, |state, _| {
             let at = |row_y: Pixels| state.gutter_row_at(point(gutter, top + row_y));
             assert_eq!(at(line_height * 0.5), Some(0));
@@ -4851,6 +4886,153 @@ mod tests {
         assert_eq!(queued, px(-800.));
         cx.update(|window, cx| window.draw(cx).clear(cx));
         assert_eq!(editor.read_with(&cx, |state, _| state.scroll_offset().x), px(-800.));
+    }
+
+    /// HERDR: sixty lines too wide for the view, prefixed with `prefix`.
+    fn sixty_wide_lines(prefix: &str) -> String {
+        (0..60)
+            .map(|i| format!("{prefix} {i} {}", "x".repeat(300)))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    // HERDR: set_value keeps only the vertical part of a row scroll asked
+    // for earlier in its handler: the new text starts at its left edge,
+    // not at the old text's horizontal scroll.
+    #[gpui::test]
+    fn set_value_starts_a_kept_row_scroll_at_the_left_edge(cx: &mut TestAppContext) {
+        let (editor, window) = decoration_editor(cx, &sixty_wide_lines("line"), false);
+        let mut cx = VisualTestContext::from_window(window.into(), cx);
+        cx.update(|window, cx| {
+            window.draw(cx).clear(cx);
+            editor.update(cx, |state, cx| state.set_scroll_offset(point(px(-300.), px(0.)), cx));
+            window.draw(cx).clear(cx);
+        });
+        assert_eq!(editor.read_with(&cx, |state, _| state.scroll_offset().x), px(-300.));
+        cx.update(|window, cx| {
+            editor.update(cx, |state, cx| {
+                state.scroll_to_row(40, crate::input::RowScrollAlign::Top, cx);
+                state.set_value(sixty_wide_lines("other"), window, cx);
+            });
+            window.draw(cx).clear(cx);
+        });
+        editor.read_with(&cx, |state, _| {
+            assert_eq!(state.scroll_offset().x, px(0.), "the new text starts at its left edge");
+            assert_eq!(state.row_bounds(40).expect("laid out").0, px(0.), "row 40 is at the top");
+        });
+    }
+
+    // HERDR: a caret reveal that only scrolls sideways keeps a row scroll
+    // asked for earlier in the handler as a code scroll, so set_value after
+    // it still keeps the row.
+    #[gpui::test]
+    fn a_sideways_caret_reveal_keeps_a_row_scroll_across_set_value(cx: &mut TestAppContext) {
+        let long = "x".repeat(400);
+        let text = (0..60)
+            .map(|i| if i == 42 { long.clone() } else { format!("line {i}") })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let (editor, window) = decoration_editor(cx, &text, false);
+        let mut cx = VisualTestContext::from_window(window.into(), cx);
+        cx.update(|window, cx| {
+            window.draw(cx).clear(cx);
+            editor.update(cx, |state, cx| {
+                state.scroll_to_row(40, crate::input::RowScrollAlign::Top, cx)
+            });
+            window.draw(cx).clear(cx);
+        });
+        let target = text.find(&long).unwrap() + 390;
+        cx.update(|window, cx| {
+            editor.update(cx, |state, cx| {
+                state.scroll_to_row(40, crate::input::RowScrollAlign::Top, cx);
+                let y = state.queued_scroll_offset().y;
+                state.set_selections(vec![sel(target..target, false)], cx);
+                let queued = state.queued_scroll_offset();
+                assert_eq!(queued.y, y, "row 42 shows at row 40's scroll");
+                assert!(queued.x < px(0.), "the caret is revealed sideways");
+                state.set_value(sixty_lines("other"), window, cx);
+            });
+            window.draw(cx).clear(cx);
+        });
+        let (top, _) = editor.read_with(&cx, |state, _| state.row_bounds(40)).expect("laid out");
+        assert_eq!(top, px(0.), "row 40 is still at the top");
+    }
+
+    // HERDR: an editor reports selection changes only once asked to (a
+    // script subscribing): until then none are compared. Asking takes the
+    // current selections as the baseline, not as a change.
+    #[gpui::test]
+    fn selection_changes_are_reported_only_once_asked_for(cx: &mut TestAppContext) {
+        let (editor, window) = decoration_editor(cx, "alpha\nbeta", false);
+        let mut cx = VisualTestContext::from_window(window.into(), cx);
+        let seen = Rc::new(std::cell::Cell::new(0));
+        cx.update(|window, cx| {
+            let counter = seen.clone();
+            window
+                .subscribe(&editor, cx, move |_, event: &InputEvent, _, _| {
+                    if matches!(event, InputEvent::SelectionChange) {
+                        counter.set(counter.get() + 1);
+                    }
+                })
+                .detach();
+            editor.update(cx, |state, cx| state.set_selections(vec![sel(1..3, false)], cx));
+        });
+        cx.run_until_parked();
+        assert_eq!(seen.get(), 0, "nobody asked");
+        cx.update(|_, cx| editor.update(cx, |state, cx| state.report_selection_changes(cx)));
+        cx.run_until_parked();
+        assert_eq!(seen.get(), 0, "the selections when asked are the baseline");
+        cx.update(|_, cx| {
+            editor.update(cx, |state, cx| state.set_selections(vec![sel(2..4, false)], cx))
+        });
+        cx.run_until_parked();
+        assert_eq!(seen.get(), 1);
+    }
+
+    // HERDR: a blur earlier in the handler, before any paint, drops the
+    // ghost lines from the measurements once focus is read from the window
+    // (the script API does before it scrolls or measures).
+    #[gpui::test]
+    fn a_blur_in_the_handler_drops_ghost_lines_from_measurements(cx: &mut TestAppContext) {
+        let (editor, mut cx) = numbered_editor(cx, "a\nb\nc\nd\ne");
+        focus_and_draw(&editor, &mut cx);
+        cx.update(|window, cx| {
+            editor.update(cx, |state, cx| show_inline_completion(state, 1, 2, cx));
+            window.draw(cx).clear(cx);
+        });
+        cx.update(|window, cx| {
+            let line_height = editor.read(cx).last_layout.as_ref().unwrap().line_height;
+            let gap = |state: &EditorState| state.row_bounds(2).unwrap().0 - state.row_bounds(0).unwrap().0;
+            assert_eq!(gap(editor.read(cx)), line_height * 4., "drawn with ghost lines");
+            window.blur(cx);
+            editor.update(cx, |state, _| state.sync_focus(window));
+            assert_eq!(gap(editor.read(cx)), line_height * 2., "the next frame draws none");
+        });
+    }
+
+    // HERDR: a press is measured on the frame that was pressed: a
+    // completion cleared since that frame still pushes the rows below it
+    // down, because that is where they were drawn.
+    #[gpui::test]
+    fn gutter_presses_are_measured_on_the_frame_that_was_pressed(cx: &mut TestAppContext) {
+        let (editor, mut cx) = numbered_editor(cx, "a\nb\nc\nd\ne");
+        let (gutter, top) = editor.read_with(&cx, |state, _| {
+            (state.input_bounds.origin.x + px(2.), state.input_bounds.origin.y)
+        });
+        focus_and_draw(&editor, &mut cx);
+        cx.update(|window, cx| {
+            editor.update(cx, |state, cx| show_inline_completion(state, 1, 2, cx));
+            window.draw(cx).clear(cx);
+            // Cleared and pressed in one handler, before the next frame.
+            editor.update(cx, |state, _| state.extras.inline_completion.item = None);
+            let state = editor.read(cx);
+            let line_height = state.last_layout.as_ref().unwrap().line_height;
+            let at = |row_y: Pixels| state.gutter_row_at(point(gutter, top + row_y));
+            assert_eq!(at(line_height * 2.5), None, "on the ghost lines as drawn");
+            assert_eq!(at(line_height * 4.5), Some(2), "row 2 as drawn");
+            let gap = state.row_bounds(2).unwrap().0 - state.row_bounds(0).unwrap().0;
+            assert_eq!(gap, line_height * 2., "scroll measurements use the current completion");
+        });
     }
 
     // HERDR: presses in the gutter's left padding, where decoration bars

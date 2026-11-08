@@ -560,8 +560,11 @@ pub fn install(ctx: &Ctx<'_>, module: &Object<'_>, runtime: Weak<ShellRuntime>) 
                         "set_selections needs at least one range (a caret is an empty range)",
                     ));
                 }
-                scope::with_current(|_, cx| {
+                scope::with_current(|window, cx| {
                     state.update(cx, |state, cx| {
+                        // The caret reveal measures ghost lines, which
+                        // depend on focus.
+                        state.sync_focus(window);
                         let selections: Vec<_> = ranges
                             .iter()
                             .map(|range| editor_selection(state.text(), range))
@@ -598,8 +601,12 @@ pub fn install(ctx: &Ctx<'_>, module: &Object<'_>, runtime: Weak<ShellRuntime>) 
                         ));
                     }
                 };
-                scope::with_current(|_, cx| {
-                    state.update(cx, |state, cx| state.scroll_to_row(row, align, cx))
+                scope::with_current(|window, cx| {
+                    state.update(cx, |state, cx| {
+                        // Ghost lines are measured only in a focused editor.
+                        state.sync_focus(window);
+                        state.scroll_to_row(row, align, cx)
+                    })
                 })
                 .ok_or_else(|| needs_call(&ctx, "scroll_to_row()"))
             },
@@ -612,7 +619,8 @@ pub fn install(ctx: &Ctx<'_>, module: &Object<'_>, runtime: Weak<ShellRuntime>) 
         Func::from(
             move |ctx: Ctx<'_>, handle: EntityHandle| -> JsResult<String> {
                 let state = live_editor(&ctx, &read_scroll, handle)?;
-                scope::with_current_app(|cx| {
+                scope::with_current(|window, cx| {
+                    state.update(cx, |state, _| state.sync_focus(window));
                     let state = state.read(cx);
                     // A scroll queued in this handler counts, like `row_bounds`.
                     let offset = state.queued_scroll_offset();
@@ -635,7 +643,12 @@ pub fn install(ctx: &Ctx<'_>, module: &Object<'_>, runtime: Weak<ShellRuntime>) 
             move |ctx: Ctx<'_>, handle: EntityHandle, row: f64| -> JsResult<String> {
                 let state = live_editor(&ctx, &read_row, handle)?;
                 let row = editor_row(&ctx, row)?;
-                scope::with_current_app(|cx| match state.read(cx).row_bounds(row) {
+                scope::with_current(|window, cx| match state
+                    .update(cx, |state, _| {
+                        // Rows below ghost lines move with focus.
+                        state.sync_focus(window);
+                        state.row_bounds(row)
+                    }) {
                     Some((top, height)) => serde_json::json!({
                         "top": f32::from(top),
                         "height": f32::from(height),
