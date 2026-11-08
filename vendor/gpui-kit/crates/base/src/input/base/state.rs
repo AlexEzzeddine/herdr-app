@@ -170,7 +170,8 @@ pub(in crate::input) enum QueuedScroll {
 /// still being sized, or later the window) places it again, so the row the
 /// request was about stays where it asked, until the reader takes over the
 /// view: another scroll (asked for, or the scroll handle moving), a press in
-/// the editor, an edit, or `set_value` ([`InputBaseState::resolve_pending_scroll`]).
+/// the editor, changing the selections (keys, `set_selections`), an edit, or
+/// `set_value` ([`InputBaseState::resolve_pending_scroll`]).
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct SettlingScroll {
     /// The [`QueuedScroll::Row`] or [`QueuedScroll::Caret`] asked for.
@@ -179,6 +180,10 @@ struct SettlingScroll {
     view_height: Pixels,
     /// The scroll the frame that placed it ended at; `None` until painted.
     painted: Option<Point<Pixels>>,
+    /// [`Selections::generation`](super::cursor::Selections::generation)
+    /// when it was placed: selections changed since without a scroll
+    /// (select all reveals nothing) mean the reader has the view.
+    selections: u64,
 }
 
 /// HERDR: a position the frame applying a queued offset reveals
@@ -232,6 +237,32 @@ impl QueuedScroll {
     fn kept_by_set_value(&self) -> bool {
         matches!(self, Self::Offset { api: false, .. })
     }
+}
+
+/// HERDR: whether `built` (clipped, the active selection first) is
+/// `current` ([`InputBaseState::selections`]): then setting it changes
+/// nothing, and a handler that re-applies the selections it read doesn't
+/// close menus, clear the inline completion, break undo coalescing or
+/// scroll. [`InputBaseState::set_selections`] asks twice, against one read
+/// of `current`: for the input as given (the current selections may be
+/// unmerged, e.g. a caret added at a selection's start) and merged. A
+/// caret's side is ignored (it has none scripts can see).
+///
+/// Sorts `built` after the active selection (merged input is usually in
+/// order already: checked before sorting); allocates nothing.
+fn selections_equal(current: &[SelectionRange], built: &mut [CursorSelection]) -> bool {
+    let key = |start: usize, end: usize, reversed: bool| (start, end, reversed && start != end);
+    if current.len() != built.len() {
+        return false;
+    }
+    if let Some(rest) = built.get_mut(1..)
+        && !rest.is_sorted_by_key(|sel| key(sel.start, sel.end, sel.reversed))
+    {
+        rest.sort_unstable_by_key(|sel| key(sel.start, sel.end, sel.reversed));
+    }
+    current.iter().zip(built.iter()).all(|(a, b)| {
+        key(a.range.start, a.range.end, a.reversed) == key(b.start, b.end, b.reversed)
+    })
 }
 
 /// HERDR: the selections as last reported by
@@ -802,7 +833,7 @@ pub struct InputBaseState<M: InputModeKind> {
     selection_report: SelectionReport,
     /// HERDR: the buffer [`Self::take_selection_report`] reads the current
     /// selections into; it swaps with the report's, so neither reallocates.
-    /// [`Self::selections_equal`] borrows it too.
+    /// [`Self::set_selections`] borrows it too.
     selection_scratch: Vec<SelectionRange>,
     /// [`Selections::generation`] when `selection_report` was last
     /// checked: an unchanged generation skips the comparison (cursor blinks
@@ -3793,16 +3824,25 @@ impl<M: InputModeKind> InputBaseState<M> {
                 self.build_selection(active_id, start, end, selection.reversed)
             })
             .collect();
-        if built.is_empty() || self.selections_equal(&mut built) {
+        if built.is_empty() {
             return;
         }
-        // Merged as installing them would, so input that merges into the
-        // current selections (`[0..5, 5..10]` for `0..10`) changes nothing
-        // either.
-        let mut merged = super::cursor::merged(built);
-        if self.selections_equal(&mut merged) {
+        // The current selections are read once, for both checks.
+        let mut current = std::mem::take(&mut self.selection_scratch);
+        self.selections_into(&mut current);
+        let merged = if selections_equal(&current, &mut built) {
+            None
+        } else {
+            // Merged as installing them would, so input that merges into the
+            // current selections (`[0..5, 5..10]` for `0..10`) changes
+            // nothing either.
+            let mut merged = super::cursor::merged(built);
+            (!selections_equal(&current, &mut merged)).then_some(merged)
+        };
+        self.selection_scratch = current;
+        let Some(mut merged) = merged else {
             return;
-        }
+        };
         for sel in merged.iter_mut().skip(1) {
             sel.id = self.selections.generate_id();
         }
@@ -3816,33 +3856,6 @@ impl<M: InputModeKind> InputBaseState<M> {
         let id = self.selections.active().id;
         self.reveal_caret(id, focused, true, cx);
         cx.notify();
-    }
-
-    /// HERDR: whether `built` (clipped, the active selection first) is what
-    /// the selections already are, in [`Self::selections`] order: then
-    /// setting them changes nothing, and a handler that re-applies the
-    /// selections it read doesn't close menus, clear the inline completion,
-    /// break undo coalescing or scroll. [`Self::set_selections`] asks twice:
-    /// for the input as given (the current selections may be unmerged, e.g.
-    /// a caret added at a selection's start) and merged. A caret's side is
-    /// ignored (it has none scripts can see).
-    ///
-    /// Sorts `built` after the active selection and reads the current
-    /// selections into the reused `selection_scratch`, so it allocates
-    /// nothing.
-    fn selections_equal(&mut self, built: &mut [CursorSelection]) -> bool {
-        let key = |start: usize, end: usize, reversed: bool| (start, end, reversed && start != end);
-        if let Some(rest) = built.get_mut(1..) {
-            rest.sort_unstable_by_key(|sel| key(sel.start, sel.end, sel.reversed));
-        }
-        let mut current = std::mem::take(&mut self.selection_scratch);
-        self.selections_into(&mut current);
-        let equal = current.len() == built.len()
-            && current.iter().zip(built.iter()).all(|(a, b)| {
-                key(a.range.start, a.range.end, a.reversed) == key(b.start, b.end, b.reversed)
-            });
-        self.selection_scratch = current;
-        equal
     }
 
     /// A selection over clipped `start..end`, with its caret side and the
@@ -4079,15 +4092,24 @@ impl<M: InputModeKind> InputBaseState<M> {
         if let Some(settling) = self.settling_scroll
             && let Some(painted) = settling.painted
         {
-            if self.queued_scroll.is_some() || self.scroll_handle.offset() != painted {
-                // Something else scrolled since: it no longer applies.
+            if self.queued_scroll.is_some()
+                || self.scroll_handle.offset() != painted
+                || self.selections.generation() != settling.selections
+            {
+                // Something else scrolled, or a caret moved, since: it no
+                // longer applies.
                 self.settling_scroll = None;
             } else if settling.view_height != view_height {
                 self.queued_scroll = Some(settling.request);
             }
         }
         let request = self.queued_scroll.filter(|queued| queued.is_pending())?;
-        self.settling_scroll = Some(SettlingScroll { request, view_height, painted: None });
+        self.settling_scroll = Some(SettlingScroll {
+            request,
+            view_height,
+            painted: None,
+            selections: self.selections.generation(),
+        });
         self.queued_scroll = self.placed_offset(request, line_height, view_height, focused);
         Some(request)
     }
@@ -4202,7 +4224,8 @@ impl<M: InputModeKind> InputBaseState<M> {
     /// Where buffer `row` sits vertically, relative to the top of the visible
     /// text area: `(top, height)`. `top` is negative or past the viewport when
     /// the row is scrolled out of view; a soft-wrapped row is taller than one
-    /// line. `None` before the first layout or when a fold hides the row.
+    /// line. `None` before the first layout, for a row past the last one, or
+    /// when a fold hides the row.
     /// A scroll queued earlier in the same handler (`scroll_to_row`, a caret
     /// reveal) is already counted. Reads focus from `window`: rows below
     /// ghost lines, drawn only while focused, move with it.

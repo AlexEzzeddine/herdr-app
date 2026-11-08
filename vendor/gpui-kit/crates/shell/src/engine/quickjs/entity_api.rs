@@ -683,7 +683,7 @@ pub fn install(ctx: &Ctx<'_>, module: &Object<'_>, runtime: Weak<ShellRuntime>) 
                         gutter: color(&item.gutter)?,
                     });
                 }
-                scope::with_current(|_, cx| {
+                scope::with_current_app(|cx| {
                     state.update(cx, |state, cx| state.set_line_decorations(key, decorations, cx))
                 })
                 .ok_or_else(|| needs_call(&ctx, "set_line_decorations()"))

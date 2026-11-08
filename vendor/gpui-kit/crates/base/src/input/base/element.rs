@@ -4449,6 +4449,79 @@ mod tests {
         }
     }
 
+    // HERDR: a key that changes the selections without revealing the caret
+    // (select all) scrolls nothing, but the reader has the view now: a
+    // resize after it leaves the scroll alone instead of placing the early
+    // scroll's row again. (Keys that move the caret reveal it, which queues
+    // an offset even when the caret is in view, and that already ends it.)
+    #[gpui::test]
+    fn a_selection_changed_by_a_key_ends_an_early_scroll(cx: &mut TestAppContext) {
+        cx.update(crate::init);
+        let height = Rc::new(std::cell::Cell::new(px(0.)));
+        let mut editor = None;
+        let window = cx.open_window(size(px(240.), px(200.)), {
+            let height = height.clone();
+            |window, cx| {
+                let state = cx.new(|cx| {
+                    let mut state =
+                        EditorState::new(window, cx).soft_wrap(false).default_value(sixty_lines("line"));
+                    state.scroll_to_row(40, crate::input::RowScrollAlign::Center, window, cx);
+                    state
+                });
+                editor = Some(state.clone());
+                SizedHarness(state, height)
+            }
+        });
+        let editor = editor.unwrap();
+        let mut cx = VisualTestContext::from_window(window.into(), cx);
+        height.set(px(100.));
+        cx.update(|window, cx| {
+            editor.update(cx, |state, cx| state.focus(window, cx));
+            window.draw(cx).clear(cx);
+        });
+        let before = editor.read_with(&cx, |state, _| state.scroll_offset());
+        cx.simulate_keystrokes(if cfg!(target_os = "macos") { "cmd-a" } else { "ctrl-a" });
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        editor.read_with(&cx, |state, _| {
+            assert_eq!(state.selected_range(), 0..state.text.len(), "the key selected all");
+            assert_eq!(state.scroll_offset(), before, "nothing scrolled");
+        });
+        height.set(px(180.));
+        cx.update(|window, cx| {
+            window.refresh();
+            window.draw(cx).clear(cx);
+        });
+        let view = editor.read_with(&cx, |state, _| state.last_bounds.unwrap().size.height);
+        assert!(view > px(150.), "the view grew ({view:?})");
+        assert_eq!(
+            editor.read_with(&cx, |state, _| state.scroll_offset()),
+            before,
+            "the scroll stays where it was"
+        );
+    }
+
+    // HERDR: a caret set by code clears the inline completion before it is
+    // revealed, and ghost lines are drawn at the active caret's own row, so
+    // a revealed caret and `row_bounds` never disagree about ghost lines.
+    #[gpui::test]
+    fn a_caret_set_under_a_completion_lands_where_row_bounds_says(cx: &mut TestAppContext) {
+        let (editor, window) = decoration_editor(cx, &sixty_lines("line"), false);
+        let mut cx = VisualTestContext::from_window(window.into(), cx);
+        focus_and_draw(&editor, &mut cx);
+        let queued = editor.update_in(&mut cx, |state, window, cx| {
+            show_inline_completion(state, 10, 3, cx);
+            let start = state.text.line_start_offset(40);
+            state.set_selections(vec![sel(start..start, false)], window, cx);
+            assert!(state.extras.inline_completion.item.is_none(), "the completion is cleared");
+            let view = state.last_bounds.unwrap().size.height;
+            let (top, height) = state.row_bounds(40, window).expect("row 40");
+            assert!(top >= px(0.) && top + height <= view, "row 40 shows: {top:?}");
+            state.queued_scroll_offset(window)
+        });
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        assert_eq!(editor.read_with(&cx, |state, _| state.scroll_offset()).y, queued.y);
+    }
+
     // HERDR: writing the active selection with the value it already has
     // (a click's `reversed = false`) isn't a selection change: the report
     // check stays one integer compare.
