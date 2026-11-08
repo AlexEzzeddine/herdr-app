@@ -321,14 +321,19 @@ pub(super) struct RowSpan {
 /// HERDR: the horizontal scroll that shows a caret `caret_x` from the
 /// text's left edge in a `view_width` view now scrolled to `scroll_x`,
 /// keeping the margin `text_align` asks for. Shared by
-/// [`InputBaseState::scroll_to_with_padding`] and the code-caret reveal in
-/// `TextElement::layout_cursors`, so revealing a caret before and after its
-/// line is shaped lands in the same place.
+/// [`InputBaseState::scroll_to_with_padding`], the code-caret reveal and
+/// the cursor-follow in `TextElement::layout_cursors`, so revealing a caret
+/// before and after its line is shaped lands in the same place.
+///
+/// `left_margin`: keep the margin at the left edge too, as upstream's
+/// `scroll_to` does. Upstream's cursor-follow keeps none there (a caret
+/// followed past the left edge sits on it), and passes `false`.
 pub(super) fn reveal_x(
     caret_x: Pixels,
     scroll_x: Pixels,
     view_width: Pixels,
     text_align: TextAlign,
+    left_margin: bool,
 ) -> Pixels {
     // For Right alignment use 0 margin: the cursor indicator is clamped inside
     // bounds in layout_cursors, so shifting the text here would cause a
@@ -338,8 +343,9 @@ pub(super) fn reveal_x(
         TextAlign::Right => px(0.),
         TextAlign::Center => CURSOR_WIDTH,
     };
-    if caret_x - margin < -scroll_x {
-        (-caret_x + margin).min(px(0.))
+    let left = if left_margin { margin } else { px(0.) };
+    if caret_x - left < -scroll_x {
+        (-caret_x + left).min(px(0.))
     } else if caret_x + margin > -scroll_x + view_width {
         -(caret_x - view_width + margin)
     } else {
@@ -753,16 +759,16 @@ impl<M: InputModeKind> TextElement<M> {
                 let selection_changed = state.last_selected_range != Some(selected_range);
                 let auto_scrolling = state.auto_scroll.is_active();
                 if selection_changed && !is_selected_all {
-                    // HERDR: the one horizontal reveal rule, shared with
-                    // `scroll_to_with_padding` and the code-caret reveal below,
-                    // so a caret followed after typing and one revealed by
-                    // code or keys land in the same place (upstream's copy
-                    // kept no margin at the left edge).
+                    // HERDR: the horizontal reveal rule shared with
+                    // `scroll_to_with_padding` and the code-caret reveal
+                    // below, keeping upstream's cursor-follow edge: no
+                    // margin at the left, so every input scrolls as before.
                     scroll_offset.x = reveal_x(
                         cursor_pos.x,
                         scroll_offset.x,
                         bounds.size.width - line_number_width,
                         last_layout.text_align,
+                        false,
                     );
 
                     // Vertical cursor-follow is suppressed while auto-scroll manages the y axis,
@@ -843,6 +849,7 @@ impl<M: InputModeKind> TextElement<M> {
                         scroll_offset.x,
                         bounds.size.width - line_number_width,
                         last_layout.text_align,
+                        true,
                     );
                 }
             }
@@ -3913,10 +3920,11 @@ mod tests {
     }
 
     // HERDR: a caret followed past the left edge by layout's cursor-follow
-    // (no `scroll_to`: a click, typing) keeps the margin a reveal by code or
-    // keys keeps (`reveal_x`), instead of sitting on the edge.
+    // (no `scroll_to`: a click, typing) sits on the edge, as upstream's
+    // cursor-follow always has: sharing `reveal_x` changes no input's
+    // scrolling.
     #[gpui::test]
-    fn a_caret_followed_past_the_left_edge_keeps_the_reveal_margin(cx: &mut TestAppContext) {
+    fn a_caret_followed_past_the_left_edge_sits_on_it(cx: &mut TestAppContext) {
         let (text, target) = text_with_a_far_column();
         let (editor, window) = decoration_editor(cx, &text, false);
         let mut cx = VisualTestContext::from_window(window.into(), cx);
@@ -3936,7 +3944,7 @@ mod tests {
             let cursor = layout.cursor_bounds.expect("the caret is drawn");
             let text_left = state.input_bounds.left() + layout.line_number_width;
             let gap = cursor.left() - text_left;
-            assert!((gap - RIGHT_MARGIN).abs() < px(0.5), "the caret keeps the margin: {gap:?}");
+            assert!(gap.abs() < px(0.5), "the caret sits on the edge: {gap:?}");
         });
     }
 
@@ -5179,6 +5187,60 @@ mod tests {
                 assert!(top >= px(0.) && top + height <= view, "caret {caret}: row 40 shows");
             });
         }
+    }
+
+    // HERDR: an upstream reveal before the first layout queues nothing (as
+    // upstream), so it doesn't drop a row scroll waiting for that layout.
+    #[gpui::test]
+    fn an_upstream_reveal_before_layout_keeps_a_waiting_row_scroll(cx: &mut TestAppContext) {
+        cx.update(crate::init);
+        let text = sixty_lines("line");
+        let mut editor = None;
+        let window = cx.open_window(size(px(240.), px(140.)), |window, cx| {
+            let state = cx.new(|cx| {
+                let mut state = EditorState::new(window, cx).soft_wrap(false).default_value(text);
+                state.scroll_to_row(40, crate::input::RowScrollAlign::Top, window, cx);
+                // `move_to` reveals the caret through `scroll_to`.
+                state.set_selected_range(3..3, cx);
+                state
+            });
+            editor = Some(state.clone());
+            DecorationHarness(state)
+        });
+        let editor = editor.unwrap();
+        let mut cx = VisualTestContext::from_window(window.into(), cx);
+        editor.update_in(&mut cx, |state, window, _| {
+            let (top, _) = state.row_bounds(40, window).unwrap();
+            assert!(top.abs() < px(0.5), "row 40 is at the top: {top:?}");
+        });
+    }
+
+    // HERDR: upstream's `add_selection` before the first layout reveals
+    // nothing, as upstream: no caret scroll waits for the layout, so the
+    // first frame isn't moved to it, a resize doesn't place it again and
+    // `set_value` has nothing to drop.
+    #[gpui::test]
+    fn upstream_add_selection_before_layout_queues_no_scroll(cx: &mut TestAppContext) {
+        cx.update(crate::init);
+        let text = sixty_lines("line");
+        let target = text.find("line 40").unwrap();
+        let mut editor = None;
+        let window = cx.open_window(size(px(240.), px(140.)), |window, cx| {
+            let state = cx.new(|cx| {
+                let mut state = EditorState::new(window, cx).soft_wrap(false).default_value(text);
+                state.add_selection(target..target, cx);
+                assert_eq!(state.queued_scroll, None, "nothing waits for the layout");
+                state
+            });
+            editor = Some(state.clone());
+            DecorationHarness(state)
+        });
+        let editor = editor.unwrap();
+        let cx = VisualTestContext::from_window(window.into(), cx);
+        editor.read_with(&cx, |state, _| {
+            assert_eq!(state.selections().len(), 2, "the selection is added");
+            assert!(state.last_layout.as_ref().unwrap().visible_range.contains(&0), "still at the top");
+        });
     }
 
     // HERDR: a completion replaced in the same handler is measured with its

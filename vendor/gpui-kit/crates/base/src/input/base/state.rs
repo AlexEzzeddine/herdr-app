@@ -192,6 +192,19 @@ pub(in crate::input) enum RevealX {
     Offset(usize),
 }
 
+/// HERDR: who asked [`InputBaseState::reveal_offset`] for a reveal.
+#[derive(Clone, Copy, Debug)]
+enum RevealBy {
+    /// Keys, mouse, search: reveal the offset; `set_value` keeps it.
+    Upstream,
+    /// Selection `id`'s caret; `api`: through the HERDR API
+    /// ([`QueuedScroll::Offset`]).
+    Caret {
+        id: super::selection::CursorId,
+        api: bool,
+    },
+}
+
 impl QueuedScroll {
     /// The offset the next paint applies; `None` while waiting for layout.
     fn offset(&self) -> Option<Point<Pixels>> {
@@ -240,6 +253,10 @@ struct SelectionReport {
     /// alone, so an offset at or before it has the same script position in
     /// both texts.
     edit_floor: usize,
+    /// The selections after the active one have non-decreasing ends (they
+    /// always do once merged), so [`Self::record_edit`] can binary-search
+    /// them.
+    ends_sorted: bool,
 }
 
 impl SelectionReport {
@@ -247,15 +264,39 @@ impl SelectionReport {
     /// it is about to change): record the position of each reported end
     /// past `start` not recorded yet. Those ends are at or before the old
     /// floor, where `text_before` still matches the reported text.
+    ///
+    /// Only selections with an end in `start..=floor` are visited: the
+    /// selections after the active one are in document order, so a
+    /// multi-cursor edit (applied from the last caret back) records each
+    /// end once over the batch instead of rescanning them all per edit.
     fn record_edit(&mut self, text_before: &Rope, start: usize) {
-        if start >= self.edit_floor {
+        let floor = self.edit_floor;
+        if start >= floor {
             return;
         }
-        let ends = self.selections.iter().flat_map(|sel| [sel.range.start, sel.range.end]);
-        for (offset, position) in ends.zip(&mut self.positions) {
-            if position.is_none() && offset > start {
-                *position = Some(script_position(text_before, offset));
+        let mut record = |index: usize, sel: &SelectionRange| {
+            for (offset, position) in
+                [sel.range.start, sel.range.end].into_iter().zip(&mut self.positions[index * 2..])
+            {
+                if position.is_none() && offset > start {
+                    *position = Some(script_position(text_before, offset));
+                }
             }
+        };
+        let Some((active, rest)) = self.selections.split_first() else {
+            self.edit_floor = start;
+            return;
+        };
+        record(0, active);
+        // Sorted by start, so the first selection starting past the old
+        // floor ends the range: its ends were recorded by an earlier edit.
+        // Merged selections don't overlap, so their ends are sorted too;
+        // `ends_sorted` guards the binary search for the lower bound.
+        let last = rest.partition_point(|sel| sel.range.start <= floor);
+        let first =
+            if self.ends_sorted { rest[..last].partition_point(|sel| sel.range.end <= start) } else { 0 };
+        for (index, sel) in rest[first..last].iter().enumerate() {
+            record(first + index + 1, sel);
         }
         self.edit_floor = start;
     }
@@ -313,8 +354,10 @@ pub enum InputEvent {
     /// The view scrolled (by the user, by code, or to follow the caret).
     /// Emitted after the frame that applied it, so layout reads are current.
     Scroll,
-    /// A left or right press in the line-number gutter, outside a fold
-    /// chevron. The press still places the caret as usual.
+    /// A left or right press in the line-number gutter. A left press on a
+    /// fold chevron folds instead and isn't reported; the chevron ignores a
+    /// right press, which is reported for its row. The press still places
+    /// the caret as usual.
     GutterClick {
         /// 0-based buffer row.
         row: usize,
@@ -759,6 +802,7 @@ pub struct InputBaseState<M: InputModeKind> {
     selection_report: SelectionReport,
     /// HERDR: the buffer [`Self::take_selection_report`] reads the current
     /// selections into; it swaps with the report's, so neither reallocates.
+    /// [`Self::selections_equal`] borrows it too.
     selection_scratch: Vec<SelectionRange>,
     /// [`Selections::generation`] when `selection_report` was last
     /// checked: an unchanged generation skips the comparison (cursor blinks
@@ -1102,6 +1146,7 @@ impl<M: InputModeKind> InputBaseState<M> {
                 selections: Vec::new(),
                 positions: Vec::new(),
                 edit_floor: usize::MAX,
+                ends_sorted: true,
             },
             selection_scratch: Vec::new(),
             reported_selections_generation: 0,
@@ -2934,26 +2979,31 @@ impl<M: InputModeKind> InputBaseState<M> {
         // Upstream paths (keys, mouse, search) run in a painted editor:
         // measure ghost lines with the focus that frame was drawn with.
         let focused = self.painted_focus();
-        self.reveal_offset(offset, direction, padding, focused, cx);
+        self.reveal_offset(offset, direction, padding, focused, RevealBy::Upstream, cx);
     }
 
     /// HERDR: [`Self::scroll_to_with_padding`], measuring ghost lines (drawn
-    /// only while focused) as an editor that is `focused` draws them.
+    /// only while focused) as an editor that is `focused` draws them. `by`
+    /// decides what the queued offset reveals sideways and whether
+    /// `set_value` keeps it.
     fn reveal_offset(
         &mut self,
         offset: usize,
         direction: Option<MoveDirection>,
         padding: ScrollPadding,
         focused: bool,
+        by: RevealBy,
         cx: &mut Context<Self>,
     ) {
-        // The newest scroll request wins over one kept for after layout
-        // (before layout the caret-follow in paint reveals this offset).
-        self.drop_pending_scroll();
-        let Some(last_layout) = self.last_layout.as_ref() else {
+        // Without a layout this queues nothing, as upstream: a row or caret
+        // scroll waiting for the first layout stays.
+        if self.last_layout.is_none() || self.last_bounds.is_none() {
             return;
-        };
-        let Some(bounds) = self.last_bounds.as_ref() else {
+        }
+        // The newest scroll request wins over one kept for after layout.
+        self.drop_pending_scroll();
+        let (Some(last_layout), Some(bounds)) = (self.last_layout.as_ref(), self.last_bounds.as_ref())
+        else {
             return;
         };
 
@@ -2983,6 +3033,7 @@ impl<M: InputModeKind> InputBaseState<M> {
                     scroll_offset.x,
                     bounds.size.width - last_layout.line_number_width,
                     last_layout.text_align,
+                    true,
                 );
                 measured_x = true;
             }
@@ -3029,9 +3080,13 @@ impl<M: InputModeKind> InputBaseState<M> {
         // frame that applies this scroll reveals it horizontally, rather than
         // drawing at this offset's x instead of its own cursor-follow. A
         // measured column replaces an older target, which would undo it.
-        let reveal_x = (!measured_x).then(|| self.reveal_x_target(offset));
-        self.queued_scroll =
-            Some(QueuedScroll::Offset { offset: scroll_offset, reveal_x, api: false });
+        // A caret reveal always names its caret, which follows edits made
+        // before that frame.
+        let (reveal_x, api) = match by {
+            RevealBy::Upstream => ((!measured_x).then(|| self.reveal_x_target(offset)), false),
+            RevealBy::Caret { id, api } => (Some(RevealX::Caret(id)), api),
+        };
+        self.queued_scroll = Some(QueuedScroll::Offset { offset: scroll_offset, reveal_x, api });
         cx.notify();
     }
 
@@ -3732,18 +3787,21 @@ impl<M: InputModeKind> InputBaseState<M> {
             }
             return;
         }
-        let mut built: Vec<CursorSelection> = Vec::with_capacity(selections.len());
-        for (index, selection) in selections.into_iter().enumerate() {
-            let (start, end) = self.clip_selection_range(selection.range);
-            let id = if index == 0 {
-                self.selections.active().id
-            } else {
-                self.selections.generate_id()
-            };
-            built.push(self.build_selection(id, start, end, selection.reversed));
-        }
-        if built.is_empty() || self.selections_equal(&built) {
+        // Every selection is built with the active id first: new ids are
+        // handed out only once they are known to change something.
+        let active_id = self.selections.active().id;
+        let mut built: Vec<CursorSelection> = selections
+            .into_iter()
+            .map(|selection| {
+                let (start, end) = self.clip_selection_range(selection.range);
+                self.build_selection(active_id, start, end, selection.reversed)
+            })
+            .collect();
+        if built.is_empty() || self.selections_equal(&mut built) {
             return;
+        }
+        for sel in built.iter_mut().skip(1) {
+            sel.id = self.selections.generate_id();
         }
 
         self.begin_programmatic_selection(cx);
@@ -3764,17 +3822,23 @@ impl<M: InputModeKind> InputBaseState<M> {
     /// break undo coalescing or scroll. The current selections are already
     /// merged, so equal ones need no merging either. A caret's side is
     /// ignored (it has none scripts can see).
-    fn selections_equal(&self, built: &[CursorSelection]) -> bool {
-        let key = |sel: &SelectionRange| {
-            (sel.range.start, sel.range.end, sel.reversed && !sel.range.is_empty())
-        };
-        let mut wanted: Vec<_> = built.iter().map(Self::selection_range).collect();
-        if let Some(rest) = wanted.get_mut(1..) {
-            rest.sort_unstable_by_key(key);
+    ///
+    /// Sorts `built` after the active selection, as merging would, and
+    /// reads the current selections into the reused `selection_scratch`,
+    /// so a check that finds nothing changed allocates nothing.
+    fn selections_equal(&mut self, built: &mut [CursorSelection]) -> bool {
+        let key = |start: usize, end: usize, reversed: bool| (start, end, reversed && start != end);
+        if let Some(rest) = built.get_mut(1..) {
+            rest.sort_unstable_by_key(|sel| key(sel.start, sel.end, sel.reversed));
         }
-        let current = self.selections();
-        current.len() == wanted.len()
-            && current.iter().zip(&wanted).all(|(a, b)| key(a) == key(b))
+        let mut current = std::mem::take(&mut self.selection_scratch);
+        self.selections_into(&mut current);
+        let equal = current.len() == built.len()
+            && current.iter().zip(built.iter()).all(|(a, b)| {
+                key(a.range.start, a.range.end, a.reversed) == key(b.start, b.end, b.reversed)
+            });
+        self.selection_scratch = current;
+        equal
     }
 
     /// A selection over clipped `start..end`, with its caret side and the
@@ -3832,6 +3896,8 @@ impl<M: InputModeKind> InputBaseState<M> {
     /// which may be off screen now. Ghost lines are measured as an editor
     /// that is `focused` draws them.
     /// `api`: asked for through the HERDR API ([`QueuedScroll::Offset`]).
+    /// Only an API reveal waits for a usable layout: upstream's
+    /// `add_selection` revealed nothing before one, and still doesn't.
     fn reveal_caret(
         &mut self,
         id: super::selection::CursorId,
@@ -3839,16 +3905,12 @@ impl<M: InputModeKind> InputBaseState<M> {
         api: bool,
         cx: &mut Context<Self>,
     ) {
-        if !self.has_usable_layout() {
+        if api && !self.has_usable_layout() {
             self.queued_scroll = Some(QueuedScroll::Caret(id));
             return;
         }
-        self.reveal_offset(self.caret_of(id), None, ScrollPadding::Minimal, focused, cx);
-        if let Some(QueuedScroll::Offset { reveal_x, api: queued_api, .. }) = &mut self.queued_scroll
-        {
-            *reveal_x = Some(RevealX::Caret(id));
-            *queued_api = api;
-        }
+        let by = RevealBy::Caret { id, api };
+        self.reveal_offset(self.caret_of(id), None, ScrollPadding::Minimal, focused, by, cx);
     }
 
     /// Scroll so buffer `row` (0-based, clamped to the document) is in view.
@@ -4283,6 +4345,10 @@ impl<M: InputModeKind> InputBaseState<M> {
         report.positions.clear();
         report.positions.resize(report.selections.len() * 2, None);
         report.edit_floor = usize::MAX;
+        report.ends_sorted = report
+            .selections
+            .get(1..)
+            .is_none_or(|rest| rest.is_sorted_by_key(|sel| sel.range.end));
         changed
     }
 
@@ -8847,6 +8913,53 @@ mod tests {
             // "éab\ncd\nxef": (1, 1) is byte 6, (2, 1) byte 9.
             state.set_selected_range(6..9, cx);
             assert!(!state.take_selection_report(), "same script positions");
+        });
+    }
+
+    /// HERDR: `set_selections` with the current selections hands out no
+    /// new selection ids: ids are assigned once the check finds a change.
+    #[gpui::test]
+    fn setting_the_same_selections_uses_no_ids(cx: &mut TestAppContext) {
+        let input_view = InputView::build_textarea(cx, |state| state.default_value("ab\ncd\nef"));
+        let mut cx = VisualTestContext::from_window(input_view.window_handle.into(), cx);
+        input_view.input.update_in(&mut cx, |state, window, cx| {
+            let caret = |at: usize| SelectionRange { range: at..at, reversed: false };
+            state.set_selections(vec![caret(4), caret(7), caret(1)], window, cx);
+            let before = state.selections.generate_id();
+            state.set_selections(vec![caret(4), caret(1), caret(7)], window, cx);
+            let after = state.selections.generate_id();
+            // `CursorId`'s number is private to its module: read it from Debug.
+            let number = |id| format!("{id:?}").trim_matches(|c: char| !c.is_ascii_digit()).parse::<usize>().unwrap();
+            assert_eq!(number(after), number(before) + 1, "no ids used");
+            state.set_selections(vec![caret(4), caret(1)], window, cx);
+            assert_eq!(state.selections().len(), 2, "a different set still applies");
+        });
+    }
+
+    /// HERDR: a multi-cursor batch of edits, applied from the last caret
+    /// back, records each caret once at the first edit before it; carets
+    /// past an earlier edit are skipped, not rescanned.
+    #[gpui::test]
+    fn a_batch_of_edits_records_each_caret_once(cx: &mut TestAppContext) {
+        let input_view = InputView::build_textarea(cx, |state| state.default_value("ab\ncd\nef"));
+        let mut cx = VisualTestContext::from_window(input_view.window_handle.into(), cx);
+        input_view.input.update_in(&mut cx, |state, window, cx| {
+            let caret = |at: usize| SelectionRange { range: at..at, reversed: false };
+            // Active (1, 1), then (0, 1) and (2, 1): reported in that order.
+            state.set_selections(vec![caret(4), caret(1), caret(7)], window, cx);
+            state.take_selection_report();
+            assert!(state.selection_report.ends_sorted);
+            state.replace_text_in_range(Some(6..6), "x", window, cx);
+            let none = None;
+            let row = |r: usize| Some((r, 1));
+            assert_eq!(state.selection_report.positions, vec![none, none, none, none, row(2), row(2)]);
+            state.replace_text_in_range(Some(3..3), "x", window, cx);
+            assert_eq!(state.selection_report.positions, vec![row(1), row(1), none, none, row(2), row(2)]);
+            state.replace_text_in_range(Some(0..0), "x", window, cx);
+            assert_eq!(state.selection_report.positions, vec![row(1), row(1), row(0), row(0), row(2), row(2)]);
+            // "xab\nxcd\nxef": the same carets one column on are a change.
+            state.set_selections(vec![caret(6), caret(2), caret(10)], window, cx);
+            assert!(state.take_selection_report(), "every caret moved a column");
         });
     }
 
