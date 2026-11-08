@@ -144,10 +144,11 @@ pub(in crate::input) enum QueuedScroll {
     /// (`scroll_to_row`, `set_scroll_offset`). Replacing the text drops a
     /// reveal, which points into the old text, but keeps a code scroll.
     ///
-    /// `then_caret`: once this offset is painted, reveal this selection's
-    /// caret horizontally as well. Set when a [`Self::Caret`] is resolved
-    /// in the first prepaint, where the line height is known but the caret's
-    /// line isn't shaped yet.
+    /// `then_caret`: the frame that applies this offset also reveals this
+    /// selection's caret horizontally, once its line is shaped at the new
+    /// vertical scroll (`TextElement::layout_cursors`). Set by every caret
+    /// reveal: a caret whose row the last frame didn't lay out (or the
+    /// first frame, before any layout) has no measurable column until then.
     Offset {
         offset: Point<Pixels>,
         reveal: bool,
@@ -164,25 +165,15 @@ pub(in crate::input) enum QueuedScroll {
     Caret(super::selection::CursorId),
 }
 
-/// HERDR: one selection as [`InputEvent::SelectionChange`] compares it:
-/// [`script_position`] of each end.
+/// HERDR: one selection as scripts read it, which is what
+/// [`InputEvent::SelectionChange`] compares: [`script_position`] of each
+/// end, and the caret's side only where scripts can see it (a non-empty
+/// selection; a caret's head is its start and its end).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct ReportedSelection {
     start: (usize, usize),
     end: (usize, usize),
     reversed: bool,
-}
-
-/// HERDR: the selections as [`InputEvent::SelectionChange`] last reported
-/// them.
-#[derive(Debug, Default)]
-struct SelectionReport {
-    /// In [`InputBaseState::selections`] order.
-    ranges: Vec<SelectionRange>,
-    /// `ranges` as scripts see them, in the same order.
-    positions: Vec<ReportedSelection>,
-    /// `document_revision` the positions were measured on.
-    revision: u64,
 }
 
 /// HERDR: `(row, col)` of byte `offset`, 0-based, `col` in UTF-16 code
@@ -680,11 +671,9 @@ pub struct InputBaseState<M: InputModeKind> {
     pub(super) emit_events: bool,
 
     _subscriptions: Vec<Subscription>,
-    /// The selections last reported by [`InputEvent::SelectionChange`].
-    reported_selections: SelectionReport,
-    /// Reused for the next comparison, so a selection change doesn't
-    /// allocate.
-    selection_report_scratch: SelectionReport,
+    /// The selections last reported by [`InputEvent::SelectionChange`], in
+    /// [`Self::selections`] order.
+    reported_selections: Vec<ReportedSelection>,
     /// [`Selections::generation`] when `reported_selections` was last
     /// checked: an unchanged generation skips the comparison (cursor blinks
     /// notify without touching the selections).
@@ -1026,19 +1015,11 @@ impl<M: InputModeKind> InputBaseState<M> {
             silent_replace_text: false,
             emit_events: true,
             _subscriptions,
-            reported_selections: SelectionReport {
-                ranges: vec![SelectionRange {
-                    range: 0..0,
-                    reversed: false,
-                }],
-                positions: vec![ReportedSelection {
-                    start: (0, 0),
-                    end: (0, 0),
-                    reversed: false,
-                }],
-                revision: 0,
-            },
-            selection_report_scratch: SelectionReport::default(),
+            reported_selections: vec![ReportedSelection {
+                start: (0, 0),
+                end: (0, 0),
+                reversed: false,
+            }],
             reported_selections_generation: 0,
             _pending_update: false,
             cursor_line_end_affinity: false,
@@ -1353,6 +1334,11 @@ impl<M: InputModeKind> InputBaseState<M> {
             // text there.
             Some(QueuedScroll::Offset { reveal: true, .. } | QueuedScroll::Caret(_)) => {
                 self.queued_scroll = None;
+            }
+            // A code scroll kept by a caret reveal keeps the scroll, not the
+            // old text's caret.
+            Some(QueuedScroll::Offset { reveal: false, ref mut then_caret, .. }) if then_caret.is_some() => {
+                *then_caret = None;
             }
             // A scroll asked for by code (`scroll_to_row`, `set_scroll_offset`)
             // is kept; paint clamps it to the new text, and rows are clamped
@@ -2615,8 +2601,11 @@ impl<M: InputModeKind> InputBaseState<M> {
         // chevron never gets here: the chevron stops it.
         // Reported now, before the early returns below (a tap that reopens
         // the touch menu is still a press on the line number); subscribers
-        // run after this handler, once the caret is placed.
-        if let Some(row) = self.gutter_row_at(event.position) {
+        // run after this handler, once the caret is placed. A disabled
+        // editor still selects text but reports no presses.
+        if !self.disabled
+            && let Some(row) = self.gutter_row_at(event.position)
+        {
             cx.emit(InputEvent::GutterClick {
                 row,
                 button: event.button,
@@ -3517,17 +3506,10 @@ impl<M: InputModeKind> InputBaseState<M> {
 
     /// Every selection, the active (primary) one first, the rest in document
     /// order.
+    /// The one place their order is decided, shared with selection-change
+    /// reports.
     pub fn selections(&self) -> Vec<SelectionRange> {
-        let mut out = Vec::with_capacity(self.selections.len());
-        self.selections_into(&mut out);
-        out
-    }
-
-    /// Fill `out` with [`Self::selections`]: the one place their order is
-    /// decided, shared with selection-change reports.
-    fn selections_into(&self, out: &mut Vec<SelectionRange>) {
-        out.clear();
-        out.extend(self.selections.iter().map(Self::selection_range));
+        let mut out: Vec<_> = self.selections.iter().map(Self::selection_range).collect();
         // The active selection is always first in `self.selections`. Ties
         // on start (a caret at a selection's start, which adding a cursor
         // above or below doesn't merge) are ordered by end, so the order
@@ -3539,6 +3521,7 @@ impl<M: InputModeKind> InputBaseState<M> {
         {
             rest.sort_unstable_by_key(key);
         }
+        out
     }
 
     fn selection_range(sel: &CursorSelection) -> SelectionRange {
@@ -3632,12 +3615,18 @@ impl<M: InputModeKind> InputBaseState<M> {
     }
 
     /// Scroll selection `id`'s caret into view now, or after the first layout.
+    /// The vertical part is known now (later reads see it); the horizontal
+    /// part is finished by the frame that draws the caret's line, which may
+    /// be off screen now.
     fn reveal_caret(&mut self, id: super::selection::CursorId, cx: &mut Context<Self>) {
         if self.last_layout.is_none() || self.last_bounds.is_none() {
             self.queued_scroll = Some(QueuedScroll::Caret(id));
             return;
         }
         self.scroll_to(self.caret_of(id), None, cx);
+        if let Some(QueuedScroll::Offset { then_caret, .. }) = &mut self.queued_scroll {
+            *then_caret = Some(id);
+        }
     }
 
     /// Scroll so buffer `row` (0-based, clamped to the document) is in view.
@@ -3917,34 +3906,23 @@ impl<M: InputModeKind> InputBaseState<M> {
         }
     }
 
+    /// The selections as scripts read them, in [`Self::selections`] order.
+    fn reported_selection_positions(&self) -> Vec<ReportedSelection> {
+        self.selections()
+            .into_iter()
+            .map(|sel| ReportedSelection {
+                start: script_position(&self.text, sel.range.start),
+                end: script_position(&self.text, sel.range.end),
+                reversed: sel.reversed && !sel.range.is_empty(),
+            })
+            .collect()
+    }
+
     /// Whether the selections still match the last report, as scripts
     /// see them.
     #[cfg(test)]
     fn selections_match_reported(&self) -> bool {
-        let mut current = SelectionReport::default();
-        self.selections_into(&mut current.ranges);
-        self.measure_selection_report(&mut current, None);
-        self.reported_selections.positions == current.positions
-    }
-
-    /// Measure `report.ranges` as scripts see them on the current text.
-    /// Positions of `previous` measured on the same text are reused for
-    /// ranges it has at the same index, so moving one caret of many
-    /// converts only that one.
-    fn measure_selection_report(&self, report: &mut SelectionReport, previous: Option<&SelectionReport>) {
-        let previous = previous.filter(|previous| previous.revision == self.document_revision);
-        report.revision = self.document_revision;
-        report.positions.clear();
-        report.positions.extend(report.ranges.iter().enumerate().map(|(index, sel)| {
-            previous
-                .filter(|previous| previous.ranges.get(index) == Some(sel))
-                .map(|previous| previous.positions[index])
-                .unwrap_or_else(|| ReportedSelection {
-                    start: script_position(&self.text, sel.range.start),
-                    end: script_position(&self.text, sel.range.end),
-                    reversed: sel.reversed,
-                })
-        }));
+        self.reported_selection_positions() == self.reported_selections
     }
 
     fn mark_selections_reported(&mut self) {
@@ -3957,21 +3935,9 @@ impl<M: InputModeKind> InputBaseState<M> {
     /// would see them differently from the last report.
     fn take_selection_report(&mut self) -> bool {
         self.reported_selections_generation = self.selections.generation();
-        let mut current = std::mem::take(&mut self.selection_report_scratch);
-        self.selections_into(&mut current.ranges);
-        let same_text = self.reported_selections.revision == self.document_revision;
-        if same_text && current.ranges == self.reported_selections.ranges {
-            self.selection_report_scratch = current;
-            return false;
-        }
-        self.measure_selection_report(&mut current, Some(&self.reported_selections));
-        // On unchanged text, byte offsets and positions map one to one, so
-        // differing ranges are a change without comparing positions.
-        let changed = same_text || current.positions != self.reported_selections.positions;
-        // Kept even when unchanged: the ranges and revision must describe
-        // the current text for the next comparison.
-        std::mem::swap(&mut current, &mut self.reported_selections);
-        self.selection_report_scratch = current;
+        let current = self.reported_selection_positions();
+        let changed = current != self.reported_selections;
+        self.reported_selections = current;
         changed
     }
 
@@ -3985,8 +3951,7 @@ impl<M: InputModeKind> InputBaseState<M> {
     /// silent path calls [`Self::mark_selections_reported`] instead.
     ///
     /// Compared whole, in `selections()` order, so two equal carets can't
-    /// both stand for one reported entry; byte ranges first, and positions
-    /// (UTF-16 conversion) only where the text or a range changed.
+    /// both stand for one reported entry.
     fn report_selection_change(&mut self, cx: &mut Context<Self>) {
         if self.selections.generation() == self.reported_selections_generation {
             return;
@@ -4012,20 +3977,26 @@ impl<M: InputModeKind> InputBaseState<M> {
         });
     }
 
-    /// After a paint: drop the offset it applied, and finish a scroll asked
-    /// for before layout. The first prepaint resolves those
-    /// ([`Self::resolve_scroll_before_layout`]); a caret's horizontal part
-    /// needs its line shaped, and so waits for this paint.
+    /// The caret the next paint reveals horizontally with the queued offset
+    /// (`then_caret`), as a byte offset.
+    pub(super) fn queued_caret_reveal(&self) -> Option<(super::selection::CursorId, usize)> {
+        match self.queued_scroll {
+            Some(QueuedScroll::Offset {
+                then_caret: Some(id),
+                ..
+            }) => Some((id, self.caret_of(id))),
+            _ => None,
+        }
+    }
+
+    /// After a paint: drop the offset it applied (with its caret's
+    /// horizontal reveal, done in that paint). A row or caret still waiting
+    /// here wasn't resolved by the first prepaint (a single-line input), so
+    /// it is applied now.
     pub(super) fn apply_queued_scroll(&mut self, cx: &mut Context<Self>) {
         match self.queued_scroll.take() {
             Some(QueuedScroll::Row(row, align)) => self.scroll_to_row(row, align, cx),
-            Some(
-                QueuedScroll::Caret(id)
-                | QueuedScroll::Offset {
-                    then_caret: Some(id),
-                    ..
-                },
-            ) => self.scroll_to(self.caret_of(id), None, cx),
+            Some(QueuedScroll::Caret(id)) => self.scroll_to(self.caret_of(id), None, cx),
             Some(QueuedScroll::Offset { .. }) | None => {}
         }
     }
@@ -8434,6 +8405,28 @@ mod tests {
             add(state, 5);
             add(state, 5);
             assert!(!state.selections_match_reported());
+        });
+    }
+
+    /// HERDR: a caret's side isn't something scripts can read (its head is
+    /// its start and its end), so flipping it is no change; a non-empty
+    /// selection's side is.
+    #[gpui::test]
+    fn a_caret_flipping_sides_is_no_change(cx: &mut TestAppContext) {
+        let input_view = InputView::build_textarea(cx, |state| state.default_value("alpha beta gamma"));
+        let mut cx = VisualTestContext::from_window(input_view.window_handle.into(), cx);
+        input_view.input.update_in(&mut cx, |state, _, cx| {
+            state.set_selected_range(5..5, cx);
+            state.active_selection_mut().reversed = true;
+            state.take_selection_report();
+            state.active_selection_mut().reversed = false;
+            assert!(state.selections_match_reported());
+            assert!(!state.take_selection_report(), "a caret's side is not reported");
+
+            state.set_selected_range(2..5, cx);
+            state.take_selection_report();
+            state.active_selection_mut().reversed = true;
+            assert!(state.take_selection_report(), "a selection's side is");
         });
     }
 

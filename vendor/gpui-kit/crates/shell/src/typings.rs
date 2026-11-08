@@ -3157,7 +3157,10 @@ const BASE: &str = r#"  /** A row. */
     value(): string;
     /** Programmatic replacement works even in readonly mode. It is silent: it resets the
      * selections to a caret at the start and scrolls to the top without a `change`,
-     * `selection_change` or `scroll`, so read `selections()` / `scroll_position()` after it. */
+     * `selection_change` or `scroll`, so read `selections()` / `scroll_position()` after it.
+     * A scroll asked for earlier in the same handler (`scroll_to_row`) is kept instead of
+     * the reset to the top, so a mod can scroll and then load the file; that scroll is
+     * reported by `scroll` like any other. */
     set_value(value: string): void;
     /** `selection_change`: selections or carets moved, were added or removed; read `selections()`.
      * `scroll`: the view scrolled; `scroll_position()` and `row_bounds()` are current in the handler.
@@ -3166,14 +3169,17 @@ const BASE: &str = r#"  /** A row. */
     /** A press on a line number (a left press on a fold chevron folds instead). The press
      * still places the caret, so dragging down the gutter still selects lines. Presses in the
      * gutter's left padding (where decoration bars paint) are on their row; presses below
-     * the last line or on an inline completion's extra lines report nothing. Needs line numbers. */
+     * the last line or on an inline completion's extra lines report nothing, and neither
+     * does a disabled editor. Needs line numbers. */
     on(event: "gutter_click", handler: (event: GutterClickEvent, cx: Context) => void): boolean;
     /** Replaces the line decorations under `key` (each owner uses its own key, so they
      * don't replace each other); an empty list removes them. Rows are fixed: they don't
      * move with edits, so set them again on `change`. Rows past the end of the text
      * are kept and paint once the text reaches them. Where decorations overlap, later
-     * ones in the list win, and keys apply in alphabetical order, so on a row two keys
-     * color the alphabetically later key wins ("review" over "diff"), whichever was set last. */
+     * ones in the list win, and keys apply in sorted order (by character code, as JS
+     * `sort()` orders them, so every uppercase letter sorts before every lowercase one):
+     * on a row two keys color, the later key wins ("review" over "diff", but "diff" over
+     * "Review"), whichever was set last. */
     set_line_decorations(key: string, decorations: LineDecoration[]): void;
     /** Every selection: the primary one first, then the rest in document order.
      * An empty selection is a caret. `set_value` changes it without a `selection_change`. */

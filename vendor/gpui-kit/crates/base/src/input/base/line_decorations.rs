@@ -53,6 +53,9 @@ pub(crate) struct RowPaint {
 /// painting, so a set costs the number of decorations, not of decorated rows.
 #[derive(Default)]
 pub(crate) struct LineDecorations {
+    /// Applied in key order, later keys winning: byte order, which for
+    /// the UTF-8 keys is code-point order (what scripts are told: JS
+    /// `sort()` order, uppercase before lowercase).
     by_key: BTreeMap<SharedString, KeyDecorations>,
 }
 
@@ -189,6 +192,20 @@ mod tests {
         assert!(!decorations.set("a".into(), vec![LineDecoration::new(0..3).with_background(red)]));
         assert!(decorations.set("b".into(), vec![]));
         assert_eq!(decorations.row(2).unwrap(), RowPaint { background: Some(red), gutter: None });
+    }
+
+    /// The documented order across keys: JS `sort()` order, uppercase
+    /// before lowercase, not the order they were set in.
+    #[test]
+    fn keys_apply_in_sort_order_uppercase_first() {
+        let red = hsla(0., 1., 0.5, 1.);
+        let green = hsla(0.33, 1., 0.5, 1.);
+        let mut decorations = LineDecorations::default();
+        decorations.set("diff".into(), vec![LineDecoration::new(0..1).with_background(red)]);
+        decorations.set("Review".into(), vec![LineDecoration::new(0..1).with_background(green)]);
+        assert_eq!(decorations.row(0).unwrap().background, Some(red), "\"diff\" sorts after \"Review\"");
+        decorations.set("review".into(), vec![LineDecoration::new(0..1).with_background(green)]);
+        assert_eq!(decorations.row(0).unwrap().background, Some(green), "\"review\" sorts after \"diff\"");
     }
 
     #[test]
