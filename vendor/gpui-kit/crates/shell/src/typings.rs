@@ -3187,15 +3187,17 @@ const BASE: &str = r#"  /** A row. */
      * into view (after the first layout, if there is none yet). Overlapping ranges merge.
      * Pass `head` (or `start` after `end`) for a backwards selection, so `selections()`
      * round-trips. Throws a `TypeError` when `ranges` is not an array and a `RangeError`
-     * when it is empty (an editor always has a caret: pass an empty range to reset to one). */
+     * when it is empty (an editor always has a caret: pass an empty range to reset to one).
+     * Passing the selections it already has changes nothing (no scroll). */
     set_selections(ranges: EditorRange[]): void;
     /** Adds a selection (like Alt-click), keeping the others. Throws a `TypeError` when
      * `range` is not a single range object. */
     add_selection(range: EditorRange): void;
     /** Scrolls vertically only. Before the first layout the request waits for it, and
-     * while the editor is first being sized (the first half second after it is placed)
-     * it is placed again for each new height, until something else scrolls. A later
-     * `set_value` drops it. Defaults to "nearest". */
+     * after placing it the row stays where it asked across height changes (the pane
+     * being sized, a later resize) until the reader takes over the view: another scroll,
+     * a press in the editor or an edit. A later `set_value` drops it. Defaults to
+     * "nearest". */
     scroll_to_row(row: number, align?: "nearest" | "top" | "center"): void;
     /** Pixels scrolled from the top left, counting a scroll asked for earlier in the same
      * handler (`scroll_to_row`, `set_selections`). Before the first layout `line_height` is

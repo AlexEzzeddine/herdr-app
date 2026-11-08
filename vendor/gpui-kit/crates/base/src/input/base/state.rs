@@ -141,9 +141,17 @@ pub(in crate::input) enum QueuedScroll {
     /// that frame then reveals horizontally, once the line is shaped at the
     /// new vertical scroll (`TextElement::layout_cursors`): a row the last
     /// frame didn't lay out has no measurable column until then.
+    ///
+    /// `api`: asked for through the HERDR selection and scroll API
+    /// ([`InputBaseState::scroll_to_row`], [`InputBaseState::set_selections`],
+    /// [`InputBaseState::add_selection_range`]), which `set_value` drops
+    /// ([`Self::kept_by_set_value`]). Upstream requests (`set_scroll_offset`,
+    /// reveals by keys, mouse, search and `add_selection`) are kept, as
+    /// upstream always has. The latest request decides.
     Offset {
         offset: Point<Pixels>,
         reveal_x: Option<RevealX>,
+        api: bool,
     },
     /// [`InputBaseState::scroll_to_row`] before a usable layout (none yet,
     /// or one with no height), resolved in the first prepaint that has one
@@ -158,22 +166,16 @@ pub(in crate::input) enum QueuedScroll {
 }
 
 /// HERDR: a row or caret scroll asked for before layout, after prepaint
-/// placed it: a change of the view's height within [`SETTLE_FOR`] of that
-/// (a pane still being sized) places it again, unless something else
-/// scrolled ([`InputBaseState::resolve_pending_scroll`]).
-/// HERDR: how long after an early scroll is first placed a new view height
-/// still places it again: long enough for a pane opened with the window to
-/// get its final size, short enough that a later resize (the user's) keeps
-/// what the user is looking at.
-pub(super) const SETTLE_FOR: std::time::Duration = std::time::Duration::from_millis(500);
-
+/// placed it. It stays anchored: every change of the view's height (a pane
+/// still being sized, or later the window) places it again, so the row the
+/// request was about stays where it asked, until the reader takes over the
+/// view: another scroll (asked for, or the scroll handle moving), a press in
+/// the editor, an edit, or `set_value` ([`InputBaseState::resolve_pending_scroll`]).
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct SettlingScroll {
     /// The [`QueuedScroll::Row`] or [`QueuedScroll::Caret`] asked for.
     request: QueuedScroll,
-    /// When it was first placed.
-    placed_at: std::time::Instant,
-    /// The view height it was placed for.
+    /// The view height it was last placed for.
     view_height: Pixels,
     /// The scroll the frame that placed it ended at; `None` until painted.
     painted: Option<Point<Pixels>>,
@@ -210,22 +212,53 @@ impl QueuedScroll {
             Self::Row(..) | Self::Caret(_) => None,
         }
     }
+
+    /// Whether a multi-line `set_value` keeps it: an upstream offset, not a
+    /// request through the HERDR API (always so for a waiting row or caret).
+    /// The new text starts at the top; a caller scrolls after setting it.
+    fn kept_by_set_value(&self) -> bool {
+        matches!(self, Self::Offset { api: false, .. })
+    }
 }
 
 /// HERDR: the selections as last reported by
-/// [`InputEvent::SelectionChange`], kept as byte ranges with the text they
-/// index (a rope clone shares its nodes), and converted to script positions
-/// only where the text has changed since.
+/// [`InputEvent::SelectionChange`], kept as byte ranges. An edit since the
+/// report records the script position of each reported end past it, read
+/// from the text before that edit ([`Self::record_edit`]), so the report
+/// keeps no copy of the old text and converts only ends an edit moved.
 struct SelectionReport {
     /// [`InputBaseState::selections`], with a caret's side cleared: scripts
     /// can't see it (a caret's head is its start and its end).
     selections: Vec<SelectionRange>,
-    text: Rope,
+    /// Two per selection (start, end): the end's script position in the
+    /// reported text, recorded once an edit started before it; `None` for
+    /// an end at or before every edit, whose position is the same in the
+    /// current text.
+    positions: Vec<Option<(usize, usize)>>,
     /// The lowest byte offset any edit since the report started at
     /// (`usize::MAX` for none). Every edit since left the text before it
     /// alone, so an offset at or before it has the same script position in
     /// both texts.
     edit_floor: usize,
+}
+
+impl SelectionReport {
+    /// Before an edit starting at byte `start` of `text_before` (the text
+    /// it is about to change): record the position of each reported end
+    /// past `start` not recorded yet. Those ends are at or before the old
+    /// floor, where `text_before` still matches the reported text.
+    fn record_edit(&mut self, text_before: &Rope, start: usize) {
+        if start >= self.edit_floor {
+            return;
+        }
+        let ends = self.selections.iter().flat_map(|sel| [sel.range.start, sel.range.end]);
+        for (offset, position) in ends.zip(&mut self.positions) {
+            if position.is_none() && offset > start {
+                *position = Some(script_position(text_before, offset));
+            }
+        }
+        self.edit_floor = start;
+    }
 }
 
 /// HERDR: `(row, col)` of byte `offset`, 0-based, `col` in UTF-16 code
@@ -724,6 +757,9 @@ pub struct InputBaseState<M: InputModeKind> {
     _subscriptions: Vec<Subscription>,
     /// The selections last reported by [`InputEvent::SelectionChange`].
     selection_report: SelectionReport,
+    /// HERDR: the buffer [`Self::take_selection_report`] reads the current
+    /// selections into; it swaps with the report's, so neither reallocates.
+    selection_scratch: Vec<SelectionRange>,
     /// [`Selections::generation`] when `selection_report` was last
     /// checked: an unchanged generation skips the comparison (cursor blinks
     /// notify without touching the selections).
@@ -1064,9 +1100,10 @@ impl<M: InputModeKind> InputBaseState<M> {
             _subscriptions,
             selection_report: SelectionReport {
                 selections: Vec::new(),
-                text: Rope::new(),
+                positions: Vec::new(),
                 edit_floor: usize::MAX,
             },
+            selection_scratch: Vec::new(),
             reported_selections_generation: 0,
             reports_selection_changes: false,
             _pending_update: false,
@@ -1232,6 +1269,13 @@ impl<M: InputModeKind> InputBaseState<M> {
     /// the view is scrolled back to the start, so a long value shows its
     /// beginning instead of its tail (matching HTML `<input>`). Multi-line
     /// inputs reset the selection to `0..0`.
+    ///
+    /// HERDR: a multi-line input drops a scroll asked for through
+    /// [`Self::scroll_to_row`], [`Self::set_selections`] or
+    /// [`Self::add_selection_range`] before it, so the new text starts at
+    /// the top; scroll after setting the text. An upstream queued scroll
+    /// (`set_scroll_offset`, a reveal by `add_selection` or the keyboard) is
+    /// kept, as upstream always has.
     pub fn set_value(
         &mut self,
         value: impl Into<super::InputContent>,
@@ -1374,27 +1418,16 @@ impl<M: InputModeKind> InputBaseState<M> {
         self.scroll_handle.set_offset(point(px(0.), px(0.)));
         if self.is_single_line() {
             self.queue_scroll_offset(point(px(0.), px(0.)));
-        }
-        // HERDR: a multi-line input keeps a queued scroll, as upstream
-        // always has; an early scroll placed for the old text is no longer
-        // placed again. Scripts start the new text at the top
-        // ([`Self::set_value_from_top`]).
-        self.settling_scroll = None;
-    }
-
-    /// HERDR: [`Self::set_value`] for scripts: a multi-line input also drops
-    /// any scroll asked for before it, so the new text always starts at the
-    /// top. A script scrolls after setting the text.
-    pub fn set_value_from_top(
-        &mut self,
-        value: impl Into<super::InputContent>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.set_value(value, window, cx);
-        if !self.is_single_line() {
+        } else if self.queued_scroll.is_some_and(|queued| !queued.kept_by_set_value()) {
+            // HERDR: a multi-line input keeps an upstream queued scroll, as
+            // upstream always has, and drops one asked for through the HERDR
+            // API: the new text starts at the top, and the caller scrolls
+            // after setting it ([`QueuedScroll::kept_by_set_value`]).
             self.queued_scroll = None;
         }
+        // HERDR: an early scroll placed for the old text is no longer placed
+        // again.
+        self.settling_scroll = None;
     }
 
     /// Set with disabled mode.
@@ -2642,6 +2675,9 @@ impl<M: InputModeKind> InputBaseState<M> {
             return;
         }
         self.undo_manager.break_transaction_coalescing();
+        // HERDR: the reader has the view now: an early scroll is no longer
+        // placed again on a resize.
+        self.settling_scroll = None;
         // Input has its own text selection; suppress the window-level text
         // selection (Root) so it does not start a drag from here.
         crate::global_state::GlobalState::suppress_text_selection(cx);
@@ -2994,7 +3030,8 @@ impl<M: InputModeKind> InputBaseState<M> {
         // drawing at this offset's x instead of its own cursor-follow. A
         // measured column replaces an older target, which would undo it.
         let reveal_x = (!measured_x).then(|| self.reveal_x_target(offset));
-        self.queued_scroll = Some(QueuedScroll::Offset { offset: scroll_offset, reveal_x });
+        self.queued_scroll =
+            Some(QueuedScroll::Offset { offset: scroll_offset, reveal_x, api: false });
         cx.notify();
     }
 
@@ -3040,8 +3077,18 @@ impl<M: InputModeKind> InputBaseState<M> {
         scroll_y: Pixels,
         focused: bool,
     ) -> Pixels {
-        let ghost_height =
-            self.ghost_block_at(scroll_y, focused).map_or(px(0.), |(_, height)| height);
+        self.scroll_y_min_with(line_height, view_height, self.ghost_block_at(scroll_y, focused))
+    }
+
+    /// HERDR: [`Self::safe_scroll_y_min`] for a frame that draws `ghost`
+    /// (already measured, [`Self::ghost_drawn_at`]).
+    fn scroll_y_min_with(
+        &self,
+        line_height: Pixels,
+        view_height: Pixels,
+        ghost: Option<(usize, Pixels)>,
+    ) -> Pixels {
+        let ghost_height = ghost.map_or(px(0.), |(_, height)| height);
         let content = self.content_height(view_height, line_height, ghost_height);
         (-content + view_height).min(px(0.))
     }
@@ -3307,9 +3354,11 @@ impl<M: InputModeKind> InputBaseState<M> {
         selection_after: Option<CursorSelection>,
     ) -> bool {
         self.document_revision = self.document_revision.wrapping_add(1);
+        // HERDR: an edit ends placing an early scroll again ([`SettlingScroll`]).
+        self.settling_scroll = None;
         // HERDR: `range` is in the text before this edit, whose bytes before
         // `range.start` it leaves alone.
-        self.selection_report.edit_floor = self.selection_report.edit_floor.min(range.start);
+        self.selection_report.record_edit(text, range.start);
         let token_delta = self.edit_tokens(range, new_text.len());
         if self.undo_manager.is_ignoring() {
             return false;
@@ -3560,6 +3609,7 @@ impl<M: InputModeKind> InputBaseState<M> {
                 reversed: false,
             },
             focused,
+            false,
             cx,
         );
     }
@@ -3573,11 +3623,18 @@ impl<M: InputModeKind> InputBaseState<M> {
         cx: &mut Context<Self>,
     ) {
         let focused = self.focus_handle.is_focused(window);
-        self.push_selection(selection, focused, cx);
+        self.push_selection(selection, focused, true, cx);
     }
 
     /// Ghost lines are measured as an editor that is `focused` draws them.
-    fn push_selection(&mut self, selection: SelectionRange, focused: bool, cx: &mut Context<Self>) {
+    /// `api`: called through the HERDR API ([`QueuedScroll::Offset`]).
+    fn push_selection(
+        &mut self,
+        selection: SelectionRange,
+        focused: bool,
+        api: bool,
+        cx: &mut Context<Self>,
+    ) {
         if !self.is_multi_line() {
             // The path `add_selection` has always taken on single-line inputs.
             self.select_range(selection.range, selection.reversed, cx);
@@ -3602,7 +3659,7 @@ impl<M: InputModeKind> InputBaseState<M> {
             .find(|sel| sel.id == id)
             .or_else(|| self.selections.iter().find(|sel| sel.start <= start && end <= sel.end))
             .map_or(id, |sel| sel.id);
-        self.reveal_caret(id, focused, cx);
+        self.reveal_caret(id, focused, api, cx);
         cx.notify();
     }
 
@@ -3620,7 +3677,15 @@ impl<M: InputModeKind> InputBaseState<M> {
     /// The one place their order is decided, shared with selection-change
     /// reports.
     pub fn selections(&self) -> Vec<SelectionRange> {
-        let mut out: Vec<_> = self.selections.iter().map(Self::selection_range).collect();
+        let mut out = Vec::new();
+        self.selections_into(&mut out);
+        out
+    }
+
+    /// [`Self::selections`] into `out` (cleared first), reusing its buffer.
+    fn selections_into(&self, out: &mut Vec<SelectionRange>) {
+        out.clear();
+        out.extend(self.selections.iter().map(Self::selection_range));
         // The active selection is always first in `self.selections`. Ties
         // on start (a caret at a selection's start, which adding a cursor
         // above or below doesn't merge) are ordered by end, so the order
@@ -3632,7 +3697,6 @@ impl<M: InputModeKind> InputBaseState<M> {
         {
             rest.sort_unstable_by_key(key);
         }
-        out
     }
 
     fn selection_range(sel: &CursorSelection) -> SelectionRange {
@@ -3651,6 +3715,8 @@ impl<M: InputModeKind> InputBaseState<M> {
     /// Ranges are clipped and snapped like [`Self::add_selection`];
     /// overlapping ones are merged. Reads focus from `window` for the
     /// reveal: ghost lines, drawn only while focused, move the rows below.
+    /// Selections equal to the current ones change nothing: no scroll, and
+    /// menus and an inline completion stay.
     pub fn set_selections(
         &mut self,
         selections: Vec<SelectionRange>,
@@ -3662,7 +3728,7 @@ impl<M: InputModeKind> InputBaseState<M> {
             // One path for a code-set selection on a single-line input,
             // shared with `add_selection` (`push_selection`).
             if let Some(first) = selections.into_iter().next() {
-                self.push_selection(first, focused, cx);
+                self.push_selection(first, focused, true, cx);
             }
             return;
         }
@@ -3676,7 +3742,7 @@ impl<M: InputModeKind> InputBaseState<M> {
             };
             built.push(self.build_selection(id, start, end, selection.reversed));
         }
-        if built.is_empty() {
+        if built.is_empty() || self.selections_equal(&built) {
             return;
         }
 
@@ -3687,8 +3753,28 @@ impl<M: InputModeKind> InputBaseState<M> {
         // Merging may widen the active selection, so read its caret after.
         self.selections.merge_overlapping();
         let id = self.selections.active().id;
-        self.reveal_caret(id, focused, cx);
+        self.reveal_caret(id, focused, true, cx);
         cx.notify();
+    }
+
+    /// HERDR: whether `built` (clipped, the active selection first) is what
+    /// the selections already are, in [`Self::selections`] order: then
+    /// setting them changes nothing, and a handler that re-applies the
+    /// selections it read doesn't close menus, clear the inline completion,
+    /// break undo coalescing or scroll. The current selections are already
+    /// merged, so equal ones need no merging either. A caret's side is
+    /// ignored (it has none scripts can see).
+    fn selections_equal(&self, built: &[CursorSelection]) -> bool {
+        let key = |sel: &SelectionRange| {
+            (sel.range.start, sel.range.end, sel.reversed && !sel.range.is_empty())
+        };
+        let mut wanted: Vec<_> = built.iter().map(Self::selection_range).collect();
+        if let Some(rest) = wanted.get_mut(1..) {
+            rest.sort_unstable_by_key(key);
+        }
+        let current = self.selections();
+        current.len() == wanted.len()
+            && current.iter().zip(&wanted).all(|(a, b)| key(a) == key(b))
     }
 
     /// A selection over clipped `start..end`, with its caret side and the
@@ -3745,14 +3831,23 @@ impl<M: InputModeKind> InputBaseState<M> {
     /// horizontal part is finished by the frame that draws the caret's line,
     /// which may be off screen now. Ghost lines are measured as an editor
     /// that is `focused` draws them.
-    fn reveal_caret(&mut self, id: super::selection::CursorId, focused: bool, cx: &mut Context<Self>) {
+    /// `api`: asked for through the HERDR API ([`QueuedScroll::Offset`]).
+    fn reveal_caret(
+        &mut self,
+        id: super::selection::CursorId,
+        focused: bool,
+        api: bool,
+        cx: &mut Context<Self>,
+    ) {
         if !self.has_usable_layout() {
             self.queued_scroll = Some(QueuedScroll::Caret(id));
             return;
         }
         self.reveal_offset(self.caret_of(id), None, ScrollPadding::Minimal, focused, cx);
-        if let Some(QueuedScroll::Offset { reveal_x, .. }) = &mut self.queued_scroll {
+        if let Some(QueuedScroll::Offset { reveal_x, api: queued_api, .. }) = &mut self.queued_scroll
+        {
             *reveal_x = Some(RevealX::Caret(id));
+            *queued_api = api;
         }
     }
 
@@ -3762,8 +3857,8 @@ impl<M: InputModeKind> InputBaseState<M> {
     /// Before a usable layout (none yet, or one with no height) the request
     /// is kept and applied once there is one. Reads focus from `window`:
     /// ghost lines, drawn only while focused, move the rows below them.
-    /// A later `set_value` keeps it only as [`Self::set_value`] keeps any
-    /// queued scroll; [`Self::set_value_from_top`] drops it.
+    /// A later `set_value` drops it: the new text starts at the top, so
+    /// scroll after setting the text.
     pub fn scroll_to_row(
         &mut self,
         row: usize,
@@ -3809,6 +3904,7 @@ impl<M: InputModeKind> InputBaseState<M> {
         self.queued_scroll = Some(QueuedScroll::Offset {
             offset: scroll_offset,
             reveal_x,
+            api: true,
         });
         cx.notify();
     }
@@ -3834,7 +3930,11 @@ impl<M: InputModeKind> InputBaseState<M> {
                 let start = self.display_map.buffer_line_to_display_row(row);
                 start..start + 1
             });
-        let (top, height) = self.row_span(row, rows.clone(), line_height, scroll_y, focused);
+        // The completion's ghost block is worked out once; each scroll below
+        // only checks whether that frame draws it.
+        let completion = self.completion_ghost(focused);
+        let ghost_at = |y: Pixels| self.ghost_drawn_at(completion, y);
+        let (top, height) = self.row_span(row, rows.clone(), line_height, ghost_at(scroll_y));
         // The scroll that shows a row drawn at `top` in a view whose top is
         // at `view_top`.
         let target_y = |top: Pixels, view_top: Pixels| -> Option<Pixels> {
@@ -3849,7 +3949,7 @@ impl<M: InputModeKind> InputBaseState<M> {
                 RowScrollAlign::Nearest => return None,
             };
             let y = -target;
-            Some(y.clamp(self.safe_scroll_y_min(line_height, view_height, y, focused), px(0.)))
+            Some(y.clamp(self.scroll_y_min_with(line_height, view_height, ghost_at(y)), px(0.)))
         };
         let mut y = target_y(top, -scroll_y)?;
         // Ghost lines above the row push it down only if the frame at the
@@ -3858,7 +3958,7 @@ impl<M: InputModeKind> InputBaseState<M> {
         // "Nearest" checks that against the view at the target, not the
         // current one: a row the ghost lines hid now may show at the target
         // without them, and is then left where it is.
-        let (top_there, _) = self.row_span(row, rows, line_height, y, focused);
+        let (top_there, _) = self.row_span(row, rows, line_height, ghost_at(y));
         if top_there != top
             && let Some(refined) = target_y(top_there, -y)
         {
@@ -3884,16 +3984,14 @@ impl<M: InputModeKind> InputBaseState<M> {
     /// height has nowhere to place the row: the request keeps waiting. A
     /// first frame can also have a height that is not the final one (a
     /// pane still being sized), so the request is placed again whenever the
-    /// height changes, until another scroll is asked for or the view is
-    /// scrolled, or until [`SETTLE_FOR`] has passed ([`SettlingScroll`]).
-    /// `focused`: whether this frame draws an inline completion's ghost
-    /// lines. `now`: the app's clock.
+    /// height changes, until the reader takes over the view
+    /// ([`SettlingScroll`]). `focused`: whether this frame draws an inline
+    /// completion's ghost lines.
     pub(super) fn resolve_pending_scroll(
         &mut self,
         line_height: Pixels,
         view_height: Pixels,
         focused: bool,
-        now: std::time::Instant,
     ) {
         if self.is_single_line() || view_height <= px(0.) {
             return;
@@ -3901,12 +3999,8 @@ impl<M: InputModeKind> InputBaseState<M> {
         if let Some(settling) = self.settling_scroll
             && let Some(painted) = settling.painted
         {
-            if self.queued_scroll.is_some()
-                || self.scroll_handle.offset() != painted
-                || now.saturating_duration_since(settling.placed_at) >= SETTLE_FOR
-            {
-                // Something else scrolled since, or the pane has long been
-                // sized (a resize now is the user's): it no longer applies.
+            if self.queued_scroll.is_some() || self.scroll_handle.offset() != painted {
+                // Something else scrolled since: it no longer applies.
                 self.settling_scroll = None;
             } else if settling.view_height != view_height {
                 self.queued_scroll = Some(settling.request);
@@ -3919,6 +4013,7 @@ impl<M: InputModeKind> InputBaseState<M> {
                 .map(|y| QueuedScroll::Offset {
                     offset: point(scroll.x, y),
                     reveal_x: None,
+                    api: true,
                 }),
             Some(QueuedScroll::Caret(id)) => {
                 // Vertically as `scroll_to` reveals it (minimal padding); the
@@ -3935,18 +4030,13 @@ impl<M: InputModeKind> InputBaseState<M> {
                 Some(QueuedScroll::Offset {
                     offset: point(scroll.x, y),
                     reveal_x: Some(RevealX::Caret(id)),
+                    api: true,
                 })
             }
             _ => return,
         };
         if let Some(request) = self.queued_scroll {
-            // Placed again: the window still counts from the first placing.
-            let placed_at = self
-                .settling_scroll
-                .filter(|settling| settling.request == request)
-                .map_or(now, |settling| settling.placed_at);
-            self.settling_scroll =
-                Some(SettlingScroll { request, placed_at, view_height, painted: None });
+            self.settling_scroll = Some(SettlingScroll { request, view_height, painted: None });
         }
         self.queued_scroll = resolved;
     }
@@ -4014,14 +4104,15 @@ impl<M: InputModeKind> InputBaseState<M> {
         }
         let rows = self.display_map.buffer_line_to_display_row_range(row)?;
         let scroll_y = self.next_scroll_offset(focused).y;
-        let (top, height) = self.row_span(row, rows, line_height, scroll_y, focused);
+        let (top, height) =
+            self.row_span(row, rows, line_height, self.ghost_block_at(scroll_y, focused));
         Some((top + scroll_y, height))
     }
 
     /// Where buffer `row`, laid out on display `rows`, sits in the content
-    /// (unscrolled) of a frame scrolled to `scroll_y`, in an editor that is
-    /// `focused`: `(top, height)`. Rows below an inline completion are drawn
-    /// under its ghost lines when that frame draws them. Shared by
+    /// (unscrolled) of a frame that draws `ghost` ([`Self::ghost_block_at`]
+    /// at that frame's scroll): `(top, height)`. Rows below an inline
+    /// completion are drawn under its ghost lines. Shared by
     /// [`Self::scroll_to_row`] and [`Self::row_bounds`], so scrolling to a
     /// row and measuring it agree.
     fn row_span(
@@ -4029,11 +4120,10 @@ impl<M: InputModeKind> InputBaseState<M> {
         row: usize,
         rows: Range<usize>,
         line_height: Pixels,
-        scroll_y: Pixels,
-        focused: bool,
+        ghost: Option<(usize, Pixels)>,
     ) -> (Pixels, Pixels) {
         let mut top = line_height * rows.start;
-        if let Some((ghost_row, ghost_height)) = self.ghost_block_at(scroll_y, focused)
+        if let Some((ghost_row, ghost_height)) = ghost
             && row > ghost_row
         {
             top += ghost_height;
@@ -4086,8 +4176,26 @@ impl<M: InputModeKind> InputBaseState<M> {
     /// counted. Returns before measuring the visible range when there are no
     /// ghost lines (every row counted as visible), the usual case.
     fn ghost_block_at(&self, scroll_y: Pixels, focused: bool) -> Option<(usize, Pixels)> {
+        self.ghost_drawn_at(self.completion_ghost(focused), scroll_y)
+    }
+
+    /// HERDR: the current completion's ghost block, wherever the caret row
+    /// is: the part of [`Self::ghost_block_at`] that doesn't depend on the
+    /// scroll, worked out once by callers that measure several scrolls.
+    fn completion_ghost(&self, focused: bool) -> Option<(usize, Pixels)> {
+        let layout = self.last_layout.as_ref()?;
+        self.ghost_block_in(0..usize::MAX, layout.line_height, focused)
+    }
+
+    /// HERDR: `block` ([`Self::completion_ghost`]) if a frame scrolled to
+    /// `scroll_y` draws it: only while its row is laid out.
+    fn ghost_drawn_at(
+        &self,
+        block: Option<(usize, Pixels)>,
+        scroll_y: Pixels,
+    ) -> Option<(usize, Pixels)> {
+        let block = block?;
         let (layout, bounds) = (self.last_layout.as_ref()?, self.last_bounds?);
-        let block = self.ghost_block_in(0..usize::MAX, layout.line_height, focused)?;
         let height = bounds.size.height;
         let scroll_top = super::element::clamp_auto_grow_vertical_scroll_offset(
             &self.mode,
@@ -4145,29 +4253,36 @@ impl<M: InputModeKind> InputBaseState<M> {
     /// pair, stopping at the first difference.
     fn take_selection_report(&mut self) -> bool {
         self.reported_selections_generation = self.selections.mark_seen();
-        let mut current = self.selections();
+        let mut current = std::mem::take(&mut self.selection_scratch);
+        self.selections_into(&mut current);
         for sel in &mut current {
             sel.reversed &= !sel.range.is_empty();
         }
-        let report = &self.selection_report;
-        let moved = |new: usize, old: usize| {
+        let report = &mut self.selection_report;
+        let text = &self.text;
+        let moved = |new: usize, old: usize, old_position: Option<(usize, usize)>| {
             if new.max(old) <= report.edit_floor {
                 new != old
             } else {
-                script_position(&self.text, new) != script_position(&report.text, old)
+                // An old end past the floor was recorded by the edit; one at
+                // or before it reads the same in the current text.
+                script_position(text, new)
+                    != old_position.unwrap_or_else(|| script_position(text, old))
             }
         };
         let changed = current.len() != report.selections.len()
-            || current.iter().zip(&report.selections).any(|(new, old)| {
-                new.reversed != old.reversed
-                    || moved(new.range.start, old.range.start)
-                    || moved(new.range.end, old.range.end)
-            });
-        self.selection_report = SelectionReport {
-            selections: current,
-            text: self.text.clone(),
-            edit_floor: usize::MAX,
-        };
+            || current.iter().zip(&report.selections).zip(report.positions.chunks_exact(2)).any(
+                |((new, old), positions)| {
+                    new.reversed != old.reversed
+                        || moved(new.range.start, old.range.start, positions[0])
+                        || moved(new.range.end, old.range.end, positions[1])
+                },
+            );
+        std::mem::swap(&mut report.selections, &mut current);
+        self.selection_scratch = current;
+        report.positions.clear();
+        report.positions.resize(report.selections.len() * 2, None);
+        report.edit_floor = usize::MAX;
         changed
     }
 
@@ -4208,7 +4323,7 @@ impl<M: InputModeKind> InputBaseState<M> {
     }
 
     pub(in crate::input) fn queue_scroll_offset(&mut self, offset: Point<Pixels>) {
-        self.queued_scroll = Some(QueuedScroll::Offset { offset, reveal_x: None });
+        self.queued_scroll = Some(QueuedScroll::Offset { offset, reveal_x: None, api: false });
     }
 
     /// What the next paint reveals horizontally with the queued offset
@@ -4247,7 +4362,7 @@ impl<M: InputModeKind> InputBaseState<M> {
         }
         match queued {
             QueuedScroll::Row(row, align) => self.scroll_to_row_at(row, align, focused, cx),
-            QueuedScroll::Caret(id) => self.reveal_caret(id, focused, cx),
+            QueuedScroll::Caret(id) => self.reveal_caret(id, focused, true, cx),
             QueuedScroll::Offset { .. } => {}
         }
     }
@@ -8706,6 +8821,32 @@ mod tests {
             // moved from column 1 to column 2.
             state.set_selected_range(3..3, cx);
             assert!(state.take_selection_report(), "an edit before the caret");
+        });
+    }
+
+    /// HERDR: an edit records the reported position of each end past it,
+    /// read from the text before the edit, once (a later, lower edit keeps
+    /// the first record), so the report needs no copy of the old text.
+    #[gpui::test]
+    fn an_edit_records_the_positions_of_ends_past_it(cx: &mut TestAppContext) {
+        let input_view = InputView::build_textarea(cx, |state| state.default_value("ab\ncd\nef"));
+        let mut cx = VisualTestContext::from_window(input_view.window_handle.into(), cx);
+        input_view.input.update_in(&mut cx, |state, window, cx| {
+            // (1, 1) to (2, 1).
+            state.set_selected_range(4..7, cx);
+            state.take_selection_report();
+            assert_eq!(state.selection_report.positions, vec![None, None], "nothing edited");
+            state.replace_text_in_range(Some(6..6), "x", window, cx);
+            assert_eq!(state.selection_report.positions, vec![None, Some((2, 1))], "the end only");
+            state.replace_text_in_range(Some(0..0), "é", window, cx);
+            assert_eq!(
+                state.selection_report.positions,
+                vec![Some((1, 1)), Some((2, 1))],
+                "the start too; the end keeps its first record"
+            );
+            // "éab\ncd\nxef": (1, 1) is byte 6, (2, 1) byte 9.
+            state.set_selected_range(6..9, cx);
+            assert!(!state.take_selection_report(), "same script positions");
         });
     }
 

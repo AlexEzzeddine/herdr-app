@@ -499,11 +499,13 @@ pub fn install(ctx: &Ctx<'_>, module: &Object<'_>, runtime: Weak<ShellRuntime>) 
         "__editor_set_value",
         Func::from(
             move |ctx: Ctx<'_>, handle: EntityHandle, value: String| -> JsResult<()> {
-                // HERDR: the new text starts at the top, whatever scroll was
-                // asked for before it; a script scrolls after setting it.
+                // HERDR: the new text starts at the top: `set_value` drops
+                // every scroll a script can ask for before it (they all go
+                // through the selection and scroll API); a script scrolls
+                // after setting it.
                 let state = live_editor(&ctx, &write_editor, handle)?;
                 scope::with_current(|window, cx| {
-                    state.update(cx, |state, cx| state.set_value_from_top(value, window, cx));
+                    state.update(cx, |state, cx| state.set_value(value, window, cx));
                 })
                 .ok_or_else(|| needs_call(&ctx, "set_value()"))
             },
