@@ -4806,7 +4806,7 @@ mod tests {
         };
         assert!(declarations.contains(&format!(
             "on(event: {}, handler: (event: InputEvent, cx: Context)",
-            union(crate::entities::InputEventName::NAMES)
+            union(&crate::entities::InputEventName::names(false))
         )));
         // HERDR: editors add `selection_change` and `scroll` to the same
         // handler type, and `gutter_click` with its own payload.

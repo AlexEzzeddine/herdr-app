@@ -1282,39 +1282,55 @@ pub enum InputEventName {
 }
 
 impl InputEventName {
+    /// HERDR: every event, in the order [`Self::names`] lists them.
+    const ALL: [Self; 8] = [
+        Self::Change,
+        Self::Submit,
+        Self::Focus,
+        Self::Blur,
+        Self::PasteOther,
+        Self::SelectionChange,
+        Self::Scroll,
+        Self::GutterClick,
+    ];
+
     /// The event called `name`, if a state of this kind reports it:
-    /// [`Self::EDITOR_ONLY`] events only on an `EditorState`.
+    /// [`Self::editor_only`] events only on an `EditorState`.
     pub fn from_name(name: &str, editor: bool) -> Option<Self> {
-        if !editor && Self::EDITOR_ONLY.contains(&name) {
-            return None;
-        }
-        match name {
-            "change" => Some(Self::Change),
-            "submit" => Some(Self::Submit),
-            "focus" => Some(Self::Focus),
-            "blur" => Some(Self::Blur),
-            "paste_other" => Some(Self::PasteOther),
-            "selection_change" => Some(Self::SelectionChange),
-            "scroll" => Some(Self::Scroll),
-            "gutter_click" => Some(Self::GutterClick),
-            _ => None,
+        Self::ALL
+            .into_iter()
+            .find(|event| event.name() == name && (editor || !event.editor_only()))
+    }
+
+    /// The name scripts subscribe with.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Change => "change",
+            Self::Submit => "submit",
+            Self::Focus => "focus",
+            Self::Blur => "blur",
+            Self::PasteOther => "paste_other",
+            Self::SelectionChange => "selection_change",
+            Self::Scroll => "scroll",
+            Self::GutterClick => "gutter_click",
         }
     }
 
-    pub const NAMES: &'static [&'static str] =
-        &["change", "submit", "focus", "blur", "paste_other"];
+    /// HERDR: whether only an `EditorState` reports it to scripts. Inputs
+    /// and textareas reject these instead of accepting a handler they can't
+    /// act on: they have no gutter, and no `selections()` or
+    /// `scroll_position()` to read after a `selection_change` or `scroll`.
+    pub fn editor_only(self) -> bool {
+        matches!(self, Self::SelectionChange | Self::Scroll | Self::GutterClick)
+    }
 
-    /// HERDR: events only an `EditorState` reports to scripts. Inputs and
-    /// textareas reject them instead of accepting a handler they can't act
-    /// on: they have no gutter, and no `selections()` or `scroll_position()`
-    /// to read after a `selection_change` or `scroll`.
-    pub const EDITOR_ONLY: &'static [&'static str] =
-        &["selection_change", "scroll", "gutter_click"];
-
-    /// The names [`Self::from_name`] accepts, for an error message.
+    /// The names [`Self::from_name`] accepts for a state of this kind.
     pub fn names(editor: bool) -> Vec<&'static str> {
-        let extra: &[&str] = if editor { Self::EDITOR_ONLY } else { &[] };
-        Self::NAMES.iter().chain(extra).copied().collect()
+        Self::ALL
+            .into_iter()
+            .filter(|event| editor || !event.editor_only())
+            .map(Self::name)
+            .collect()
     }
 
     fn matches(self, event: &InputEvent) -> bool {

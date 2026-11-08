@@ -5412,36 +5412,45 @@ mod tests {
 
     // HERDR: set_value after layout keeps an upstream scroll asked for in
     // the same update (`set_scroll_offset`), as upstream keeps it, and drops
-    // a `scroll_to_row`: the new text starts at the top.
+    // a `scroll_to_row`: the new text starts at the top. `replace_all` (the
+    // undoable full replace) follows the same rule.
     #[gpui::test]
     fn set_value_after_layout_keeps_only_an_upstream_code_scroll(cx: &mut TestAppContext) {
-        for scroll in ["scroll_to_row", "set_scroll_offset"] {
-            let (editor, window) = decoration_editor(cx, &sixty_lines("old"), false);
-            let mut cx = VisualTestContext::from_window(window.into(), cx);
-            cx.update(|window, cx| {
-                window.draw(cx).clear(cx);
-                editor.update(cx, |state, cx| {
-                    match scroll {
-                        "scroll_to_row" => {
-                            state.scroll_to_row(40, crate::input::RowScrollAlign::Top, window, cx)
+        for replace in ["set_value", "replace_all"] {
+            for scroll in ["scroll_to_row", "set_scroll_offset"] {
+                let (editor, window) = decoration_editor(cx, &sixty_lines("old"), false);
+                let mut cx = VisualTestContext::from_window(window.into(), cx);
+                cx.update(|window, cx| {
+                    window.draw(cx).clear(cx);
+                    editor.update(cx, |state, cx| {
+                        match scroll {
+                            "scroll_to_row" => state.scroll_to_row(
+                                40,
+                                crate::input::RowScrollAlign::Top,
+                                window,
+                                cx,
+                            ),
+                            _ => {
+                                let line_height = state.last_layout.as_ref().unwrap().line_height;
+                                state.set_scroll_offset(point(px(0.), -(line_height * 40.)), cx)
+                            }
                         }
-                        _ => {
-                            let line_height = state.last_layout.as_ref().unwrap().line_height;
-                            state.set_scroll_offset(point(px(0.), -(line_height * 40.)), cx)
+                        match replace {
+                            "set_value" => state.set_value(sixty_lines("new"), window, cx),
+                            _ => state.replace_all(sixty_lines("new"), window, cx),
                         }
-                    }
-                    state.set_value(sixty_lines("new"), window, cx);
+                    });
+                    window.draw(cx).clear(cx);
                 });
-                window.draw(cx).clear(cx);
-            });
-            let y = editor.read_with(&cx, |state, _| state.scroll_offset().y);
-            let (top, _) = editor
-                .update_in(&mut cx, |state, window, _| state.row_bounds(40, window))
-                .expect("row 40");
-            if scroll == "scroll_to_row" {
-                assert_eq!(y, px(0.), "scroll_to_row: dropped, the text starts at the top");
-            } else {
-                assert_eq!(top, px(0.), "set_scroll_offset: row 40 stays at the top");
+                let y = editor.read_with(&cx, |state, _| state.scroll_offset().y);
+                let (top, _) = editor
+                    .update_in(&mut cx, |state, window, _| state.row_bounds(40, window))
+                    .expect("row 40");
+                if scroll == "scroll_to_row" {
+                    assert_eq!(y, px(0.), "{replace}, scroll_to_row: dropped, the text starts at the top");
+                } else {
+                    assert_eq!(top, px(0.), "{replace}, set_scroll_offset: row 40 stays at the top");
+                }
             }
         }
     }

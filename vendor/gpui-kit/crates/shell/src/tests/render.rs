@@ -5827,6 +5827,19 @@ export default class Code extends View {
       try { call(); this.typos.push("accepted"); }
       catch (error) { this.typos.push(error.name); }
     }
+    // A row past what fits in an integer is past the end, as in
+    // `scroll_to_row`; a row that isn't a non-negative integer is refused.
+    this.rows = [];
+    for (const call of [
+      () => this.code.set_line_decorations("far", [{ row: 1e20 }, { row: 70, end_row: 1e20 }]),
+      () => this.code.set_line_decorations("far", [{ row: 1.5 }]),
+      () => this.code.set_line_decorations("far", [{ row: 2, end_row: -1 }]),
+      () => this.code.add_selection({ start: { row: 0, col: 0.5 }, end: { row: 0, col: 1 } }),
+    ]) {
+      try { call(); this.rows.push("accepted"); }
+      catch (error) { this.rows.push(error.name); }
+    }
+    this.code.set_line_decorations("far", []);
     // Not scrolled yet: `0`, not `-0`.
     const unscrolled = this.code.scroll_position();
     this.zero = [Object.is(unscrolled.top, 0), Object.is(unscrolled.left, 0)];
@@ -5862,7 +5875,8 @@ export default class Code extends View {
       .child("empty=" + this.empty)
       .child("round_trip=" + this.round_trip)
       .child("typos=" + JSON.stringify(this.typos))
-      .child("zero=" + JSON.stringify(this.zero));
+      .child("zero=" + JSON.stringify(this.zero))
+      .child("rows=" + JSON.stringify(this.rows));
   }
 }
 "##;
@@ -5912,6 +5926,7 @@ export default class Code extends View {
     assert!(tree.contains("round_trip=ok"), "{tree}");
     assert!(tree.contains(r#"typos=["TypeError","TypeError","TypeError","TypeError","TypeError"]"#), "{tree}");
     assert!(tree.contains("zero=[true,true]"), "{tree}");
+    assert!(tree.contains(r#"rows=["accepted","TypeError","TypeError","TypeError"]"#), "{tree}");
 
     // A user moving the caret is reported too.
     context.update(|_, cx| editor.update(cx, |state, cx| state.set_selected_range(0..0, cx)));

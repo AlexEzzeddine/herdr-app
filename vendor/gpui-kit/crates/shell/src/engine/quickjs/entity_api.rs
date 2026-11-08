@@ -2040,8 +2040,48 @@ fn needs_call(ctx: &Ctx<'_>, what: &str) -> rquickjs::Error {
 #[derive(Clone, Copy, PartialEq, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct EditorPosition {
+    #[serde(deserialize_with = "script_index")]
     row: usize,
+    #[serde(deserialize_with = "script_index")]
     col: usize,
+}
+
+/// A row or column in script input: [`editor_row`]'s rule, so a row too
+/// large for `usize` means past the end everywhere (clamped or clipped by
+/// whoever uses it) rather than an error in some calls only. JSON gives a
+/// number past `u64` (`1e20`) as a float, which serde's `usize` refuses.
+fn script_index<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<usize, D::Error> {
+    struct Index;
+    impl serde::de::Visitor<'_> for Index {
+        type Value = usize;
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            f.write_str("a non-negative integer")
+        }
+        fn visit_u64<E: serde::de::Error>(self, value: u64) -> Result<usize, E> {
+            Ok(usize::try_from(value).unwrap_or(usize::MAX))
+        }
+        fn visit_i64<E: serde::de::Error>(self, value: i64) -> Result<usize, E> {
+            u64::try_from(value)
+                .map_err(|_| E::invalid_value(serde::de::Unexpected::Signed(value), &self))
+                .and_then(|value| self.visit_u64(value))
+        }
+        fn visit_f64<E: serde::de::Error>(self, value: f64) -> Result<usize, E> {
+            if !value.is_finite() || value < 0. || value.fract() != 0. {
+                return Err(E::invalid_value(serde::de::Unexpected::Float(value), &self));
+            }
+            Ok(value as usize)
+        }
+    }
+    deserializer.deserialize_any(Index)
+}
+
+fn script_index_opt<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<usize>, D::Error> {
+    #[derive(serde::Deserialize)]
+    struct Index(#[serde(deserialize_with = "script_index")] usize);
+    let index: Option<Index> = serde::Deserialize::deserialize(deserializer)?;
+    Ok(index.map(|Index(index)| index))
 }
 
 #[derive(serde::Deserialize)]
@@ -2063,9 +2103,10 @@ struct EditorRange {
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct EditorLineDecoration {
+    #[serde(deserialize_with = "script_index")]
     row: usize,
     /// Inclusive.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "script_index_opt")]
     end_row: Option<usize>,
     #[serde(default)]
     background: Option<String>,

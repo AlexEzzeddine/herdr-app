@@ -1438,6 +1438,12 @@ impl<M: InputModeKind> InputBaseState<M> {
     ///
     /// Use this when programmatically replacing the full text but the
     /// user should still be able to undo the operation — e.g. formatting.
+    ///
+    /// HERDR: scrolls like [`Self::set_value`]: a multi-line input drops a
+    /// scroll asked for through [`Self::scroll_to_row`],
+    /// [`Self::set_selections`] or [`Self::add_selection_range`] before it
+    /// (its row or caret was in the old text) and keeps an upstream one.
+    /// Scroll after replacing the text.
     pub fn replace_all(
         &mut self,
         text: impl Into<SharedString>,
@@ -2813,7 +2819,9 @@ impl<M: InputModeKind> InputBaseState<M> {
         // Reported now, before the early returns below (a tap that reopens
         // the touch menu is still a press on the line number); subscribers
         // run after this handler, once the caret is placed. A disabled
-        // editor still selects text but reports no presses.
+        // editor still selects text but reports no presses. No
+        // `emit_events` check: only `set_value` turns it off, inside its own
+        // call, which a mouse press never runs in.
         if !self.disabled
             && let Some(row) = self.gutter_row_at(event.position)
         {
