@@ -231,8 +231,9 @@ pub(in crate::input) enum RevealX {
 /// HERDR: who asked [`InputBaseState::reveal_offset`] for a reveal.
 #[derive(Clone, Copy, Debug)]
 enum RevealBy {
-    /// Keys, mouse, search: reveal the offset; `set_value` keeps it.
-    Upstream,
+    /// Reveal the offset. `api: false` for keys, mouse, search, which
+    /// `set_value` keeps; `true` through the HERDR API.
+    Offset { api: bool },
     /// Selection `id`'s caret; `api`: through the HERDR API
     /// ([`QueuedScroll::Offset`]).
     Caret {
@@ -298,33 +299,48 @@ impl QueuedScroll {
 ///
 /// `built` must be in [`sort_after_active`] order, like `current`.
 fn selections_equal(current: &[SelectionRange], built: &[CursorSelection]) -> bool {
-    debug_assert!(built.get(1..).is_none_or(|rest| rest.is_sorted_by_key(selection_key)));
-    current.len() == built.len()
-        && current.iter().zip(built).all(|(a, b)| {
-            selection_key_of(a.range.start, a.range.end, a.reversed) == selection_key(b)
-        })
+    debug_assert!(built.get(1..).is_none_or(|rest| rest.is_sorted_by_key(SelectionKey::key)));
+    current.len() == built.len() && current.iter().zip(built).all(|(a, b)| a.key() == b.key())
 }
 
 /// HERDR: sort `selections` after the active one (the first) into the
 /// order [`InputBaseState::selections`] reports and [`selections_equal`]
-/// compares. Allocates nothing; input already in order (merged
-/// selections, usually) is only checked.
-fn sort_after_active(selections: &mut [CursorSelection]) {
+/// compares: the one copy of that rule, for both selection types. Allocates
+/// nothing; input already in order (merged selections, usually) is only
+/// checked.
+fn sort_after_active<T: SelectionKey>(selections: &mut [T]) {
     if let Some(rest) = selections.get_mut(1..)
-        && !rest.is_sorted_by_key(selection_key)
+        && !rest.is_sorted_by_key(SelectionKey::key)
     {
-        rest.sort_unstable_by_key(selection_key);
+        rest.sort_unstable_by_key(SelectionKey::key);
     }
 }
 
-/// The order [`sort_after_active`] sorts in and what [`selections_equal`]
-/// compares: a caret's side is ignored.
-fn selection_key(sel: &CursorSelection) -> (usize, usize, bool) {
-    selection_key_of(sel.start, sel.end, sel.reversed)
+/// HERDR: the order [`sort_after_active`] sorts in and what
+/// [`selections_equal`] compares, for the reported ([`SelectionRange`]) and
+/// the installed ([`CursorSelection`]) selections alike. Ties on start (a
+/// caret at a selection's start, which adding a cursor above or below
+/// doesn't merge) are ordered by end, so the order doesn't depend on how the
+/// selections were added; a caret's side is ignored.
+trait SelectionKey {
+    fn bounds(&self) -> (usize, usize, bool);
+
+    fn key(&self) -> (usize, usize, bool) {
+        let (start, end, reversed) = self.bounds();
+        (start, end, reversed && start != end)
+    }
 }
 
-fn selection_key_of(start: usize, end: usize, reversed: bool) -> (usize, usize, bool) {
-    (start, end, reversed && start != end)
+impl SelectionKey for CursorSelection {
+    fn bounds(&self) -> (usize, usize, bool) {
+        (self.start, self.end, self.reversed)
+    }
+}
+
+impl SelectionKey for SelectionRange {
+    fn bounds(&self) -> (usize, usize, bool) {
+        (self.range.start, self.range.end, self.reversed)
+    }
 }
 
 /// HERDR: the selections as last reported by
@@ -407,14 +423,23 @@ pub fn script_position(text: &Rope, offset: usize) -> (usize, usize) {
 /// HERDR: byte offset of script position `(row, col)` ([`script_position`]'s
 /// inverse), clamped to the document and the line: a row past the end is
 /// the end of the text, a column past the end of its line the line's end.
-/// Kept next to [`script_position`] so the two stay one conversion.
+/// A position between a CRLF's `\r` and `\n` is the line's end before the
+/// `\r`, where the editor places a caret there, so two positions the editor
+/// treats as one caret give one offset. Kept next to [`script_position`] so
+/// the two stay one conversion.
 pub fn script_offset(text: &Rope, row: usize, col: usize) -> usize {
     if row >= text.lines_len().max(1) {
         return text.len();
     }
     let line = text.slice_line(row);
     let col = col.min(line.len_utf16());
-    text.line_start_offset(row) + line.utf16_to_byte_idx(col)
+    let offset = text.line_start_offset(row) + line.utf16_to_byte_idx(col);
+    if offset > 0 && text.char_at(offset - 1) == Some('\r') && text.char_at(offset) == Some('\n')
+    {
+        offset - 1
+    } else {
+        offset
+    }
 }
 
 /// One selection as a byte range, with the side its caret is on.
@@ -1474,11 +1499,15 @@ impl<M: InputModeKind> InputBaseState<M> {
     /// Use this when programmatically replacing the full text but the
     /// user should still be able to undo the operation — e.g. formatting.
     ///
-    /// HERDR: scrolls like [`Self::set_value`]: a multi-line input drops a
-    /// scroll asked for through [`Self::scroll_to_row`],
-    /// [`Self::set_selections`] or [`Self::add_selection_range`] before it
-    /// (its row or caret was in the old text) and keeps an upstream one.
-    /// Scroll after replacing the text.
+    /// HERDR: drops and keeps queued scrolls like [`Self::set_value`]: a
+    /// multi-line input drops a scroll asked for through
+    /// [`Self::scroll_to_row`], [`Self::set_selections`] or
+    /// [`Self::add_selection_range`] before it (its row or caret was in the
+    /// old text) and keeps an upstream one. Scroll after replacing the text.
+    /// Unlike `set_value` it is an edit (it emits [`InputEvent::Change`]),
+    /// so the reset to the top and to `0..0` is reported
+    /// ([`InputEvent::Scroll`], [`InputEvent::SelectionChange`]) to owners
+    /// that asked for those reports.
     pub fn replace_all(
         &mut self,
         text: impl Into<SharedString>,
@@ -3103,7 +3132,7 @@ impl<M: InputModeKind> InputBaseState<M> {
         // Upstream paths (keys, mouse, search) run in a painted editor:
         // measure ghost lines with the focus that frame was drawn with.
         let focused = self.painted_focus();
-        self.reveal_offset(offset, direction, padding, focused, RevealBy::Upstream, cx);
+        self.reveal_offset(offset, direction, padding, focused, RevealBy::Offset { api: false }, cx);
     }
 
     /// HERDR: [`Self::scroll_to_with_padding`], measuring ghost lines (drawn
@@ -3217,12 +3246,12 @@ impl<M: InputModeKind> InputBaseState<M> {
         // A caret reveal always names its caret, which follows edits made
         // before that frame.
         let (reveal_x, measured, api) = match by {
-            RevealBy::Upstream => {
+            RevealBy::Offset { api } => {
                 let target = self.reveal_x_target(offset);
                 if measured_x {
-                    (None, Some(target), false)
+                    (None, Some(target), api)
                 } else {
-                    (Some(target), None, false)
+                    (Some(target), None, api)
                 }
             }
             RevealBy::Caret { id, api } => (Some(RevealX::Caret(id)), None, api),
@@ -3834,15 +3863,23 @@ impl<M: InputModeKind> InputBaseState<M> {
         let added = self.build_selection(id, start, end, selection.reversed);
         self.selections.add(added);
         self.selections.merge_overlapping();
-        // Merging into an earlier selection drops the added id: reveal the
-        // selection that now covers the added range instead.
-        let id = self
-            .selections
-            .iter()
-            .find(|sel| sel.id == id)
-            .or_else(|| self.selections.iter().find(|sel| sel.start <= start && end <= sel.end))
-            .map_or(id, |sel| sel.id);
-        self.reveal_caret(id, focused, api, cx);
+        if self.selections.iter().any(|sel| sel.id == id) {
+            self.reveal_caret(id, focused, api, cx);
+        } else {
+            // Merged into a selection that already overlapped it: reveal
+            // where the added range's caret is, as upstream scrolled to the
+            // added range. The covering selection's caret can be far away.
+            let caret = if selection.reversed { start } else { end };
+            if api && !self.has_usable_layout() {
+                // No id to follow edits by: its row, vertically.
+                let row = self.text.offset_to_point(caret).row;
+                self.queued_scroll =
+                    Some(QueuedScroll::Pending(PendingScroll::Row(row, RowScrollAlign::Nearest)));
+            } else {
+                let by = RevealBy::Offset { api };
+                self.reveal_offset(caret, None, ScrollPadding::Minimal, focused, by, cx);
+            }
+        }
         cx.notify();
     }
 
@@ -3869,19 +3906,8 @@ impl<M: InputModeKind> InputBaseState<M> {
     fn selections_into(&self, out: &mut Vec<SelectionRange>) {
         out.clear();
         out.extend(self.selections.iter().map(Self::selection_range));
-        // The active selection is always first in `self.selections`. Ties
-        // on start (a caret at a selection's start, which adding a cursor
-        // above or below doesn't merge) are ordered by end, so the order
-        // doesn't depend on how the selections were added. Selections are
-        // usually kept in document order already: check before sorting.
-        // The same key `sort_after_active` sorts by and `selections_equal`
-        // compares with.
-        let key = |sel: &SelectionRange| selection_key_of(sel.range.start, sel.range.end, sel.reversed);
-        if let Some(rest) = out.get_mut(1..)
-            && !rest.is_sorted_by_key(key)
-        {
-            rest.sort_unstable_by_key(key);
-        }
+        // The active selection is always first in `self.selections`.
+        sort_after_active(out);
     }
 
     fn selection_range(sel: &CursorSelection) -> SelectionRange {
@@ -4281,11 +4307,20 @@ impl<M: InputModeKind> InputBaseState<M> {
         Some(request)
     }
 
-    /// HERDR: whether [`Self::resolve_pending_scroll`] has anything to do:
-    /// a queued scroll, or an early one still settling. It returns at once
-    /// otherwise, so prepaint skips the update.
-    pub(super) fn has_waiting_scroll(&self) -> bool {
-        !self.is_single_line() && (self.queued_scroll.is_some() || self.settling_scroll.is_some())
+    /// HERDR: whether [`Self::resolve_pending_scroll`] has anything to do
+    /// for a view of `view_size`: a queued scroll, or an early one settling
+    /// whose view changed size. It returns at once otherwise, so prepaint
+    /// skips the update. An early scroll in a view that keeps its size has
+    /// nothing to place, so whether the reader took over the view is checked
+    /// only when the size changes, not on every frame: an idle editor pays
+    /// one read. (Undone changes, such as a fold unfolded before the
+    /// resize, are then not seen; the view is as it was placed.)
+    pub(super) fn has_waiting_scroll(&self, view_size: gpui::Size<Pixels>) -> bool {
+        !self.is_single_line()
+            && (self.queued_scroll.is_some()
+                || self.settling_scroll.as_ref().is_some_and(|settling| {
+                    settling.painted.is_some() && settling.view_size != view_size
+                }))
     }
 
     /// HERDR: [`Self::resolve_pending_scroll`] placed `request` before the
@@ -9157,6 +9192,18 @@ mod tests {
             add(state, 5);
             assert!(state.take_selection_report());
         });
+    }
+
+    /// HERDR: a script position between a CRLF's `\r` and `\n` is the
+    /// line's end, so a clamped column and the reported one agree.
+    #[test]
+    fn a_script_offset_never_splits_a_crlf() {
+        let text = Rope::from("ab\r\ncd");
+        assert_eq!(script_offset(&text, 0, 2), 2);
+        assert_eq!(script_offset(&text, 0, 3), 2);
+        assert_eq!(script_offset(&text, 0, 999), 2);
+        assert_eq!(script_offset(&text, 1, 0), 4);
+        assert_eq!(script_position(&text, 2), (0, 2));
     }
 
     /// HERDR: after an edit, selections are compared as scripts read them

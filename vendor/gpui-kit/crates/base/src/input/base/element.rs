@@ -2727,7 +2727,7 @@ impl<M: InputModeKind> Element for TextElement<M> {
         // Most frames have nothing waiting: they skip the update.
         let (focused, waiting) = {
             let state = self.state.read(cx);
-            (state.focus_handle.is_focused(window), state.has_waiting_scroll())
+            (state.focus_handle.is_focused(window), state.has_waiting_scroll(bounds.size))
         };
         let placed = waiting
             .then(|| {
@@ -3965,6 +3965,46 @@ mod tests {
         assert_eq!(scrolls.get(), 1);
     }
 
+    // HERDR: unlike `set_value`, `replace_all` is an edit (it emits `Change`
+    // and can be undone), so its move back to the top and its caret reset
+    // are reported like any other.
+    #[gpui::test]
+    fn replace_all_reports_its_scroll_and_selection_reset(cx: &mut TestAppContext) {
+        let (editor, window) = decoration_editor(cx, &sixty_lines("line"), false);
+        let mut cx = VisualTestContext::from_window(window.into(), cx);
+        let (scrolls, selections) =
+            (Rc::new(std::cell::Cell::new(0)), Rc::new(std::cell::Cell::new(0)));
+        cx.update(|window, cx| {
+            let (scrolls, selections) = (scrolls.clone(), selections.clone());
+            window
+                .subscribe(&editor, cx, move |_, event: &InputEvent, _, _| match event {
+                    InputEvent::Scroll => scrolls.set(scrolls.get() + 1),
+                    InputEvent::SelectionChange => selections.set(selections.get() + 1),
+                    _ => {}
+                })
+                .detach();
+            editor.update(cx, |state, cx| {
+                state.report_scrolls();
+                state.report_selection_changes(cx);
+            });
+            window.draw(cx).clear(cx);
+            editor.update(cx, |state, cx| {
+                state.set_selections(vec![sel(300..300, false)], window, cx)
+            });
+            window.draw(cx).clear(cx);
+        });
+        cx.run_until_parked();
+        let (scrolls_before, selections_before) = (scrolls.get(), selections.get());
+        assert!(scrolls_before > 0, "the caret's reveal scrolled");
+        cx.update(|window, cx| {
+            editor.update(cx, |state, cx| state.replace_all(sixty_lines("row"), window, cx));
+            window.draw(cx).clear(cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(scrolls.get(), scrolls_before + 1, "back to the top");
+        assert_eq!(selections.get(), selections_before + 1, "the caret moved to 0");
+    }
+
     // HERDR: a caret set by code far down and far right, after layout, is
     // revealed both ways by the frame that scrolls to it: its row wasn't
     // laid out when it was asked for, so only that frame can measure it.
@@ -4692,6 +4732,42 @@ mod tests {
         );
     }
 
+    // HERDR: an early scroll that has been placed waits only for a size
+    // change: frames at the same size skip prepaint's update, and a resize
+    // still places it again.
+    #[gpui::test]
+    fn a_placed_early_scroll_waits_only_for_a_resize(cx: &mut TestAppContext) {
+        cx.update(crate::init);
+        let height = Rc::new(std::cell::Cell::new(px(0.)));
+        let mut editor = None;
+        let window = cx.open_window(size(px(240.), px(200.)), {
+            let height = height.clone();
+            |window, cx| {
+                let state = cx.new(|cx| {
+                    let mut state =
+                        EditorState::new(window, cx).soft_wrap(false).default_value(sixty_lines("line"));
+                    state.scroll_to_row(40, crate::input::RowScrollAlign::Top, window, cx);
+                    state
+                });
+                editor = Some(state.clone());
+                SizedHarness(state, height)
+            }
+        });
+        let editor = editor.unwrap();
+        let mut cx = VisualTestContext::from_window(window.into(), cx);
+        height.set(px(100.));
+        cx.update(|window, cx| {
+            window.draw(cx).clear(cx);
+            window.refresh();
+            window.draw(cx).clear(cx);
+        });
+        editor.read_with(&cx, |state, _| {
+            let view = state.last_bounds.unwrap().size;
+            assert!(!state.has_waiting_scroll(view), "an idle frame skips the update");
+            assert!(state.has_waiting_scroll(size(view.width, view.height + px(80.))), "a resize places it again");
+        });
+    }
+
     // HERDR: a caret set by code clears the inline completion before it is
     // revealed, and ghost lines are drawn at the active caret's own row, so
     // a revealed caret and `row_bounds` never disagree about ghost lines.
@@ -4973,6 +5049,31 @@ mod tests {
         });
         editor.update_in(&mut cx, |state, window, _| {
             assert_eq!(state.selections(), vec![sel(0..0, false), sel(at(30)..at(50), false)]);
+            let (top, height) = state.row_bounds(50, window).expect("row 50");
+            assert!(top >= px(0.) && top + height <= px(140.), "row 50 is in view: {top:?}");
+        });
+    }
+
+    // HERDR: an added selection that merges into a reversed one scrolls to
+    // the added range's caret, not to the far side of the covering selection.
+    #[gpui::test]
+    fn add_selection_merged_into_a_reversed_one_scrolls_to_the_added_caret(cx: &mut TestAppContext) {
+        let text = sixty_lines("line");
+        let (editor, window) = decoration_editor(cx, &text, false);
+        let mut cx = VisualTestContext::from_window(window.into(), cx);
+        let at = |row: usize| text.find(&format!("line {row}\n")).unwrap();
+        cx.update(|window, cx| {
+            editor.update(cx, |state, cx| {
+                state.set_selections(vec![sel(at(2)..at(45), true)], window, cx);
+                state.scroll_to_row(44, crate::input::RowScrollAlign::Top, window, cx);
+            });
+            window.draw(cx).clear(cx);
+            window.draw(cx).clear(cx);
+            editor.update(cx, |state, cx| state.add_selection(at(44)..at(50), cx));
+            window.draw(cx).clear(cx);
+        });
+        editor.update_in(&mut cx, |state, window, _| {
+            assert_eq!(state.selections(), vec![sel(at(2)..at(50), true)]);
             let (top, height) = state.row_bounds(50, window).expect("row 50");
             assert!(top >= px(0.) && top + height <= px(140.), "row 50 is in view: {top:?}");
         });

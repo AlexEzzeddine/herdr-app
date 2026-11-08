@@ -522,8 +522,14 @@ pub fn install(ctx: &Ctx<'_>, module: &Object<'_>, runtime: Weak<ShellRuntime>) 
                         .map(|(index, selection)| {
                             let start = editor_position(text, selection.range.start);
                             let end = editor_position(text, selection.range.end);
-                            // The caret is one of the ends: reuse its position.
-                            let head = if selection.reversed { start.clone() } else { end.clone() };
+                            // The caret (`SelectionRange::head`) is one of
+                            // the ends: reuse that end's position rather than
+                            // converting it again.
+                            let head = if selection.head() == selection.range.start {
+                                start.clone()
+                            } else {
+                                end.clone()
+                            };
                             serde_json::json!({
                                 "start": start,
                                 "end": end,
