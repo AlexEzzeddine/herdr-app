@@ -3511,13 +3511,14 @@ impl<M: InputModeKind> Element for TextElement<M> {
             // scrollbar writes the shared `ScrollHandle` directly. An editor
             // that isn't painted hasn't scrolled yet, so it has nothing to
             // report until it is. Only code editors report scrolls, as
-            // only they report selection changes.
+            // only they report selection changes. Paint runs outside every
+            // update that turns `emit_events` off, so it can't silence this:
+            // `set_value`'s reset to the top is silent because it updates
+            // `reported_scroll` itself.
             let scroll = state.scroll_handle.offset();
             if state.is_code_editor() && scroll != state.reported_scroll {
                 state.reported_scroll = scroll;
-                if state.emit_events {
-                    cx.emit(crate::input::InputEvent::Scroll);
-                }
+                cx.emit(crate::input::InputEvent::Scroll);
             }
 
             // Layout consumers need changed geometry, not another notification
@@ -5511,6 +5512,88 @@ mod tests {
             editor.read_with(&cx, |state, _| state.scroll_offset()),
             lowest
         );
+    }
+
+    // HERDR: with nothing queued, reads clamp the current scroll as well:
+    // after an edit shortens the text it is past the end until the next
+    // paint clamps it, and a handler reading before then sees that frame.
+    #[gpui::test]
+    fn reads_clamp_the_current_scroll_after_the_text_shrinks(cx: &mut TestAppContext) {
+        let (editor, window) = decoration_editor(cx, &sixty_lines("line"), false);
+        let mut cx = VisualTestContext::from_window(window.into(), cx);
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        editor.update(&mut cx, |state, cx| state.set_scroll_offset(point(px(0.), px(-100_000.)), cx));
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        let bottom = editor.read_with(&cx, |state, _| state.scroll_offset());
+        let (read, row5) = editor.update_in(&mut cx, |state, window, cx| {
+            let cut = state.text.line_start_offset(10);
+            let len = state.value().len();
+            state.replace_text_in_ranges(&[(cut..len, "".into())], window, cx);
+            assert_eq!(state.deferred_scroll_offset(), None, "nothing queued");
+            (state.queued_scroll_offset(window), state.row_bounds(5, window).expect("row 5").0)
+        });
+        assert_ne!(read, bottom, "the old bottom is past the shorter text");
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        let (painted, painted_row5) = editor.update_in(&mut cx, |state, window, _| {
+            (state.scroll_offset(), state.row_bounds(5, window).expect("row 5").0)
+        });
+        assert_eq!(read, painted);
+        assert_eq!(row5, painted_row5);
+    }
+
+    // HERDR: a row scroll placed by prepaint measures ghost lines for the
+    // view it is placed for: whether the caret row (and so its ghost lines)
+    // is laid out depends on that height, not the last frame's. Covers the
+    // first placement (the last frame had no height, so the scroll waited)
+    // and placing it again for a taller view.
+    #[gpui::test]
+    fn a_placed_scroll_counts_ghost_lines_the_frame_draws(cx: &mut TestAppContext) {
+        for first_height in [px(0.), px(140.)] {
+            cx.update(crate::init);
+            let text = (0..120).map(|i| format!("line {i}")).collect::<Vec<_>>().join("\n");
+            let height = Rc::new(std::cell::Cell::new(first_height));
+            let mut editor = None;
+            let window = cx.open_window(size(px(240.), px(1000.)), {
+                let height = height.clone();
+                |window, cx| {
+                    let state = cx.new(|cx| {
+                        let mut state = EditorState::new(window, cx).soft_wrap(false).default_value(text);
+                        // The caret row is above row 40: in view once row 40
+                        // is centered in 800px, but not in 140px.
+                        show_inline_completion(&mut state, 30, 3, cx);
+                        state.scroll_to_row(40, crate::input::RowScrollAlign::Center, window, cx);
+                        state
+                    });
+                    editor = Some(state.clone());
+                    SizedHarness(state, height)
+                }
+            });
+            let editor = editor.unwrap();
+            let mut cx = VisualTestContext::from_window(window.into(), cx);
+            // Focus applies once the editor has been drawn.
+            cx.update(|window, cx| window.draw(cx).clear(cx));
+            focus_and_draw(&editor, &mut cx);
+            assert!(
+                editor.read_with(&cx, |state, _| state.ghost_block().is_none()),
+                "nothing drawn at {first_height:?}"
+            );
+            height.set(px(800.));
+            cx.update(|window, cx| {
+                window.refresh();
+                window.draw(cx).clear(cx);
+            });
+            editor.update_in(&mut cx, |state, window, _| {
+                let view = state.last_bounds.unwrap().size.height;
+                assert_eq!(view, px(800.));
+                assert!(state.ghost_block().is_some(), "the taller frame draws the ghost lines");
+                let (top, row_height) = state.row_bounds(40, window).expect("row 40");
+                let centered = (view - row_height) / 2.;
+                assert!(
+                    (top - centered).abs() < px(1.),
+                    "row 40 is centered (from {first_height:?}): {top:?} vs {centered:?}"
+                );
+            });
+        }
     }
 
     // HERDR: scroll_to_row measures rows below an inline completion's ghost

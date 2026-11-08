@@ -3189,7 +3189,7 @@ const BASE: &str = r#"  /** A row. */
     /** Replaces every selection; the first becomes primary and its caret is scrolled
      * into view (after the first layout, if there is none yet). Overlapping ranges merge.
      * Pass `head` (or `start` after `end`) for a backwards selection, so `selections()`
-     * round-trips. Throws a `TypeError` when `ranges` is not an array and a `RangeError`
+     * round-trips; a `head` that is neither `start` nor `end` is a `TypeError`. Throws a `TypeError` when `ranges` is not an array and a `RangeError`
      * when it is empty (an editor always has a caret: pass an empty range to reset to one).
      * Passing the selections it already has changes nothing (no scroll). A key a range
      * or position doesn't have is a `TypeError`; `primary` is accepted and ignored, so

@@ -281,21 +281,35 @@ impl QueuedScroll {
 /// unmerged, e.g. a caret added at a selection's start) and merged. A
 /// caret's side is ignored (it has none scripts can see).
 ///
-/// Sorts `built` after the active selection (merged input is usually in
-/// order already: checked before sorting); allocates nothing.
-fn selections_equal(current: &[SelectionRange], built: &mut [CursorSelection]) -> bool {
-    let key = |start: usize, end: usize, reversed: bool| (start, end, reversed && start != end);
-    if current.len() != built.len() {
-        return false;
-    }
-    if let Some(rest) = built.get_mut(1..)
-        && !rest.is_sorted_by_key(|sel| key(sel.start, sel.end, sel.reversed))
+/// `built` must be in [`sort_after_active`] order, like `current`.
+fn selections_equal(current: &[SelectionRange], built: &[CursorSelection]) -> bool {
+    debug_assert!(built.get(1..).is_none_or(|rest| rest.is_sorted_by_key(selection_key)));
+    current.len() == built.len()
+        && current.iter().zip(built).all(|(a, b)| {
+            selection_key_of(a.range.start, a.range.end, a.reversed) == selection_key(b)
+        })
+}
+
+/// HERDR: sort `selections` after the active one (the first) into the
+/// order [`InputBaseState::selections`] reports and [`selections_equal`]
+/// compares. Allocates nothing; input already in order (merged
+/// selections, usually) is only checked.
+fn sort_after_active(selections: &mut [CursorSelection]) {
+    if let Some(rest) = selections.get_mut(1..)
+        && !rest.is_sorted_by_key(selection_key)
     {
-        rest.sort_unstable_by_key(|sel| key(sel.start, sel.end, sel.reversed));
+        rest.sort_unstable_by_key(selection_key);
     }
-    current.iter().zip(built.iter()).all(|(a, b)| {
-        key(a.range.start, a.range.end, a.reversed) == key(b.start, b.end, b.reversed)
-    })
+}
+
+/// The order [`sort_after_active`] sorts in and what [`selections_equal`]
+/// compares: a caret's side is ignored.
+fn selection_key(sel: &CursorSelection) -> (usize, usize, bool) {
+    selection_key_of(sel.start, sel.end, sel.reversed)
+}
+
+fn selection_key_of(start: usize, end: usize, reversed: bool) -> (usize, usize, bool) {
+    (start, end, reversed && start != end)
 }
 
 /// HERDR: the selections as last reported by
@@ -3145,8 +3159,11 @@ impl<M: InputModeKind> InputBaseState<M> {
         // Clamp the deferred target into the same safe range that
         // `update_scroll_offset` enforces on persist, so paint never shows an
         // over-scrolled frame before the post-paint clamp pulls it back.
-        let safe_y_min =
-            self.scroll_y_min(line_height, bounds.size.height, self.ghost_block_at(scroll_offset.y, focused));
+        let safe_y_min = self.scroll_y_min(
+            line_height,
+            bounds.size.height,
+            self.ghost_block_at(scroll_offset.y, line_height, bounds.size.height, focused),
+        );
         scroll_offset.x = scroll_offset.x.min(px(0.));
         scroll_offset.y = scroll_offset.y.clamp(safe_y_min, px(0.));
         // HERDR: a row the last frame didn't lay out has no column yet: the
@@ -3240,10 +3257,11 @@ impl<M: InputModeKind> InputBaseState<M> {
     }
 
     /// HERDR: where the view will be after the next frame: a scroll queued
-    /// in this handler (clamped to what the text can reach, since
-    /// `set_scroll_offset` stores any offset), or the current one. Before
-    /// the first layout a row or caret scroll has no offset yet and isn't
-    /// counted. Reads focus from `window`: ghost lines, drawn only while
+    /// in this handler, or the current one, clamped to what the text can
+    /// reach now (`set_scroll_offset` stores any offset, and the current
+    /// one is past the end after an edit shortened the text until paint
+    /// clamps it). Before the first layout a row or caret scroll has no
+    /// offset yet and isn't counted. Reads focus from `window`: ghost lines, drawn only while
     /// focused, change how far the text reaches.
     pub fn queued_scroll_offset(&self, window: &Window) -> Point<Pixels> {
         self.next_scroll_offset(self.focus_handle.is_focused(window))
@@ -3251,15 +3269,21 @@ impl<M: InputModeKind> InputBaseState<M> {
 
     /// [`Self::queued_scroll_offset`] in an editor that is `focused`.
     fn next_scroll_offset(&self, focused: bool) -> Point<Pixels> {
-        let Some(mut offset) = self.deferred_scroll_offset() else {
-            return self.scroll_handle.offset();
-        };
+        let mut offset = self
+            .deferred_scroll_offset()
+            .unwrap_or_else(|| self.scroll_handle.offset());
         let (Some(layout), Some(bounds)) = (self.last_layout.as_ref(), self.last_bounds) else {
             return offset;
         };
-        offset.y = offset
-            .y
-            .clamp(self.scroll_y_min(layout.line_height, bounds.size.height, self.ghost_block_at(offset.y, focused)), px(0.));
+        let (line_height, view_height) = (layout.line_height, bounds.size.height);
+        offset.y = offset.y.clamp(
+            self.scroll_y_min(
+                line_height,
+                view_height,
+                self.ghost_block_at(offset.y, line_height, view_height, focused),
+            ),
+            px(0.),
+        );
         offset.x = if self.document_revision == self.last_frame_document_revision {
             super::element::clamp_horizontal_scroll_offset(
                 offset.x,
@@ -3870,14 +3894,19 @@ impl<M: InputModeKind> InputBaseState<M> {
         // The current selections are read once, for both checks.
         let mut current = std::mem::take(&mut self.selection_scratch);
         self.selections_into(&mut current);
-        let merged = if selections_equal(&current, &mut built) {
+        // Compared as given (the current selections may be unmerged), then
+        // merged; both in the order `selections_into` reports. `merged`
+        // fronts the active selection by a swap, so its output is sorted too.
+        sort_after_active(&mut built);
+        let merged = if selections_equal(&current, &built) {
             None
         } else {
             // Merged as installing them would, so input that merges into the
             // current selections (`[0..5, 5..10]` for `0..10`) changes
             // nothing either.
             let mut merged = super::cursor::merged(built);
-            (!selections_equal(&current, &mut merged)).then_some(merged)
+            sort_after_active(&mut merged);
+            (!selections_equal(&current, &merged)).then_some(merged)
         };
         self.selection_scratch = current;
         let Some(mut merged) = merged else {
@@ -4091,8 +4120,8 @@ impl<M: InputModeKind> InputBaseState<M> {
             });
         // The completion's ghost block is worked out once; each scroll below
         // only checks whether that frame draws it.
-        let completion = self.completion_ghost(focused);
-        let ghost_at = |y: Pixels| self.ghost_drawn_at(completion, y);
+        let completion = self.completion_ghost(line_height, focused);
+        let ghost_at = |y: Pixels| self.ghost_drawn_at(completion, y, line_height, view_height);
         let (top, height) = self.row_span(row, rows.clone(), line_height, ghost_at(scroll_y));
         // The scroll that shows a row drawn at `top` in a view whose top is
         // at `view_top`.
@@ -4232,7 +4261,14 @@ impl<M: InputModeKind> InputBaseState<M> {
                     line_height,
                     line_height,
                 );
-                let y = y.clamp(self.scroll_y_min(line_height, view_height, self.ghost_block_at(y, focused)), px(0.));
+                let y = y.clamp(
+                    self.scroll_y_min(
+                        line_height,
+                        view_height,
+                        self.ghost_block_at(y, line_height, view_height, focused),
+                    ),
+                    px(0.),
+                );
                 Some(QueuedScroll::Offset {
                     offset: point(scroll.x, y),
                     reveal_x: Some(RevealX::Caret(id)),
@@ -4306,13 +4342,15 @@ impl<M: InputModeKind> InputBaseState<M> {
     pub fn row_bounds(&self, row: usize, window: &Window) -> Option<(Pixels, Pixels)> {
         let focused = self.focus_handle.is_focused(window);
         let line_height = self.last_layout.as_ref()?.line_height;
+        // Set with the layout, by the same paint.
+        let view_height = self.last_bounds?.size.height;
         if row >= self.text.lines_len() {
             return None;
         }
         let rows = self.display_map.buffer_line_to_display_row_range(row)?;
         let scroll_y = self.next_scroll_offset(focused).y;
-        let (top, height) =
-            self.row_span(row, rows, line_height, self.ghost_block_at(scroll_y, focused));
+        let ghost = self.ghost_block_at(scroll_y, line_height, view_height, focused);
+        let (top, height) = self.row_span(row, rows, line_height, ghost);
         Some((top + scroll_y, height))
     }
 
@@ -4365,42 +4403,54 @@ impl<M: InputModeKind> InputBaseState<M> {
     /// ghost lines are drawn only while the caret row is laid out. Uses the
     /// current completion and caret, so a completion shown, replaced or
     /// cleared, or a caret moved, earlier in the same handler is already
-    /// counted. Returns before measuring the visible range when there are no
-    /// ghost lines (every row counted as visible), the usual case.
-    fn ghost_block_at(&self, scroll_y: Pixels, focused: bool) -> Option<(usize, Pixels)> {
-        self.ghost_drawn_at(self.completion_ghost(focused), scroll_y)
+    /// counted. Measured for a frame with `line_height` rows in a
+    /// `view_height` view, which can differ from the last frame's (a pane
+    /// being resized). Returns before measuring the visible range when there
+    /// are no ghost lines (every row counted as visible), the usual case.
+    fn ghost_block_at(
+        &self,
+        scroll_y: Pixels,
+        line_height: Pixels,
+        view_height: Pixels,
+        focused: bool,
+    ) -> Option<(usize, Pixels)> {
+        let block = self.completion_ghost(line_height, focused);
+        self.ghost_drawn_at(block, scroll_y, line_height, view_height)
     }
 
     /// HERDR: the current completion's ghost block, wherever the caret row
     /// is: the part of [`Self::ghost_block_at`] that doesn't depend on the
     /// scroll, worked out once by callers that measure several scrolls.
-    fn completion_ghost(&self, focused: bool) -> Option<(usize, Pixels)> {
-        let line_height = self.last_layout.as_ref()?.line_height;
+    fn completion_ghost(&self, line_height: Pixels, focused: bool) -> Option<(usize, Pixels)> {
         let (row, text) = self.shown_inline_completion(focused, &(0..usize::MAX))?;
         let ghost_lines = text.split('\n').count() - 1;
         (ghost_lines > 0).then(|| (row, ghost_lines as f32 * line_height))
     }
 
     /// HERDR: `block` ([`Self::completion_ghost`]) if a frame scrolled to
-    /// `scroll_y` draws it: only while its row is laid out.
+    /// `scroll_y`, with `line_height` rows in a `view_height` view, draws
+    /// it: only while its row is laid out. Takes the frame's sizes rather
+    /// than the last frame's, so a scroll placed for a new view size (or
+    /// for the first frame, before any layout) measures the frame it is
+    /// placed for.
     fn ghost_drawn_at(
         &self,
         block: Option<(usize, Pixels)>,
         scroll_y: Pixels,
+        line_height: Pixels,
+        view_height: Pixels,
     ) -> Option<(usize, Pixels)> {
         let block = block?;
-        let (layout, bounds) = (self.last_layout.as_ref()?, self.last_bounds?);
-        let height = bounds.size.height;
         let scroll_top = super::element::clamp_auto_grow_vertical_scroll_offset(
             &self.mode,
             scroll_y,
-            layout.line_height * self.display_map.wrap_row_count(),
-            height,
+            line_height * self.display_map.wrap_row_count(),
+            view_height,
         );
         let (visible, _) = super::element::visible_buffer_range(
             &self.display_map,
-            layout.line_height,
-            height,
+            line_height,
+            view_height,
             scroll_top,
         );
         visible.contains(&block.0).then_some(block)

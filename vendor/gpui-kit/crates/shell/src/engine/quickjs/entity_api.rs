@@ -551,6 +551,17 @@ pub fn install(ctx: &Ctx<'_>, module: &Object<'_>, runtime: Weak<ShellRuntime>) 
                         &format!("expected {{ start: {{ row, col }}, end: {{ row, col }} }}: {error}"),
                     )
                 })?;
+                // A `head` names which end the caret is on: anything else
+                // (a position inside the range, or one computed in another
+                // coordinate space) is a mistake, not a forward selection.
+                if ranges.iter().any(|range| {
+                    range.head.is_some_and(|head| head != range.start && head != range.end)
+                }) {
+                    return Err(Exception::throw_type(
+                        &ctx,
+                        "a range's head must be its start or its end",
+                    ));
+                }
                 // `set_selections([])` would leave no caret; the editor keeps
                 // its selections then, which a caller clearing them wouldn't
                 // expect, so it is refused rather than silently ignored.
@@ -617,9 +628,11 @@ pub fn install(ctx: &Ctx<'_>, module: &Object<'_>, runtime: Weak<ShellRuntime>) 
                     let state = state.read(cx);
                     let (offset, line_height) =
                         (state.queued_scroll_offset(window), state.line_height());
+                    // `0. - x` rather than `-x`: an unscrolled view is
+                    // `0`, not `-0` (which `Object.is(top, 0)` tells apart).
                     serde_json::json!({
-                        "top": -f32::from(offset.y),
-                        "left": -f32::from(offset.x),
+                        "top": 0. - f32::from(offset.y),
+                        "left": 0. - f32::from(offset.x),
                         "line_height": line_height.map(f32::from),
                     })
                     .to_string()
@@ -2024,7 +2037,7 @@ fn needs_call(ctx: &Ctx<'_>, what: &str) -> rquickjs::Error {
 // HERDR: editor positions crossing to scripts. Script input refuses keys
 // it doesn't know, as `EditorState.new` options do, so a misspelled one
 // (`column`, `haed`, `endRow`) is a TypeError rather than silently dropped.
-#[derive(Clone, Copy, serde::Deserialize)]
+#[derive(Clone, Copy, PartialEq, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct EditorPosition {
     row: usize,
@@ -2036,8 +2049,9 @@ struct EditorPosition {
 struct EditorRange {
     start: EditorPosition,
     end: EditorPosition,
-    /// The caret's side, as `selections()` reports it; without it a range
-    /// whose `start` is after its `end` is a backwards selection.
+    /// The caret's side, as `selections()` reports it: `start` or `end`
+    /// (anything else is refused); without it a range whose `start` is
+    /// after its `end` is a backwards selection.
     #[serde(default)]
     head: Option<EditorPosition>,
     /// What `selections()` reports; accepted and ignored, so its output

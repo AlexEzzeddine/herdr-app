@@ -5820,10 +5820,16 @@ export default class Code extends View {
       () => this.code.add_selection({ start: { row: 0, col: 0 }, end: { row: 0, col: 1 }, haed: { row: 0, col: 0 } }),
       () => this.code.add_selection({ start: { row: 0, column: 0 }, end: { row: 0, col: 1 } }),
       () => this.code.set_line_decorations("diff", [{ row: 10, endRow: 20, background: "#f004" }]),
+      // A head inside the range names neither end.
+      () => this.code.add_selection({ start: { row: 0, col: 0 }, end: { row: 0, col: 4 }, head: { row: 0, col: 2 } }),
+      () => this.code.set_selections([{ start: { row: 0, col: 0 }, end: { row: 0, col: 4 }, head: { row: 1, col: 0 } }]),
     ]) {
       try { call(); this.typos.push("accepted"); }
       catch (error) { this.typos.push(error.name); }
     }
+    // Not scrolled yet: `0`, not `-0`.
+    const unscrolled = this.code.scroll_position();
+    this.zero = [Object.is(unscrolled.top, 0), Object.is(unscrolled.left, 0)];
     this.code.scroll_to_row(60, "top");
     try { this.code.set_selections([]); this.empty = "accepted"; }
     catch (error) { this.empty = error.name; }
@@ -5855,7 +5861,8 @@ export default class Code extends View {
       .child("scroll_seen=" + JSON.stringify(this.scroll_seen))
       .child("empty=" + this.empty)
       .child("round_trip=" + this.round_trip)
-      .child("typos=" + JSON.stringify(this.typos));
+      .child("typos=" + JSON.stringify(this.typos))
+      .child("zero=" + JSON.stringify(this.zero));
   }
 }
 "##;
@@ -5903,7 +5910,8 @@ export default class Code extends View {
     let bad_row = format!("bad_row={}", serde_json::json!([vec!["TypeError:true"; 12], vec!["RangeError"]].concat()));
     assert!(tree.contains(&bad_row), "{tree}");
     assert!(tree.contains("round_trip=ok"), "{tree}");
-    assert!(tree.contains(r#"typos=["TypeError","TypeError","TypeError"]"#), "{tree}");
+    assert!(tree.contains(r#"typos=["TypeError","TypeError","TypeError","TypeError","TypeError"]"#), "{tree}");
+    assert!(tree.contains("zero=[true,true]"), "{tree}");
 
     // A user moving the caret is reported too.
     context.update(|_, cx| editor.update(cx, |state, cx| state.set_selected_range(0..0, cx)));
