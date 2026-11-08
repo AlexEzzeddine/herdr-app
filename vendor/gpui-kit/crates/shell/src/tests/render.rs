@@ -5819,11 +5819,22 @@ export default class Code extends View {
       try { this.code.add_selection(bad); this.bad_add.push("accepted"); }
       catch (error) { this.bad_add.push(error.name + ":" + error.message.includes("add_selection")); }
     }
+    // Not coerced to row 0: a TypeError naming the method.
+    this.bad_row = [];
+    for (const bad of [null, "", [], false, "5", undefined]) {
+      for (const method of ["scroll_to_row", "row_bounds"]) {
+        try { this.code[method](bad); this.bad_row.push("accepted"); }
+        catch (error) { this.bad_row.push(error.name + ":" + error.message.includes(method)); }
+      }
+    }
+    try { this.code.scroll_to_row(-1); this.bad_row.push("accepted"); }
+    catch (error) { this.bad_row.push(error.name); }
   }
   render(cx) {
     return div()
       .child(Editor.new(this.code).h(200))
       .child("bad_add=" + JSON.stringify(this.bad_add))
+      .child("bad_row=" + JSON.stringify(this.bad_row))
       .child("sel=" + JSON.stringify(this.code.selections()))
       .child("events=" + this.selection_events)
       .child("row60=" + JSON.stringify(this.code.row_bounds(60)))
@@ -5874,6 +5885,8 @@ export default class Code extends View {
     assert!(tree.contains("empty=RangeError"), "{tree}");
     // A list or nothing for one range: a TypeError naming the method.
     assert!(tree.contains(r#"bad_add=["TypeError:true","TypeError:true"]"#), "{tree}");
+    let bad_row = format!("bad_row={}", serde_json::json!([vec!["TypeError:true"; 12], vec!["RangeError"]].concat()));
+    assert!(tree.contains(&bad_row), "{tree}");
 
     // A user moving the caret is reported too.
     context.update(|_, cx| editor.update(cx, |state, cx| state.set_selected_range(0..0, cx)));

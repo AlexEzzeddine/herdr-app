@@ -5592,6 +5592,14 @@ globalThis.__gpui = (() => {
     }
     return value;
   };
+  // HERDR: `Number(row)` would turn `null`, `""`, `[]` and `false` into
+  // row 0 instead of an error.
+  const editorRow = (method, value) => {
+    if (typeof value !== "number") {
+      throw new TypeError(`EditorState.${method} expects a row number`);
+    }
+    return value;
+  };
   const element = (id) => {
     const object = Object.create(globalThis.__diagnostics ? diagnostic : methods);
     object.__id = id;
@@ -7075,9 +7083,9 @@ globalThis.__gpui = (() => {
           add_selection: (range) =>
             __editor_set_selections(handle, JSON.stringify([editorRange("add_selection", range)]), true),
           scroll_to_row: (row, align) =>
-            __editor_scroll_to_row(handle, Number(row), String(align ?? "nearest")),
+            __editor_scroll_to_row(handle, editorRow("scroll_to_row", row), String(align ?? "nearest")),
           scroll_position: () => JSON.parse(__editor_scroll_position(handle)),
-          row_bounds: (row) => JSON.parse(__editor_row_bounds(handle, Number(row))),
+          row_bounds: (row) => JSON.parse(__editor_row_bounds(handle, editorRow("row_bounds", row))),
           set_line_decorations: (key, decorations) =>
             __editor_set_line_decorations(
               handle,

@@ -3195,10 +3195,12 @@ const BASE: &str = r#"  /** A row. */
      * `range` is not a single range object. */
     add_selection(range: EditorRange): void;
     /** Scrolls vertically only. Before the first layout the request waits for it, and
-     * after placing it the row stays where it asked across height changes (the pane
-     * being sized, a later resize) until the reader takes over the view: another scroll,
-     * a press in the editor, a selection change or an edit. A later `set_value` drops
-     * it. Defaults to "nearest". */
+     * after placing it the row stays where it asked across size changes (the pane
+     * being sized, a later resize, a width change rewrapping soft-wrapped rows) until
+     * the reader takes over the view: another scroll, a press in the editor, a
+     * selection change or an edit. A later `set_value` drops it. Defaults to
+     * "nearest". Throws a TypeError when `row` isn't a number and a RangeError when it
+     * isn't a non-negative integer. */
     scroll_to_row(row: number, align?: "nearest" | "top" | "center"): void;
     /** Pixels scrolled from the top left, counting a scroll asked for earlier in the same
      * handler (`scroll_to_row`, `set_selections`). Before the first layout `line_height` is
@@ -3207,7 +3209,8 @@ const BASE: &str = r#"  /** A row. */
     /** Pixels from the top of the visible text area; null before layout, for a row past
      * the last one, or inside a fold.
      * A soft-wrapped row is taller than one line. Counts a scroll asked for earlier in the
-     * same handler, like `scroll_position()`. */
+     * same handler, like `scroll_position()`. Throws for a `row` that isn't a
+     * non-negative integer, like `scroll_to_row`. */
     row_bounds(row: number): { top: number; height: number } | null;
     release(): boolean;
   }

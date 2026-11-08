@@ -2726,7 +2726,7 @@ impl<M: InputModeKind> Element for TextElement<M> {
         // so this frame is laid out and drawn there.
         let focused = self.state.read(cx).focus_handle.is_focused(window);
         let placed = self.state.update(cx, |state, _| {
-            state.resolve_pending_scroll(line_height, bounds.size.height, focused)
+            state.resolve_pending_scroll(line_height, bounds.size, focused)
         });
         let token_width = (bounds.size.width - line_number_width - RIGHT_MARGIN).max(px(1.));
         let mut token_elements =
@@ -4221,7 +4221,7 @@ mod tests {
             editor.update(cx, |state, cx| {
                 state.scroll_to_row(40, crate::input::RowScrollAlign::Top, window, cx);
                 assert!(
-                    matches!(state.queued_scroll, Some(super::super::state::QueuedScroll::Row(40, _))),
+                    matches!(state.queued_scroll, Some(super::super::state::QueuedScroll::Pending(super::super::state::PendingScroll::Row(40, _)))),
                     "the row waits for layout"
                 );
                 state.set_value(sixty_lines("other"), window, cx);
@@ -4293,6 +4293,59 @@ mod tests {
                 }
             });
         }
+    }
+
+    /// HERDR: an editor in a box whose width and height the test sets.
+    struct BoxHarness(Entity<EditorState>, Rc<std::cell::Cell<gpui::Size<Pixels>>>);
+
+    impl Render for BoxHarness {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            let size = self.1.get();
+            div().w(size.width).h(size.height).child(self.0.clone())
+        }
+    }
+
+    // HERDR: with soft wrap, a width change rewraps the rows above an early
+    // scroll's row, so it is placed again, as for a height change.
+    #[gpui::test]
+    fn an_early_scroll_follows_a_width_change_under_soft_wrap(cx: &mut TestAppContext) {
+        cx.update(crate::init);
+        let text = (0..60)
+            .map(|i| format!("line {i} {}", "word ".repeat(16)))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let view = Rc::new(std::cell::Cell::new(size(px(360.), px(140.))));
+        let mut editor = None;
+        let window = cx.open_window(size(px(400.), px(200.)), {
+            let view = view.clone();
+            |window, cx| {
+                let state = cx.new(|cx| {
+                    let mut state = EditorState::new(window, cx).soft_wrap(true).default_value(text);
+                    state.scroll_to_row(40, crate::input::RowScrollAlign::Top, window, cx);
+                    state
+                });
+                editor = Some(state.clone());
+                BoxHarness(state, view)
+            }
+        });
+        let editor = editor.unwrap();
+        let mut cx = VisualTestContext::from_window(window.into(), cx);
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        let (top, _) = editor.update_in(&mut cx, |state, window, _| state.row_bounds(40, window)).expect("row 40");
+        assert_eq!(top, px(0.), "row 40 starts at the top");
+        let before = editor.read_with(&cx, |state, _| state.scroll_offset());
+        view.set(size(px(200.), px(140.)));
+        cx.update(|window, cx| {
+            window.refresh();
+            window.draw(cx).clear(cx);
+        });
+        assert_ne!(
+            editor.read_with(&cx, |state, _| state.scroll_offset()),
+            before,
+            "the narrower view wraps the rows above into more rows"
+        );
+        let (top, _) = editor.update_in(&mut cx, |state, window, _| state.row_bounds(40, window)).expect("row 40");
+        assert_eq!(top, px(0.), "row 40 stays at the top");
     }
 
     // HERDR: once the view is scrolled some other way, a later change of
@@ -4545,6 +4598,35 @@ mod tests {
                 assert_ne!(next, seen);
                 state.selections.active_mut().end = 4;
                 assert_ne!(state.selections.generation(), next, "a change after the mark");
+            });
+        });
+    }
+
+    // HERDR: a stamp taken while the active selection is rewritten (no mark
+    // since) still tells a later change apart: the generation would count
+    // the rewrite as +1 and then show the same number after the active
+    // selection is written back and a cursor is added.
+    #[gpui::test]
+    fn a_stamp_sees_a_change_the_generation_repeats(cx: &mut TestAppContext) {
+        let (editor, window) = decoration_editor(cx, "alpha\nbeta", false);
+        let mut cx = VisualTestContext::from_window(window.into(), cx);
+        cx.update(|window, cx| {
+            window.draw(cx).clear(cx);
+            editor.update(cx, |state, _| {
+                state.selections.mark_seen();
+                let old = *state.selections.active();
+                state.selections.active_mut().end = 3;
+                let generation = state.selections.generation();
+                let stamp = state.selections.stamp();
+                assert_eq!(state.selections.stamp(), stamp, "nothing changed yet");
+                *state.selections.active_mut() = old;
+                let id = state.selections.generate_id();
+                state.selections.add(super::super::cursor::CursorSelection::new(id, 8, 8));
+                assert_eq!(state.selections.generation(), generation, "the generation repeats");
+                assert_ne!(state.selections.stamp(), stamp, "the stamp sees the added cursor");
+                let stamp = state.selections.stamp();
+                state.selections.active_mut().reversed = old.reversed;
+                assert_eq!(state.selections.stamp(), stamp, "an unchanged write");
             });
         });
     }
@@ -4812,6 +4894,39 @@ mod tests {
         })
         .unwrap();
         assert_eq!(cx.read(|cx| input.read(cx).selections()), vec![sel(0..3, false)]);
+    }
+
+    // HERDR: on a single-line input too, set_selections with the selection
+    // already there changes nothing (the selections aren't written again).
+    #[gpui::test]
+    fn setting_the_same_selection_on_a_single_line_input_changes_nothing(cx: &mut TestAppContext) {
+        cx.update(crate::init);
+        let mut input = None;
+        let window = cx.open_window(size(px(240.), px(40.)), |window, cx| {
+            let state = cx.new(|cx| crate::input::InputState::new(window, cx).default_value("abcdefgh"));
+            input = Some(state.clone());
+            gpui::Empty
+        });
+        let input = input.unwrap();
+        for reversed in [false, true] {
+            cx.update(|cx| {
+                window.update(cx, |_, window, cx| {
+                    input.update(cx, |state, cx| {
+                        state.set_selections(vec![sel(2..5, reversed)], window, cx);
+                        assert_eq!(state.selections(), vec![sel(2..5, reversed)]);
+                        let seen = state.selections.mark_seen();
+                        let stamp = state.selections.stamp();
+                        // A second range is dropped, as before.
+                        state.set_selections(vec![sel(2..5, reversed), sel(6..7, false)], window, cx);
+                        assert_eq!(state.selections.generation(), seen, "reversed {reversed}: untouched");
+                        assert_eq!(state.selections.stamp(), stamp, "reversed {reversed}: untouched");
+                        state.set_selections(vec![sel(2..5, !reversed)], window, cx);
+                        assert_eq!(state.selections(), vec![sel(2..5, !reversed)], "the other side is a change");
+                    })
+                })
+            })
+            .unwrap();
+        }
     }
 
     // HERDR: "nearest" on a visible row leaves the horizontal scroll alone.

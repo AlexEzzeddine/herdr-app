@@ -145,6 +145,13 @@ pub(super) struct Selections {
     active_before: Option<CursorSelection>,
 }
 
+/// HERDR: [`Selections::stamp`].
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) struct SelectionsStamp {
+    counter: u64,
+    active: CursorSelection,
+}
+
 impl Selections {
     pub(super) fn new() -> Self {
         Self {
@@ -175,10 +182,21 @@ impl Selections {
     /// HERDR: changes whenever a mutating method ran or the active
     /// selection was written with a new value, since [`Self::mark_seen`]
     /// (a method may not have changed anything; equal generations mean
-    /// nothing changed).
+    /// nothing changed). Compare it only with the value `mark_seen`
+    /// returned: before the next mark it can count a changed active
+    /// selection as +1 and then repeat that number after a real change. A
+    /// caller that doesn't mark compares [`Self::stamp`]s instead.
     pub(super) fn generation(&self) -> u64 {
         let active_changed = self.active_before.is_some_and(|before| before != *self.active());
         self.generation + u64::from(active_changed)
+    }
+
+    /// HERDR: the selections now, for comparing later without
+    /// [`Self::mark_seen`]: equal stamps mean nothing changed since. The
+    /// counter only grows, and the active selection is compared by value,
+    /// so writing it back to what it was compares equal.
+    pub(super) fn stamp(&self) -> SelectionsStamp {
+        SelectionsStamp { counter: self.generation, active: *self.active() }
     }
 
     /// HERDR: the owner has seen the selections at [`Self::generation`]:

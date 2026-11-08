@@ -153,37 +153,46 @@ pub(in crate::input) enum QueuedScroll {
         reveal_x: Option<RevealX>,
         api: bool,
     },
-    /// [`InputBaseState::scroll_to_row`] before a usable layout (none yet,
-    /// or one with no height), resolved in the first prepaint that has one
+    /// A row or caret asked for before a usable layout (none yet, or one
+    /// with no height), resolved in the first prepaint that has one
     /// ([`InputBaseState::resolve_pending_scroll`]), so that frame is drawn
-    /// there; the row is clamped then, since the text may still change.
+    /// there.
+    Pending(PendingScroll),
+}
+
+/// HERDR: a [`QueuedScroll::Pending`] request. Its own type, so the code
+/// that places a waiting request has no offset case to handle.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(in crate::input) enum PendingScroll {
+    /// [`InputBaseState::scroll_to_row`]; the row is clamped when placed,
+    /// since the text may still change.
     Row(usize, RowScrollAlign),
-    /// Reveal this selection's caret ([`InputBaseState::set_selections`])
-    /// before a usable layout. Kept by id, not offset: selections follow
-    /// edits made before layout, so the caret is still a valid position in
-    /// the text when resolved.
+    /// Reveal this selection's caret ([`InputBaseState::set_selections`]).
+    /// Kept by id, not offset: selections follow edits made before layout,
+    /// so the caret is still a valid position in the text when resolved.
     Caret(super::selection::CursorId),
 }
 
 /// HERDR: a row or caret scroll asked for before layout, after prepaint
-/// placed it. It stays anchored: every change of the view's height (a pane
-/// still being sized, or later the window) places it again, so the row the
+/// placed it. It stays anchored: every change of the view's size (a pane
+/// still being sized, or later the window; with soft wrap, a width change
+/// rewraps the rows above) places it again, so the row the
 /// request was about stays where it asked, until the reader takes over the
 /// view: another scroll (asked for, or the scroll handle moving), a press in
 /// the editor, changing the selections (keys, `set_selections`), an edit, or
 /// `set_value` ([`InputBaseState::resolve_pending_scroll`]).
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct SettlingScroll {
-    /// The [`QueuedScroll::Row`] or [`QueuedScroll::Caret`] asked for.
-    request: QueuedScroll,
-    /// The view height it was last placed for.
-    view_height: Pixels,
+    /// The row or caret asked for.
+    request: PendingScroll,
+    /// The view size it was last placed for.
+    view_size: gpui::Size<Pixels>,
     /// The scroll the frame that placed it ended at; `None` until painted.
     painted: Option<Point<Pixels>>,
-    /// [`Selections::generation`](super::cursor::Selections::generation)
-    /// when it was placed: selections changed since without a scroll
-    /// (select all reveals nothing) mean the reader has the view.
-    selections: u64,
+    /// [`Selections::stamp`](super::cursor::Selections::stamp) when it was
+    /// placed: selections changed since without a scroll (select all
+    /// reveals nothing) mean the reader has the view.
+    selections: super::cursor::SelectionsStamp,
 }
 
 /// HERDR: a position the frame applying a queued offset reveals
@@ -215,19 +224,26 @@ impl QueuedScroll {
     fn offset(&self) -> Option<Point<Pixels>> {
         match *self {
             Self::Offset { offset, .. } => Some(offset),
-            Self::Row(..) | Self::Caret(_) => None,
+            Self::Pending(_) => None,
         }
     }
 
-    /// Waiting for a usable layout ([`Self::Row`], [`Self::Caret`]).
+    /// The request waiting for a usable layout, if this is one.
+    fn pending(&self) -> Option<PendingScroll> {
+        match *self {
+            Self::Pending(pending) => Some(pending),
+            Self::Offset { .. } => None,
+        }
+    }
+
     fn is_pending(&self) -> bool {
-        matches!(self, Self::Row(..) | Self::Caret(_))
+        self.pending().is_some()
     }
 
     fn reveal_x(&self) -> Option<RevealX> {
         match *self {
             Self::Offset { reveal_x, .. } => reveal_x,
-            Self::Row(..) | Self::Caret(_) => None,
+            Self::Pending(_) => None,
         }
     }
 
@@ -3808,20 +3824,27 @@ impl<M: InputModeKind> InputBaseState<M> {
         let focused = self.focus_handle.is_focused(window);
         if !self.is_multi_line() {
             // One path for a code-set selection on a single-line input,
-            // shared with `add_selection` (`push_selection`).
-            if let Some(first) = selections.into_iter().next() {
+            // shared with `add_selection` (`push_selection`), unless it is
+            // the selection already there.
+            if let Some(first) = selections.into_iter().next()
+                && !self.single_line_selection_is(&first)
+            {
                 self.push_selection(first, focused, true, cx);
             }
             return;
         }
         // Every selection is built with the active id first: new ids are
-        // handed out only once they are known to change something.
+        // handed out only once they are known to change something. The
+        // column vertical moves keep is a layout lookup, so it is added only
+        // to selections that get installed.
         let active_id = self.selections.active().id;
         let mut built: Vec<CursorSelection> = selections
             .into_iter()
             .map(|selection| {
                 let (start, end) = self.clip_selection_range(selection.range);
-                self.build_selection(active_id, start, end, selection.reversed)
+                let mut sel = CursorSelection::new(active_id, start, end);
+                sel.reversed = selection.reversed && start != end;
+                sel
             })
             .collect();
         if built.is_empty() {
@@ -3843,8 +3866,11 @@ impl<M: InputModeKind> InputBaseState<M> {
         let Some(mut merged) = merged else {
             return;
         };
-        for sel in merged.iter_mut().skip(1) {
-            sel.id = self.selections.generate_id();
+        for (i, sel) in merged.iter_mut().enumerate() {
+            if i > 0 {
+                sel.id = self.selections.generate_id();
+            }
+            sel.column_anchor = self.preferred_column_for(sel.cursor_offset());
         }
 
         self.begin_programmatic_selection(cx);
@@ -3856,6 +3882,21 @@ impl<M: InputModeKind> InputBaseState<M> {
         let id = self.selections.active().id;
         self.reveal_caret(id, focused, true, cx);
         cx.notify();
+    }
+
+    /// HERDR: whether a single-line input's selection already is
+    /// `selection`, clipped as [`Self::select_range`] clips it.
+    fn single_line_selection_is(&self, selection: &SelectionRange) -> bool {
+        let range = self.normalize_token_range(selection.range.clone());
+        let end_bias = if range.start == range.end { Bias::Left } else { Bias::Right };
+        let start = self.text.clip_offset(range.start, Bias::Left);
+        let end = self.text.clip_offset(range.end, end_bias);
+        let current = self.selections.active();
+        self.selections.is_single()
+            && start <= end
+            && (current.start, current.end) == (start, end)
+            && (current.reversed && current.start != current.end)
+                == (selection.reversed && start != end)
     }
 
     /// A selection over clipped `start..end`, with its caret side and the
@@ -3923,7 +3964,7 @@ impl<M: InputModeKind> InputBaseState<M> {
         cx: &mut Context<Self>,
     ) {
         if api && !self.has_usable_layout() {
-            self.queued_scroll = Some(QueuedScroll::Caret(id));
+            self.queued_scroll = Some(QueuedScroll::Pending(PendingScroll::Caret(id)));
             return;
         }
         let by = RevealBy::Caret { id, api };
@@ -3964,7 +4005,7 @@ impl<M: InputModeKind> InputBaseState<M> {
             self.has_usable_layout(),
         ) else {
             // Clamp when applied: the text may still change before layout.
-            self.queued_scroll = Some(QueuedScroll::Row(row, align));
+            self.queued_scroll = Some(QueuedScroll::Pending(PendingScroll::Row(row, align)));
             cx.notify();
             return;
         };
@@ -4069,13 +4110,13 @@ impl<M: InputModeKind> InputBaseState<M> {
     }
 
     /// HERDR: in prepaint, once the line height and view height are known:
-    /// turn a [`QueuedScroll::Row`] or [`QueuedScroll::Caret`] asked for
+    /// turn a [`QueuedScroll::Pending`] row or caret asked for
     /// before a usable layout into an offset, so this frame is drawn there
     /// instead of at the top and jumping on the next one. A view with no
     /// height has nowhere to place the row: the request keeps waiting. A
-    /// first frame can also have a height that is not the final one (a
-    /// pane still being sized), so the request is placed again whenever the
-    /// height changes, until the reader takes over the view
+    /// first frame can also have a size that is not the final one (a pane
+    /// still being sized), so the request is placed again whenever the size
+    /// changes (with soft wrap a new width rewraps the rows), until the reader takes over the view
     /// ([`SettlingScroll`]). `focused`: whether this frame draws an inline
     /// completion's ghost lines.
     ///
@@ -4083,9 +4124,10 @@ impl<M: InputModeKind> InputBaseState<M> {
     pub(super) fn resolve_pending_scroll(
         &mut self,
         line_height: Pixels,
-        view_height: Pixels,
+        view_size: gpui::Size<Pixels>,
         focused: bool,
-    ) -> Option<QueuedScroll> {
+    ) -> Option<PendingScroll> {
+        let view_height = view_size.height;
         if self.is_single_line() || view_height <= px(0.) {
             return None;
         }
@@ -4094,21 +4136,21 @@ impl<M: InputModeKind> InputBaseState<M> {
         {
             if self.queued_scroll.is_some()
                 || self.scroll_handle.offset() != painted
-                || self.selections.generation() != settling.selections
+                || self.selections.stamp() != settling.selections
             {
                 // Something else scrolled, or a caret moved, since: it no
                 // longer applies.
                 self.settling_scroll = None;
-            } else if settling.view_height != view_height {
-                self.queued_scroll = Some(settling.request);
+            } else if settling.view_size != view_size {
+                self.queued_scroll = Some(QueuedScroll::Pending(settling.request));
             }
         }
-        let request = self.queued_scroll.filter(|queued| queued.is_pending())?;
+        let request = self.queued_scroll?.pending()?;
         self.settling_scroll = Some(SettlingScroll {
             request,
-            view_height,
+            view_size,
             painted: None,
-            selections: self.selections.generation(),
+            selections: self.selections.stamp(),
         });
         self.queued_scroll = self.placed_offset(request, line_height, view_height, focused);
         Some(request)
@@ -4121,7 +4163,7 @@ impl<M: InputModeKind> InputBaseState<M> {
     /// again for the visible range at the new scroll.
     pub(super) fn place_again_after_measuring(
         &mut self,
-        request: QueuedScroll,
+        request: PendingScroll,
         line_height: Pixels,
         view_height: Pixels,
         focused: bool,
@@ -4137,21 +4179,21 @@ impl<M: InputModeKind> InputBaseState<M> {
     /// "nearest" finds the row already in view.
     fn placed_offset(
         &self,
-        request: QueuedScroll,
+        request: PendingScroll,
         line_height: Pixels,
         view_height: Pixels,
         focused: bool,
     ) -> Option<QueuedScroll> {
         let scroll = self.scroll_handle.offset();
         match request {
-            QueuedScroll::Row(row, align) => self
+            PendingScroll::Row(row, align) => self
                 .row_scroll_y(row, align, line_height, view_height, scroll.y, focused)
                 .map(|y| QueuedScroll::Offset {
                     offset: point(scroll.x, y),
                     reveal_x: None,
                     api: true,
                 }),
-            QueuedScroll::Caret(id) => {
+            PendingScroll::Caret(id) => {
                 // Vertically as `scroll_to` reveals it (minimal padding); the
                 // caret's line isn't shaped yet, so the horizontal part
                 // follows once it is (`reveal_x`).
@@ -4169,7 +4211,6 @@ impl<M: InputModeKind> InputBaseState<M> {
                     api: true,
                 })
             }
-            QueuedScroll::Offset { .. } => Some(request),
         }
     }
 
@@ -4490,17 +4531,16 @@ impl<M: InputModeKind> InputBaseState<M> {
         let Some(queued) = self.queued_scroll.take() else {
             return;
         };
-        if !queued.is_pending() {
+        let Some(pending) = queued.pending() else {
             return;
-        }
+        };
         if !self.has_usable_layout() {
             self.queued_scroll = Some(queued);
             return;
         }
-        match queued {
-            QueuedScroll::Row(row, align) => self.scroll_to_row_at(row, align, focused, cx),
-            QueuedScroll::Caret(id) => self.reveal_caret(id, focused, true, cx),
-            QueuedScroll::Offset { .. } => {}
+        match pending {
+            PendingScroll::Row(row, align) => self.scroll_to_row_at(row, align, focused, cx),
+            PendingScroll::Caret(id) => self.reveal_caret(id, focused, true, cx),
         }
     }
 
@@ -9042,6 +9082,25 @@ mod tests {
             assert_eq!(number(after), number(before) + 1, "no ids used");
             state.set_selections(vec![caret(4), caret(1)], window, cx);
             assert_eq!(state.selections().len(), 2, "a different set still applies");
+        });
+    }
+
+    /// HERDR: the column vertical moves keep is added once the selections
+    /// are known to change, to every installed selection, merged or not.
+    #[gpui::test]
+    fn set_selections_anchors_the_column_of_what_it_installs(cx: &mut TestAppContext) {
+        let input_view = InputView::build_textarea(cx, |state| state.default_value("abcd\nefgh\nij"));
+        let mut cx = VisualTestContext::from_window(input_view.window_handle.into(), cx);
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        input_view.input.update_in(&mut cx, |state, window, cx| {
+            let range = |r: Range<usize>| SelectionRange { range: r, reversed: false };
+            state.set_selections(vec![range(7..7), range(0..2), range(2..3), range(11..11)], window, cx);
+            assert_eq!(state.selections.len(), 3, "0..2 and 2..3 merged");
+            for sel in state.selections.iter() {
+                let expected = state.preferred_column_for(sel.cursor_offset());
+                assert!(expected.is_some(), "laid out");
+                assert_eq!(sel.column_anchor, expected, "{:?}", sel.start..sel.end);
+            }
         });
     }
 
