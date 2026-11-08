@@ -3158,9 +3158,8 @@ const BASE: &str = r#"  /** A row. */
     /** Programmatic replacement works even in readonly mode. It is silent: it resets the
      * selections to a caret at the start and scrolls to the top without a `change`,
      * `selection_change` or `scroll`, so read `selections()` / `scroll_position()` after it.
-     * A scroll asked for earlier in the same handler (`scroll_to_row`) is kept instead of
-     * the reset to the top, so a mod can scroll and then load the file; the new text still
-     * starts at its left edge. That scroll is reported by `scroll` like any other. */
+     * Any scroll asked for before it is dropped: to open a file at a row, set the text
+     * first, then `scroll_to_row`. */
     set_value(value: string): void;
     /** `selection_change`: selections or carets moved, were added or removed; read `selections()`.
      * `scroll`: the view scrolled; `scroll_position()` and `row_bounds()` are current in the handler.
@@ -3190,11 +3189,13 @@ const BASE: &str = r#"  /** A row. */
      * round-trips. Throws a `TypeError` when `ranges` is not an array and a `RangeError`
      * when it is empty (an editor always has a caret: pass an empty range to reset to one). */
     set_selections(ranges: EditorRange[]): void;
-    /** Adds a selection (like Alt-click), keeping the others. */
+    /** Adds a selection (like Alt-click), keeping the others. Throws a `TypeError` when
+     * `range` is not a single range object. */
     add_selection(range: EditorRange): void;
     /** Scrolls vertically only. Before the first layout the request waits for it, and
-     * while the editor is still being sized it is placed again for each new height,
-     * until something else scrolls. Defaults to "nearest". */
+     * while the editor is first being sized (the first half second after it is placed)
+     * it is placed again for each new height, until something else scrolls. A later
+     * `set_value` drops it. Defaults to "nearest". */
     scroll_to_row(row: number, align?: "nearest" | "top" | "center"): void;
     /** Pixels scrolled from the top left, counting a scroll asked for earlier in the same
      * handler (`scroll_to_row`, `set_selections`). Before the first layout `line_height` is

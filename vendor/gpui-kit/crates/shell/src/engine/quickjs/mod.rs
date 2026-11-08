@@ -5586,6 +5586,12 @@ globalThis.__gpui = (() => {
     }
     return Array.from(value);
   };
+  const editorRange = (method, value) => {
+    if (value == null || typeof value !== "object" || Array.isArray(value)) {
+      throw new TypeError(`EditorState.${method} expects one { start, end } range`);
+    }
+    return value;
+  };
   const element = (id) => {
     const object = Object.create(globalThis.__diagnostics ? diagnostic : methods);
     object.__id = id;
@@ -7053,6 +7059,8 @@ globalThis.__gpui = (() => {
     // HERDR: code editor uses the same value/event lifecycle as TextareaState.
     // `editorList` rejects a single object passed for a list: `Array.from` on it
     // would be an empty list, and the call would silently do nothing.
+    // `editorRange` rejects the reverse (a list, or nothing, for one range), so
+    // the error names the method instead of being a raw parse error.
     EditorState: {
       new: (options = {}) => {
         const handle = __editor_state_new(JSON.stringify(options));
@@ -7065,7 +7073,7 @@ globalThis.__gpui = (() => {
           set_selections: (ranges) =>
             __editor_set_selections(handle, JSON.stringify(editorList("set_selections", ranges)), false),
           add_selection: (range) =>
-            __editor_set_selections(handle, JSON.stringify([range]), true),
+            __editor_set_selections(handle, JSON.stringify([editorRange("add_selection", range)]), true),
           scroll_to_row: (row, align) =>
             __editor_scroll_to_row(handle, Number(row), String(align ?? "nearest")),
           scroll_position: () => JSON.parse(__editor_scroll_position(handle)),

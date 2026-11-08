@@ -137,14 +137,12 @@ pub enum RowScrollAlign {
 /// decided by the methods below, so callers don't match on the variants.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(in crate::input) enum QueuedScroll {
-    /// An offset the next paint applies (and clamps), and where it came
-    /// from. `reveal_x`: what that frame then reveals horizontally, once
-    /// the line is shaped at the new vertical scroll
-    /// (`TextElement::layout_cursors`): a row the last frame didn't lay out
-    /// has no measurable column until then.
+    /// An offset the next paint applies (and clamps). `reveal_x`: what
+    /// that frame then reveals horizontally, once the line is shaped at the
+    /// new vertical scroll (`TextElement::layout_cursors`): a row the last
+    /// frame didn't lay out has no measurable column until then.
     Offset {
         offset: Point<Pixels>,
-        kind: ScrollKind,
         reveal_x: Option<RevealX>,
     },
     /// [`InputBaseState::scroll_to_row`] before a usable layout (none yet,
@@ -160,32 +158,25 @@ pub(in crate::input) enum QueuedScroll {
 }
 
 /// HERDR: a row or caret scroll asked for before layout, after prepaint
-/// placed it: a later change of the view's height (a pane still being
-/// sized) places it again, until something else scrolls
-/// ([`InputBaseState::resolve_pending_scroll`]).
+/// placed it: a change of the view's height within [`SETTLE_FOR`] of that
+/// (a pane still being sized) places it again, unless something else
+/// scrolled ([`InputBaseState::resolve_pending_scroll`]).
+/// HERDR: how long after an early scroll is first placed a new view height
+/// still places it again: long enough for a pane opened with the window to
+/// get its final size, short enough that a later resize (the user's) keeps
+/// what the user is looking at.
+pub(super) const SETTLE_FOR: std::time::Duration = std::time::Duration::from_millis(500);
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct SettlingScroll {
     /// The [`QueuedScroll::Row`] or [`QueuedScroll::Caret`] asked for.
     request: QueuedScroll,
+    /// When it was first placed.
+    placed_at: std::time::Instant,
     /// The view height it was placed for.
     view_height: Pixels,
     /// The scroll the frame that placed it ended at; `None` until painted.
     painted: Option<Point<Pixels>>,
-}
-
-/// HERDR: who asked for a queued offset, which decides whether replacing
-/// the text keeps it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(in crate::input) enum ScrollKind {
-    /// A caret or offset revealed (cursor-follow): it points into the old
-    /// text, so `set_value` drops it.
-    Reveal,
-    /// `set_scroll_offset`: kept whole by `set_value` until it is drawn,
-    /// as upstream always has.
-    Code,
-    /// `scroll_to_row`: `set_value` in the same handler keeps its vertical
-    /// part ([`InputBaseState::fresh_row_scroll`]).
-    Row,
 }
 
 /// HERDR: a position the frame applying a queued offset reveals
@@ -217,24 +208,6 @@ impl QueuedScroll {
         match *self {
             Self::Offset { reveal_x, .. } => reveal_x,
             Self::Row(..) | Self::Caret(_) => None,
-        }
-    }
-
-    /// What survives replacing the text, with `keep_rows` telling whether a
-    /// row scroll was asked for in this handler. Such a row scroll is kept
-    /// vertically: the new text starts at its left edge. A row scroll from
-    /// an earlier handler and anything revealed (old text) are dropped; a
-    /// `set_scroll_offset` is kept as it is (upstream behavior).
-    fn for_new_text(self, keep_rows: bool) -> Option<Self> {
-        match self {
-            Self::Offset { kind: ScrollKind::Code, .. } => Some(self),
-            Self::Offset { offset, kind: ScrollKind::Row, .. } if keep_rows => Some(Self::Offset {
-                offset: point(px(0.), offset.y),
-                kind: ScrollKind::Row,
-                reveal_x: None,
-            }),
-            Self::Row(..) if keep_rows => Some(self),
-            _ => None,
         }
     }
 }
@@ -677,13 +650,6 @@ pub struct InputBaseState<M: InputModeKind> {
     pub(crate) scroll_handle: ScrollHandle,
     /// HERDR: the scroll the next paint applies, if any.
     pub(in crate::input) queued_scroll: Option<QueuedScroll>,
-    /// HERDR: set while a `scroll_to_row` asked for in the current handler
-    /// may still be kept by `set_value`; cleared once the handler's effects
-    /// are flushed ([`Self::mark_row_scroll_fresh`]). Holds that request's
-    /// number, so an older request's clearing can't clear a newer one.
-    fresh_row_scroll: Option<u64>,
-    /// HERDR: `scroll_to_row` requests so far, numbering `fresh_row_scroll`.
-    row_scroll_requests: u64,
     /// HERDR: a scroll asked for before layout, placed again when the view's
     /// height changes, until something else scrolls.
     settling_scroll: Option<SettlingScroll>,
@@ -1077,8 +1043,6 @@ impl<M: InputModeKind> InputBaseState<M> {
             longest_line_width: Cell::new(None),
             editor_paddings: Edges::default(),
             queued_scroll: None,
-            fresh_row_scroll: None,
-            row_scroll_requests: 0,
             settling_scroll: None,
             last_frame_document_revision: 0,
             show_unfocused_selection: false,
@@ -1409,14 +1373,28 @@ impl<M: InputModeKind> InputBaseState<M> {
         // the start visible; the deferred offset is consumed during that paint.
         self.scroll_handle.set_offset(point(px(0.), px(0.)));
         if self.is_single_line() {
-            self.queue_scroll_offset(point(px(0.), px(0.)), ScrollKind::Code);
-            return;
+            self.queue_scroll_offset(point(px(0.), px(0.)));
         }
-        // HERDR: a `scroll_to_row` earlier in this handler (a mod scrolling,
-        // then loading the file) keeps its vertical part; see `for_new_text`.
+        // HERDR: a multi-line input keeps a queued scroll, as upstream
+        // always has; an early scroll placed for the old text is no longer
+        // placed again. Scripts start the new text at the top
+        // ([`Self::set_value_from_top`]).
         self.settling_scroll = None;
-        let keep_rows = self.fresh_row_scroll.is_some();
-        self.queued_scroll = self.queued_scroll.and_then(|queued| queued.for_new_text(keep_rows));
+    }
+
+    /// HERDR: [`Self::set_value`] for scripts: a multi-line input also drops
+    /// any scroll asked for before it, so the new text always starts at the
+    /// top. A script scrolls after setting the text.
+    pub fn set_value_from_top(
+        &mut self,
+        value: impl Into<super::InputContent>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.set_value(value, window, cx);
+        if !self.is_single_line() {
+            self.queued_scroll = None;
+        }
     }
 
     /// Set with disabled mode.
@@ -3016,26 +2994,7 @@ impl<M: InputModeKind> InputBaseState<M> {
         // drawing at this offset's x instead of its own cursor-follow. A
         // measured column replaces an older target, which would undo it.
         let reveal_x = (!measured_x).then(|| self.reveal_x_target(offset));
-        // Revealing an offset whose row is visible at a code scroll queued
-        // earlier in this handler keeps that scroll and its kind, so
-        // replacing the text afterwards still treats it as asked for by
-        // code. Only the vertical part decides: a reveal that just scrolls
-        // sideways updates the code scroll's x.
-        match &mut self.queued_scroll {
-            Some(QueuedScroll::Offset { kind, offset, reveal_x: queued_x })
-                if *kind != ScrollKind::Reveal && scroll_offset.y == was_offset.y =>
-            {
-                offset.x = scroll_offset.x;
-                *queued_x = reveal_x;
-            }
-            _ => {
-                self.queued_scroll = Some(QueuedScroll::Offset {
-                    offset: scroll_offset,
-                    kind: ScrollKind::Reveal,
-                    reveal_x,
-                })
-            }
-        }
+        self.queued_scroll = Some(QueuedScroll::Offset { offset: scroll_offset, reveal_x });
         cx.notify();
     }
 
@@ -3526,7 +3485,7 @@ impl<M: InputModeKind> InputBaseState<M> {
     /// The offset will be clamped to the valid range, and applied after the next layout.
     pub fn set_scroll_offset(&mut self, offset: gpui::Point<gpui::Pixels>, cx: &mut Context<Self>) {
         // The newest scroll request wins over one kept for after layout.
-        self.queue_scroll_offset(offset, ScrollKind::Code);
+        self.queue_scroll_offset(offset);
         cx.notify();
     }
 
@@ -3803,7 +3762,8 @@ impl<M: InputModeKind> InputBaseState<M> {
     /// Before a usable layout (none yet, or one with no height) the request
     /// is kept and applied once there is one. Reads focus from `window`:
     /// ghost lines, drawn only while focused, move the rows below them.
-    /// `set_value` later in the same handler keeps this scroll.
+    /// A later `set_value` keeps it only as [`Self::set_value`] keeps any
+    /// queued scroll; [`Self::set_value_from_top`] drops it.
     pub fn scroll_to_row(
         &mut self,
         row: usize,
@@ -3813,27 +3773,6 @@ impl<M: InputModeKind> InputBaseState<M> {
     ) {
         let focused = self.focus_handle.is_focused(window);
         self.scroll_to_row_at(row, align, focused, cx);
-        self.mark_row_scroll_fresh(cx);
-    }
-
-    /// HERDR: `set_value` keeps a `scroll_to_row` asked for in the same
-    /// handler (scroll, then load the file). gpui has no handler boundary,
-    /// so "the same handler" ends when the effects queued so far are
-    /// flushed: the deferred callback runs after them, and before any later
-    /// event, timer or task.
-    fn mark_row_scroll_fresh(&mut self, cx: &mut Context<Self>) {
-        self.row_scroll_requests = self.row_scroll_requests.wrapping_add(1);
-        let request = self.row_scroll_requests;
-        self.fresh_row_scroll = Some(request);
-        let this = cx.weak_entity();
-        cx.defer(move |cx| {
-            this.update(cx, |state, _| {
-                if state.fresh_row_scroll == Some(request) {
-                    state.fresh_row_scroll = None;
-                }
-            })
-            .ok();
-        });
     }
 
     /// [`Self::scroll_to_row`] in an editor that is `focused`.
@@ -3869,7 +3808,6 @@ impl<M: InputModeKind> InputBaseState<M> {
         let reveal_x = self.queued_scroll.and_then(|queued| queued.reveal_x());
         self.queued_scroll = Some(QueuedScroll::Offset {
             offset: scroll_offset,
-            kind: ScrollKind::Row,
             reveal_x,
         });
         cx.notify();
@@ -3947,14 +3885,15 @@ impl<M: InputModeKind> InputBaseState<M> {
     /// first frame can also have a height that is not the final one (a
     /// pane still being sized), so the request is placed again whenever the
     /// height changes, until another scroll is asked for or the view is
-    /// scrolled ([`SettlingScroll`]).
+    /// scrolled, or until [`SETTLE_FOR`] has passed ([`SettlingScroll`]).
     /// `focused`: whether this frame draws an inline completion's ghost
-    /// lines.
+    /// lines. `now`: the app's clock.
     pub(super) fn resolve_pending_scroll(
         &mut self,
         line_height: Pixels,
         view_height: Pixels,
         focused: bool,
+        now: std::time::Instant,
     ) {
         if self.is_single_line() || view_height <= px(0.) {
             return;
@@ -3962,8 +3901,12 @@ impl<M: InputModeKind> InputBaseState<M> {
         if let Some(settling) = self.settling_scroll
             && let Some(painted) = settling.painted
         {
-            if self.queued_scroll.is_some() || self.scroll_handle.offset() != painted {
-                // Something else scrolled since: it no longer applies.
+            if self.queued_scroll.is_some()
+                || self.scroll_handle.offset() != painted
+                || now.saturating_duration_since(settling.placed_at) >= SETTLE_FOR
+            {
+                // Something else scrolled since, or the pane has long been
+                // sized (a resize now is the user's): it no longer applies.
                 self.settling_scroll = None;
             } else if settling.view_height != view_height {
                 self.queued_scroll = Some(settling.request);
@@ -3975,7 +3918,6 @@ impl<M: InputModeKind> InputBaseState<M> {
                 .row_scroll_y(row, align, line_height, view_height, scroll.y, focused)
                 .map(|y| QueuedScroll::Offset {
                     offset: point(scroll.x, y),
-                    kind: ScrollKind::Row,
                     reveal_x: None,
                 }),
             Some(QueuedScroll::Caret(id)) => {
@@ -3992,14 +3934,19 @@ impl<M: InputModeKind> InputBaseState<M> {
                 let y = y.clamp(self.safe_scroll_y_min(line_height, view_height, y, focused), px(0.));
                 Some(QueuedScroll::Offset {
                     offset: point(scroll.x, y),
-                    kind: ScrollKind::Reveal,
                     reveal_x: Some(RevealX::Caret(id)),
                 })
             }
             _ => return,
         };
         if let Some(request) = self.queued_scroll {
-            self.settling_scroll = Some(SettlingScroll { request, view_height, painted: None });
+            // Placed again: the window still counts from the first placing.
+            let placed_at = self
+                .settling_scroll
+                .filter(|settling| settling.request == request)
+                .map_or(now, |settling| settling.placed_at);
+            self.settling_scroll =
+                Some(SettlingScroll { request, placed_at, view_height, painted: None });
         }
         self.queued_scroll = resolved;
     }
@@ -4197,7 +4144,7 @@ impl<M: InputModeKind> InputBaseState<M> {
     /// caret convert nothing. Only ends past the edit are converted, pair by
     /// pair, stopping at the first difference.
     fn take_selection_report(&mut self) -> bool {
-        self.reported_selections_generation = self.selections.generation();
+        self.reported_selections_generation = self.selections.mark_seen();
         let mut current = self.selections();
         for sel in &mut current {
             sel.reversed &= !sel.range.is_empty();
@@ -4228,9 +4175,10 @@ impl<M: InputModeKind> InputBaseState<M> {
     /// selection changed without a notify (no event would fire until some
     /// unrelated notify otherwise). Every selection mutation goes through
     /// [`Selections`]' mutating methods, which bump its generation, so a
-    /// check that finds no selection touched (a cursor blink, a hover)
-    /// returns after one integer compare. A bump that wrote nothing new
-    /// costs one compare of byte ranges ([`Self::take_selection_report`]).
+    /// check that finds no selection touched (a cursor blink, a hover, a
+    /// click rewriting the active selection with its own value) returns
+    /// after one integer compare. A bump that wrote nothing new costs one
+    /// compare of byte ranges ([`Self::take_selection_report`]).
     /// A notify sent before the change in the same update is fine: gpui
     /// runs this after the update.
     ///
@@ -4259,12 +4207,8 @@ impl<M: InputModeKind> InputBaseState<M> {
         self.queued_scroll.and_then(|queued| queued.offset())
     }
 
-    pub(in crate::input) fn queue_scroll_offset(&mut self, offset: Point<Pixels>, kind: ScrollKind) {
-        self.queued_scroll = Some(QueuedScroll::Offset {
-            offset,
-            kind,
-            reveal_x: None,
-        });
+    pub(in crate::input) fn queue_scroll_offset(&mut self, offset: Point<Pixels>) {
+        self.queued_scroll = Some(QueuedScroll::Offset { offset, reveal_x: None });
     }
 
     /// What the next paint reveals horizontally with the queued offset

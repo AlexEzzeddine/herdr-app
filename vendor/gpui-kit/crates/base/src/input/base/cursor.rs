@@ -134,10 +134,15 @@ impl RangeBounds<usize> for CursorSelection {
 pub(super) struct Selections {
     selections: Vec<CursorSelection>,
     next_id: usize,
-    /// HERDR: bumped by every mutating method, so the owner can tell cheaply
-    /// that the selections may have changed (see `InputBaseState`'s
-    /// selection-change report).
+    /// HERDR: bumped by every mutating method but [`Self::active_mut`], so
+    /// the owner can tell cheaply that the selections may have changed (see
+    /// `InputBaseState`'s selection-change report).
     generation: u64,
+    /// HERDR: the active selection before the first [`Self::active_mut`]
+    /// since [`Self::mark_seen`]. Many callers write it with the value it
+    /// already has (`reversed = false` on every click), so the write counts
+    /// as a change only if the value differs ([`Self::generation`]).
+    active_before: Option<CursorSelection>,
 }
 
 impl Selections {
@@ -146,6 +151,7 @@ impl Selections {
             selections: vec![CursorSelection::new(CursorId::new(0), 0, 0)],
             next_id: 1,
             generation: 0,
+            active_before: None,
         }
     }
 
@@ -158,15 +164,28 @@ impl Selections {
 
     /// Returns a mutable reference to the active selection.
     pub(super) fn active_mut(&mut self) -> &mut CursorSelection {
-        self.generation += 1;
+        if self.active_before.is_none() {
+            self.active_before = Some(*self.active());
+        }
         self.selections
             .first_mut()
             .expect("Selections always has at least one selection")
     }
 
-    /// HERDR: changes whenever a mutating method ran (it may not have
-    /// changed anything; equal generations mean nothing changed).
+    /// HERDR: changes whenever a mutating method ran or the active
+    /// selection was written with a new value, since [`Self::mark_seen`]
+    /// (a method may not have changed anything; equal generations mean
+    /// nothing changed).
     pub(super) fn generation(&self) -> u64 {
+        let active_changed = self.active_before.is_some_and(|before| before != *self.active());
+        self.generation + u64::from(active_changed)
+    }
+
+    /// HERDR: the owner has seen the selections at [`Self::generation`]:
+    /// later writes of the active selection compare against it as it is now.
+    pub(super) fn mark_seen(&mut self) -> u64 {
+        self.generation = self.generation();
+        self.active_before = None;
         self.generation
     }
 

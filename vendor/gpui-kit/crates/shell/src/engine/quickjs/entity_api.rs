@@ -499,7 +499,13 @@ pub fn install(ctx: &Ctx<'_>, module: &Object<'_>, runtime: Weak<ShellRuntime>) 
         "__editor_set_value",
         Func::from(
             move |ctx: Ctx<'_>, handle: EntityHandle, value: String| -> JsResult<()> {
-                write_value(&ctx, &live_editor(&ctx, &write_editor, handle)?, value)
+                // HERDR: the new text starts at the top, whatever scroll was
+                // asked for before it; a script scrolls after setting it.
+                let state = live_editor(&ctx, &write_editor, handle)?;
+                scope::with_current(|window, cx| {
+                    state.update(cx, |state, cx| state.set_value_from_top(value, window, cx));
+                })
+                .ok_or_else(|| needs_call(&ctx, "set_value()"))
             },
         ),
     )?;
@@ -614,9 +620,9 @@ pub fn install(ctx: &Ctx<'_>, module: &Object<'_>, runtime: Weak<ShellRuntime>) 
                 let state = live_editor(&ctx, &read_scroll, handle)?;
                 scope::with_current(|window, cx| {
                     // A scroll queued in this handler counts, like `row_bounds`.
-                    let (offset, line_height) = state.update(cx, |state, _| {
-                        (state.queued_scroll_offset(window), state.line_height())
-                    });
+                    let state = state.read(cx);
+                    let (offset, line_height) =
+                        (state.queued_scroll_offset(window), state.line_height());
                     serde_json::json!({
                         "top": -f32::from(offset.y),
                         "left": -f32::from(offset.x),
@@ -636,9 +642,7 @@ pub fn install(ctx: &Ctx<'_>, module: &Object<'_>, runtime: Weak<ShellRuntime>) 
             move |ctx: Ctx<'_>, handle: EntityHandle, row: f64| -> JsResult<String> {
                 let state = live_editor(&ctx, &read_row, handle)?;
                 let row = editor_row(&ctx, row)?;
-                scope::with_current(|window, cx| match state
-                    .update(cx, |state, _| state.row_bounds(row, window))
-                {
+                scope::with_current(|window, cx| match state.read(cx).row_bounds(row, window) {
                     Some((top, height)) => serde_json::json!({
                         "top": f32::from(top),
                         "height": f32::from(height),

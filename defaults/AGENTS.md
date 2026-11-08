@@ -941,8 +941,8 @@ or editor with syntax highlighting, line numbers and folding. Its
 JS string units); `scroll_to_row(row, "nearest" | "top" | "center")`,
 `scroll_position()` and `row_bounds(row)` scroll and measure; `on("selection_change")`
 and `on("scroll")` report changes (`set_value` is silent: it resets selections and
-scroll without either event, so re-read them after it; a `scroll_to_row` earlier in
-the same handler is kept and reported). `set_line_decorations(key, [{ row,
+scroll without either event, so re-read them after it, and drops any scroll asked
+for before it: set the text, then `scroll_to_row`). `set_line_decorations(key, [{ row,
 end_row?, background?, gutter? }])` colors whole rows and puts a bar in the
 gutter (a diff: re-set on `change`, rows don't follow edits; set them
 before or after `set_value`; where keys overlap, the later key in JS `sort()`

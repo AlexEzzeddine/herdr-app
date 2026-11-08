@@ -5739,6 +5739,53 @@ export default class Code extends View {
     assert!(tree.contains("changes=1"), "{tree}");
 }
 
+// HERDR: a script's set_value starts the new text at the top, dropping a
+// scroll asked for before it; scroll_to_row after it opens the text there.
+#[gpui::test]
+fn a_script_editor_set_value_drops_an_earlier_scroll(cx: &mut TestAppContext) {
+    cx.update(|cx| crate::init(cx));
+    let runtime = ShellRuntime::new_isolated().expect("runtime");
+    cx.update(|cx| runtime.set_global(cx));
+    let source = r##"
+import { View, div } from "gpui-kit";
+import { Editor, EditorState } from "gpui-base";
+const text = (name) => Array.from({ length: 80 }, (_, i) => name + " " + i).join("\n");
+export default class Code extends View {
+  init() {
+    this.before = EditorState.new({ value: text("old") });
+    this.after = EditorState.new({ value: text("old") });
+    this.before.scroll_to_row(60, "top");
+    this.before.set_value(text("new"));
+    this.after.set_value(text("new"));
+    this.after.scroll_to_row(60, "top");
+  }
+  render(cx) {
+    return div()
+      .child(Editor.new(this.before).h(200))
+      .child(Editor.new(this.after).h(200))
+      .child("before=" + this.before.scroll_position().top)
+      .child("after=" + JSON.stringify(this.after.row_bounds(60)));
+  }
+}
+"##;
+    let view_type = runtime.load_source("set_value_scroll", source).expect("load");
+    let window = cx.add_window(|_, _| Empty);
+    let mut context = VisualTestContext::from_window(*window.deref(), cx);
+    let object = context
+        .update(|window, cx| runtime.instantiate(&view_type, window, cx))
+        .expect("instantiate");
+    let view = context.update(|_, cx| cx.new(|_| ScriptView::new(runtime.clone(), object.clone())));
+    for _ in 0..3 {
+        draw(&mut context, &view);
+    }
+    let tree = context
+        .update(|window, cx| runtime.render_to_spec(&object, None, window, cx))
+        .expect("render")
+        .replace("\\\"", "\"");
+    assert!(tree.contains("before=0"), "{tree}");
+    assert!(tree.contains(r#"after={"top":0,"#), "{tree}");
+}
+
 // HERDR: scripts read and set multiple selections by row/col and scroll to rows.
 #[gpui::test]
 fn a_script_editor_reads_sets_and_scrolls_to_selections(cx: &mut TestAppContext) {
@@ -5767,10 +5814,16 @@ export default class Code extends View {
     this.code.scroll_to_row(60, "top");
     try { this.code.set_selections([]); this.empty = "accepted"; }
     catch (error) { this.empty = error.name; }
+    this.bad_add = [];
+    for (const bad of [[{ start: { row: 0, col: 0 }, end: { row: 0, col: 0 } }], undefined]) {
+      try { this.code.add_selection(bad); this.bad_add.push("accepted"); }
+      catch (error) { this.bad_add.push(error.name + ":" + error.message.includes("add_selection")); }
+    }
   }
   render(cx) {
     return div()
       .child(Editor.new(this.code).h(200))
+      .child("bad_add=" + JSON.stringify(this.bad_add))
       .child("sel=" + JSON.stringify(this.code.selections()))
       .child("events=" + this.selection_events)
       .child("row60=" + JSON.stringify(this.code.row_bounds(60)))
@@ -5819,6 +5872,8 @@ export default class Code extends View {
     assert!(tree.contains("scroll_seen=[0]"), "{tree}");
     // An empty list would leave no caret: refused, and the selections kept.
     assert!(tree.contains("empty=RangeError"), "{tree}");
+    // A list or nothing for one range: a TypeError naming the method.
+    assert!(tree.contains(r#"bad_add=["TypeError:true","TypeError:true"]"#), "{tree}");
 
     // A user moving the caret is reported too.
     context.update(|_, cx| editor.update(cx, |state, cx| state.set_selected_range(0..0, cx)));
