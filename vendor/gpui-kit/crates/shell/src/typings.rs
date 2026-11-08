@@ -3159,7 +3159,8 @@ const BASE: &str = r#"  /** A row. */
      * selections to a caret at the start and scrolls to the top without a `change`,
      * `selection_change` or `scroll`, so read `selections()` / `scroll_position()` after it.
      * Any scroll asked for before it is dropped: to open a file at a row, set the text
-     * first, then `scroll_to_row`. */
+     * first, then `scroll_to_row`. A scroll the reader caused just before it (a key or a
+     * click revealing the caret) still applies and is reported by `scroll`. */
     set_value(value: string): void;
     /** `selection_change`: selections or carets moved, were added or removed; read `selections()`.
      * `scroll`: the view scrolled; `scroll_position()` and `row_bounds()` are current in the handler.

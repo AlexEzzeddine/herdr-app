@@ -2720,16 +2720,23 @@ impl<M: InputModeKind> Element for TextElement<M> {
         // an offset now that rows are wrapped and the line height is known,
         // so this frame is laid out and drawn there.
         let focused = self.state.read(cx).focus_handle.is_focused(window);
-        self.state.update(cx, |state, _| {
-            state.resolve_pending_scroll(line_height, bounds.size.height, focused);
+        let placed = self.state.update(cx, |state, _| {
+            state.resolve_pending_scroll(line_height, bounds.size.height, focused)
         });
-        let token_elements = self.measure_tokens(
-            (bounds.size.width - line_number_width - RIGHT_MARGIN).max(px(1.)),
-            line_height,
-            bounds.size.height,
-            window,
-            cx,
-        );
+        let token_width = (bounds.size.width - line_number_width - RIGHT_MARGIN).max(px(1.));
+        let mut token_elements =
+            self.measure_tokens(token_width, line_height, bounds.size.height, window, cx);
+        // HERDR: token widths can move soft-wrap breaks, so a scroll placed
+        // above is placed again on the rows as now wrapped, and the tokens
+        // are measured again for what that scroll shows.
+        if let Some(request) = placed
+            && self.state.update(cx, |state, _| {
+                state.place_again_after_measuring(request, line_height, bounds.size.height, focused)
+            })
+        {
+            token_elements =
+                self.measure_tokens(token_width, line_height, bounds.size.height, window, cx);
+        }
         let state = self.state.read(cx);
 
         let (visible_range, visible_buffer_lines, visible_top) =
@@ -4245,6 +4252,67 @@ mod tests {
         }
     }
 
+    // HERDR: a scroll asked for later ends placing the early one again even
+    // when it doesn't move the view: "nearest" on a row in view, or new
+    // selections whose caret is in view. A resize then leaves the scroll
+    // alone.
+    #[gpui::test]
+    fn a_request_that_scrolls_nothing_ends_an_early_scroll(cx: &mut TestAppContext) {
+        for caret in [false, true] {
+            cx.update(crate::init);
+            let height = Rc::new(std::cell::Cell::new(px(0.)));
+            let mut editor = None;
+            let window = cx.open_window(size(px(240.), px(200.)), {
+                let height = height.clone();
+                |window, cx| {
+                    let state = cx.new(|cx| {
+                        let mut state = EditorState::new(window, cx)
+                            .soft_wrap(false)
+                            .default_value(sixty_lines("line"));
+                        state.scroll_to_row(40, crate::input::RowScrollAlign::Center, window, cx);
+                        state
+                    });
+                    editor = Some(state.clone());
+                    SizedHarness(state, height)
+                }
+            });
+            let editor = editor.unwrap();
+            let mut cx = VisualTestContext::from_window(window.into(), cx);
+            height.set(px(100.));
+            cx.update(|window, cx| window.draw(cx).clear(cx));
+            let before = cx.update(|window, cx| {
+                editor.update(cx, |state, cx| {
+                    if caret {
+                        let start = state.text.line_start_offset(40);
+                        state.set_selections(vec![sel(start..start, false)], window, cx);
+                    } else {
+                        state.scroll_to_row(40, crate::input::RowScrollAlign::Nearest, window, cx);
+                    }
+                    // "Nearest" on a row in view queues nothing; a caret
+                    // reveal queues the offset it is already at.
+                    assert_eq!(
+                        state.deferred_scroll_offset().is_some(),
+                        caret,
+                        "caret {caret}: what the request queued"
+                    );
+                    state.scroll_offset()
+                })
+            });
+            height.set(px(180.));
+            cx.update(|window, cx| {
+                window.refresh();
+                window.draw(cx).clear(cx);
+            });
+            let view = editor.read_with(&cx, |state, _| state.last_bounds.unwrap().size.height);
+            assert!(view > px(150.), "caret {caret}: the view grew ({view:?})");
+            assert_eq!(
+                editor.read_with(&cx, |state, _| state.scroll_offset()),
+                before,
+                "caret {caret}: the scroll stays where it was"
+            );
+        }
+    }
+
     // HERDR: writing the active selection with the value it already has
     // (a click's `reversed = false`) isn't a selection change: the report
     // check stays one integer compare.
@@ -4358,6 +4426,33 @@ mod tests {
         cx.run_until_parked();
         assert_eq!(editor.read_with(&cx, |state, _| state.selected_range()), 5..5);
         assert_eq!(seen.get(), 2, "the caret's column moved");
+    }
+
+    // HERDR: the selection-change report skips its comparison while the
+    // selections' generation is unchanged, so every edit path has to bump
+    // it, even when the caret keeps its byte offset (only its UTF-16 column
+    // moves): otherwise that move would never be reported.
+    #[gpui::test]
+    fn every_edit_path_bumps_the_selection_generation(cx: &mut TestAppContext) {
+        for path in ["ranges", "range", "range_silent"] {
+            let (editor, window) = decoration_editor(cx, "aa\néx", false);
+            let mut cx = VisualTestContext::from_window(window.into(), cx);
+            cx.update(|window, cx| {
+                editor.update(cx, |state, cx| {
+                    state.set_selected_range(5..5, cx);
+                    let seen = state.selections.mark_seen();
+                    // "é" to "ab": the caret stays at byte 5. The single-range
+                    // paths take UTF-16 ranges ("é" is unit 3).
+                    match path {
+                        "ranges" => state.replace_text_in_ranges(&[(3..5, "ab".into())], window, cx),
+                        "range" => state.replace_text_in_range(Some(3..4), "ab", window, cx),
+                        _ => state.replace_text_in_range_silent(Some(3..4), "ab", window, cx),
+                    }
+                    assert_eq!(state.selected_range(), 5..5, "{path}: same byte offset");
+                    assert_ne!(state.selections.generation(), seen, "{path}: generation bumped");
+                })
+            });
+        }
     }
 
     // HERDR: a row asked for before layout, right after the text is set,
