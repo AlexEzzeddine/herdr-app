@@ -148,9 +148,16 @@ pub(in crate::input) enum QueuedScroll {
     /// ([`Self::kept_by_set_value`]). Upstream requests (`set_scroll_offset`,
     /// reveals by keys, mouse, search and `add_selection`) are kept, as
     /// upstream always has. The latest request decides.
+    ///
+    /// `measured`: what this offset's x was measured to reveal, when an
+    /// upstream reveal found its line laid out (it has no `reveal_x`). A
+    /// row scroll asked for after it ([`InputBaseState::scroll_to_row`])
+    /// can then redo that step at its own view instead of keeping an x
+    /// measured at the old one.
     Offset {
         offset: Point<Pixels>,
         reveal_x: Option<RevealX>,
+        measured: Option<RevealX>,
         api: bool,
     },
     /// A row or caret asked for before a usable layout (none yet, or one
@@ -243,6 +250,16 @@ impl QueuedScroll {
     fn reveal_x(&self) -> Option<RevealX> {
         match *self {
             Self::Offset { reveal_x, .. } => reveal_x,
+            Self::Pending(_) => None,
+        }
+    }
+
+    /// What this offset reveals horizontally, whether paint still has to
+    /// measure it (`reveal_x`) or it was measured when queued (`measured`);
+    /// `None` for an explicit offset.
+    fn revealed(&self) -> Option<RevealX> {
+        match *self {
+            Self::Offset { reveal_x, measured, .. } => reveal_x.or(measured),
             Self::Pending(_) => None,
         }
     }
@@ -851,10 +868,10 @@ pub struct InputBaseState<M: InputModeKind> {
     /// selections into; it swaps with the report's, so neither reallocates.
     /// [`Self::set_selections`] borrows it too.
     selection_scratch: Vec<SelectionRange>,
-    /// [`Selections::generation`] when `selection_report` was last
-    /// checked: an unchanged generation skips the comparison (cursor blinks
-    /// notify without touching the selections).
-    pub(super) reported_selections_generation: u64,
+    /// [`Selections::stamp`] when `selection_report` was last checked: an
+    /// unchanged stamp skips the comparison (cursor blinks notify without
+    /// touching the selections).
+    pub(super) reported_selections: super::cursor::SelectionsStamp,
     /// HERDR: whether [`InputEvent::SelectionChange`] is reported
     /// ([`Self::report_selection_changes`]). Off until an owner asks, so
     /// editors nobody listens to don't compare selections on every change.
@@ -1196,7 +1213,7 @@ impl<M: InputModeKind> InputBaseState<M> {
                 ends_sorted: true,
             },
             selection_scratch: Vec::new(),
-            reported_selections_generation: 0,
+            reported_selections: Selections::default().stamp(),
             reports_selection_changes: false,
             _pending_update: false,
             cursor_line_end_affinity: false,
@@ -3138,11 +3155,19 @@ impl<M: InputModeKind> InputBaseState<M> {
         // measured column replaces an older target, which would undo it.
         // A caret reveal always names its caret, which follows edits made
         // before that frame.
-        let (reveal_x, api) = match by {
-            RevealBy::Upstream => ((!measured_x).then(|| self.reveal_x_target(offset)), false),
-            RevealBy::Caret { id, api } => (Some(RevealX::Caret(id)), api),
+        let (reveal_x, measured, api) = match by {
+            RevealBy::Upstream => {
+                let target = self.reveal_x_target(offset);
+                if measured_x {
+                    (None, Some(target), false)
+                } else {
+                    (Some(target), None, false)
+                }
+            }
+            RevealBy::Caret { id, api } => (Some(RevealX::Caret(id)), None, api),
         };
-        self.queued_scroll = Some(QueuedScroll::Offset { offset: scroll_offset, reveal_x, api });
+        self.queued_scroll =
+            Some(QueuedScroll::Offset { offset: scroll_offset, reveal_x, measured, api });
         cx.notify();
     }
 
@@ -3670,15 +3695,7 @@ impl<M: InputModeKind> InputBaseState<M> {
     /// [`Self::set_selected_range`] with the caret at the start when
     /// `reversed` (and the range isn't empty).
     fn select_range(&mut self, range: Range<usize>, reversed: bool, cx: &mut Context<Self>) {
-        let range = self.normalize_token_range(range);
-        let end_bias = if range.start == range.end {
-            Bias::Left
-        } else {
-            Bias::Right
-        };
-        let start = self.text.clip_offset(range.start, Bias::Left);
-        let end = self.text.clip_offset(range.end, end_bias);
-
+        let (start, end) = self.clip_range(range);
         let (anchor, caret) = if reversed { (end, start) } else { (start, end) };
         self.move_to(anchor, None, cx);
         self.active_selection_mut().reversed = false;
@@ -3887,10 +3904,7 @@ impl<M: InputModeKind> InputBaseState<M> {
     /// HERDR: whether a single-line input's selection already is
     /// `selection`, clipped as [`Self::select_range`] clips it.
     fn single_line_selection_is(&self, selection: &SelectionRange) -> bool {
-        let range = self.normalize_token_range(selection.range.clone());
-        let end_bias = if range.start == range.end { Bias::Left } else { Bias::Right };
-        let start = self.text.clip_offset(range.start, Bias::Left);
-        let end = self.text.clip_offset(range.end, end_bias);
+        let (start, end) = self.clip_range(selection.range.clone());
         let current = self.selections.active();
         self.selections.is_single()
             && start <= end
@@ -3924,19 +3938,31 @@ impl<M: InputModeKind> InputBaseState<M> {
         M::clear_inline_completion(self, cx);
     }
 
-    /// Clip and snap a selection range for [`Self::add_selection`] and
-    /// [`Self::set_selections`]: expand UTF-8 boundaries first, then place
-    /// the endpoints without splitting a CRLF newline.
-    fn clip_selection_range(&self, range: Range<usize>) -> (usize, usize) {
+    /// HERDR: `range` clipped to the text as [`Self::select_range`] places
+    /// it: token ranges expanded, the start clipped left, a non-empty
+    /// range's end clipped right. The one copy of that rule, shared with
+    /// the multi-selection API ([`Self::clip_selection_range`]) and its
+    /// single-line no-op check, so the check and what gets installed can't
+    /// disagree.
+    fn clip_range(&self, range: Range<usize>) -> (usize, usize) {
         let range = self.normalize_token_range(range);
         let end_bias = if range.start == range.end {
             Bias::Left
         } else {
             Bias::Right
         };
-        let start = self.cursor_boundary(range.start, Bias::Left);
-        let end = self.cursor_boundary(self.text.clip_offset(range.end, end_bias), Bias::Left);
-        (start, end)
+        (
+            self.text.clip_offset(range.start, Bias::Left),
+            self.text.clip_offset(range.end, end_bias),
+        )
+    }
+
+    /// Clip and snap a selection range for [`Self::add_selection`] and
+    /// [`Self::set_selections`]: [`Self::clip_range`], then place the
+    /// endpoints without splitting a CRLF newline.
+    fn clip_selection_range(&self, range: Range<usize>) -> (usize, usize) {
+        let (start, end) = self.clip_range(range);
+        (self.cursor_boundary(start, Bias::Left), self.cursor_boundary(end, Bias::Left))
     }
 
     /// Caret of selection `id`; the active caret if merging removed it.
@@ -4023,19 +4049,20 @@ impl<M: InputModeKind> InputBaseState<M> {
         };
         scroll_offset.y = y;
         // Only the vertical part changes: the x is the one queued earlier in
-        // this handler (`set_scroll_offset`, an upstream reveal), or the
-        // current one. A caret reveal queued earlier is the exception: it
-        // keeps its horizontal step, done by paint only if that frame lays
-        // out the caret's line, but not its column measured at the old view,
-        // which with the caret scrolled out of view would shift the rows
-        // shown sideways.
-        let reveal_x = self.queued_scroll.and_then(|queued| queued.reveal_x());
+        // this handler (`set_scroll_offset`), or the current one. A reveal
+        // queued earlier (by keys, mouse, search or the API, its column
+        // measured yet or not) is the exception: it keeps its horizontal
+        // step, done by paint only if that frame lays out the caret's line,
+        // but not an x measured at the old view, which with the caret
+        // scrolled out of view would shift the rows shown sideways.
+        let reveal_x = self.queued_scroll.and_then(|queued| queued.revealed());
         if reveal_x.is_some() {
             scroll_offset.x = self.scroll_handle.offset().x;
         }
         self.queued_scroll = Some(QueuedScroll::Offset {
             offset: scroll_offset,
             reveal_x,
+            measured: None,
             api: true,
         });
         cx.notify();
@@ -4191,6 +4218,7 @@ impl<M: InputModeKind> InputBaseState<M> {
                 .map(|y| QueuedScroll::Offset {
                     offset: point(scroll.x, y),
                     reveal_x: None,
+                    measured: None,
                     api: true,
                 }),
             PendingScroll::Caret(id) => {
@@ -4208,6 +4236,7 @@ impl<M: InputModeKind> InputBaseState<M> {
                 Some(QueuedScroll::Offset {
                     offset: point(scroll.x, y),
                     reveal_x: Some(RevealX::Caret(id)),
+                    measured: None,
                     api: true,
                 })
             }
@@ -4230,8 +4259,12 @@ impl<M: InputModeKind> InputBaseState<M> {
     }
 
     /// Whether `position` (window coordinates) is in the line-number gutter,
-    /// its left padding included: the decoration bars paint there, and a
-    /// press on one is a press on its row.
+    /// its paddings included. The decoration bars paint in the left padding,
+    /// and a press on one is a press on its row. A row scrolled partly under
+    /// the top or bottom padding is drawn there (the editor clips at its
+    /// outer edge, padding included), line number too, so a press on that
+    /// part is a press on that row; a padding with no laid-out row under it
+    /// reports none ([`Self::gutter_row_at`]).
     fn is_in_gutter(&self, position: Point<Pixels>) -> bool {
         let Some(layout) = self.last_layout.as_ref() else {
             return false;
@@ -4419,7 +4452,7 @@ impl<M: InputModeKind> InputBaseState<M> {
     /// caret convert nothing. Only ends past the edit are converted, pair by
     /// pair, stopping at the first difference.
     fn take_selection_report(&mut self) -> bool {
-        self.reported_selections_generation = self.selections.mark_seen();
+        self.reported_selections = self.selections.stamp();
         let mut current = std::mem::take(&mut self.selection_scratch);
         self.selections_into(&mut current);
         for sel in &mut current {
@@ -4460,10 +4493,10 @@ impl<M: InputModeKind> InputBaseState<M> {
     /// Runs on every notify, and after every paint as a backstop for a
     /// selection changed without a notify (no event would fire until some
     /// unrelated notify otherwise). Every selection mutation goes through
-    /// [`Selections`]' mutating methods, which bump its generation, so a
+    /// [`Selections`]' mutating methods, which change its stamp, so a
     /// check that finds no selection touched (a cursor blink, a hover, a
     /// click rewriting the active selection with its own value) returns
-    /// after one integer compare. A bump that wrote nothing new costs one
+    /// after one stamp compare. A bump that wrote nothing new costs one
     /// compare of byte ranges ([`Self::take_selection_report`]). An edit
     /// since the report always compares, touched selections or not: it can
     /// move what scripts read without moving a byte offset (a column in
@@ -4485,7 +4518,7 @@ impl<M: InputModeKind> InputBaseState<M> {
     /// both stand for one reported entry.
     pub(super) fn report_selection_change(&mut self, cx: &mut Context<Self>) {
         if !self.reports_selection_changes
-            || (self.selections.generation() == self.reported_selections_generation
+            || (self.selections.stamp() == self.reported_selections
                 && self.selection_report.edit_floor == usize::MAX)
         {
             return;
@@ -4501,7 +4534,7 @@ impl<M: InputModeKind> InputBaseState<M> {
     }
 
     pub(in crate::input) fn queue_scroll_offset(&mut self, offset: Point<Pixels>) {
-        self.queued_scroll = Some(QueuedScroll::Offset { offset, reveal_x: None, api: false });
+        self.queued_scroll = Some(QueuedScroll::Offset { offset, reveal_x: None, measured: None, api: false });
     }
 
     /// What the next paint reveals horizontally with the queued offset
@@ -9115,14 +9148,14 @@ mod tests {
             let range = |r: Range<usize>| SelectionRange { range: r, reversed: false };
             state.set_selections(vec![range(0..2), range(2..5)], window, cx);
             assert_eq!(state.selections(), vec![range(0..5)], "merged");
-            let generation = state.selections.mark_seen();
+            let stamp = state.selections.stamp();
             state.queued_scroll = None;
             let before = state.selections.generate_id();
             state.set_selections(vec![range(0..2), range(2..5)], window, cx);
             let after = state.selections.generate_id();
             let number = |id| format!("{id:?}").trim_matches(|c: char| !c.is_ascii_digit()).parse::<usize>().unwrap();
             assert_eq!(number(after), number(before) + 1, "no ids used");
-            assert_eq!(state.selections.generation(), generation, "selections untouched");
+            assert_eq!(state.selections.stamp(), stamp, "selections untouched");
             assert_eq!(state.queued_scroll, None, "nothing to reveal");
             state.set_selections(vec![range(0..2), range(3..5)], window, cx);
             assert_eq!(state.selections().len(), 2, "a different set still applies");

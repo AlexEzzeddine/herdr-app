@@ -4096,6 +4096,40 @@ mod tests {
         });
     }
 
+    // HERDR: the same for an upstream reveal (keys, mouse, search) whose
+    // column was measured: a row scroll asked for after it, before paint
+    // (a script's `selection_change` handler), doesn't keep the x measured
+    // at the old view.
+    #[gpui::test]
+    fn a_row_scroll_away_from_an_upstream_reveal_does_not_scroll_sideways(cx: &mut TestAppContext) {
+        let (text, target) = text_with_a_far_column();
+        let (editor, window) = decoration_editor(cx, &text, false);
+        let mut cx = VisualTestContext::from_window(window.into(), cx);
+        cx.update(|window, cx| {
+            window.draw(cx).clear(cx);
+            editor.update(cx, |state, _| {
+                let line_height = state.last_layout.as_ref().unwrap().line_height;
+                // Row 50 is laid out, so the reveal below measures its column.
+                state.scroll_handle.set_offset(point(px(0.), -(line_height * 46.)));
+            });
+            window.draw(cx).clear(cx);
+            editor.update(cx, |state, cx| {
+                state.set_selected_range(target..target, cx);
+                assert!(
+                    state.deferred_scroll_offset().unwrap().x < px(0.),
+                    "the caret's column was measured"
+                );
+                state.scroll_to_row(5, crate::input::RowScrollAlign::Top, window, cx);
+            });
+            window.draw(cx).clear(cx);
+        });
+        editor.update_in(&mut cx, |state, window, _| {
+            assert_eq!(state.scroll_handle.offset().x, px(0.), "no sideways scroll");
+            let (top, _) = state.row_bounds(5, window).unwrap();
+            assert_eq!(top, px(0.), "row 5 is at the top");
+        });
+    }
+
     // HERDR: in a view narrower than the margin, where a caret is past
     // both edges, cursor-follow keeps upstream's right edge and the reveal
     // (`scroll_to`) its left edge, as their upstream copies did.
@@ -4577,58 +4611,50 @@ mod tests {
 
     // HERDR: writing the active selection with the value it already has
     // (a click's `reversed = false`) isn't a selection change: the report
-    // check stays one integer compare.
+    // check stays one stamp compare.
     #[gpui::test]
-    fn rewriting_the_active_selection_unchanged_keeps_its_generation(cx: &mut TestAppContext) {
+    fn rewriting_the_active_selection_unchanged_keeps_its_stamp(cx: &mut TestAppContext) {
         let (editor, window) = decoration_editor(cx, "alpha\nbeta", false);
         let mut cx = VisualTestContext::from_window(window.into(), cx);
         cx.update(|window, cx| {
             window.draw(cx).clear(cx);
             editor.update(cx, |state, _| {
-                let seen = state.selections.mark_seen();
+                let seen = state.selections.stamp();
                 state.selections.active_mut().reversed = false;
-                assert_eq!(state.selections.generation(), seen, "an unchanged write");
+                assert_eq!(state.selections.stamp(), seen, "an unchanged write");
                 state.selections.active_mut().end = 3;
-                assert_ne!(state.selections.generation(), seen, "a changed write");
+                assert_ne!(state.selections.stamp(), seen, "a changed write");
                 state.selections.active_mut().end = 0;
-                assert_eq!(state.selections.generation(), seen, "changed back before anyone looked");
-                state.selections.active_mut().start = 2;
-                state.selections.active_mut().end = 2;
-                let next = state.selections.mark_seen();
-                assert_ne!(next, seen);
-                state.selections.active_mut().end = 4;
-                assert_ne!(state.selections.generation(), next, "a change after the mark");
+                assert_eq!(state.selections.stamp(), seen, "changed back before anyone looked");
+                let id = state.selections.generate_id();
+                state.selections.add(super::super::cursor::CursorSelection::new(id, 8, 8));
+                assert_ne!(state.selections.stamp(), seen, "an added cursor");
             });
         });
     }
 
-    // HERDR: a stamp taken while the active selection is rewritten (no mark
-    // since) still tells a later change apart: the generation would count
-    // the rewrite as +1 and then show the same number after the active
-    // selection is written back and a cursor is added.
+    // HERDR: taking the selection report doesn't change the stamp another
+    // owner keeps (an early scroll's `SettlingScroll`): a report after an
+    // active-selection write, with nothing written since the stamp, leaves
+    // it equal.
     #[gpui::test]
-    fn a_stamp_sees_a_change_the_generation_repeats(cx: &mut TestAppContext) {
+    fn taking_the_selection_report_keeps_the_stamp(cx: &mut TestAppContext) {
         let (editor, window) = decoration_editor(cx, "alpha\nbeta", false);
         let mut cx = VisualTestContext::from_window(window.into(), cx);
-        cx.update(|window, cx| {
+        let seen = cx.update(|window, cx| {
             window.draw(cx).clear(cx);
-            editor.update(cx, |state, _| {
-                state.selections.mark_seen();
-                let old = *state.selections.active();
-                state.selections.active_mut().end = 3;
-                let generation = state.selections.generation();
-                let stamp = state.selections.stamp();
-                assert_eq!(state.selections.stamp(), stamp, "nothing changed yet");
-                *state.selections.active_mut() = old;
-                let id = state.selections.generate_id();
-                state.selections.add(super::super::cursor::CursorSelection::new(id, 8, 8));
-                assert_eq!(state.selections.generation(), generation, "the generation repeats");
-                assert_ne!(state.selections.stamp(), stamp, "the stamp sees the added cursor");
-                let stamp = state.selections.stamp();
-                state.selections.active_mut().reversed = old.reversed;
-                assert_eq!(state.selections.stamp(), stamp, "an unchanged write");
-            });
+            count_selection_changes(&editor, window, cx)
         });
+        cx.update(|_window, cx| {
+            editor.update(cx, |state, cx| {
+                state.selections.active_mut().end = 3;
+                let stamp = state.selections.stamp();
+                state.report_selection_change(cx);
+                assert_eq!(state.selections.stamp(), stamp, "the report changed nothing");
+            })
+        });
+        cx.run_until_parked();
+        assert_eq!(seen.get(), 1, "the write was reported");
     }
 
     // HERDR: a selection changed without a notify is still reported, once
@@ -4720,8 +4746,8 @@ mod tests {
     }
 
     // HERDR: an edit since the last report is always compared, so a report
-    // doesn't depend on the edit path bumping the selections' generation.
-    // Here the generation is marked seen after an edit that keeps the
+    // doesn't depend on the edit path changing the selections' stamp.
+    // Here the stamp is recorded as reported after an edit that keeps the
     // caret's byte offset but moves its UTF-16 column, as a path that wrote
     // the caret with its old value would leave it: the move is still
     // reported.
@@ -4737,7 +4763,7 @@ mod tests {
             editor.update(cx, |state, cx| {
                 // "é" to "ab": the caret stays at byte 5, col 1 -> 2.
                 state.replace_text_in_ranges(&[(3..5, "ab".into())], window, cx);
-                state.reported_selections_generation = state.selections.mark_seen();
+                state.reported_selections = state.selections.stamp();
             })
         });
         cx.run_until_parked();
@@ -4914,11 +4940,9 @@ mod tests {
                     input.update(cx, |state, cx| {
                         state.set_selections(vec![sel(2..5, reversed)], window, cx);
                         assert_eq!(state.selections(), vec![sel(2..5, reversed)]);
-                        let seen = state.selections.mark_seen();
                         let stamp = state.selections.stamp();
                         // A second range is dropped, as before.
                         state.set_selections(vec![sel(2..5, reversed), sel(6..7, false)], window, cx);
-                        assert_eq!(state.selections.generation(), seen, "reversed {reversed}: untouched");
                         assert_eq!(state.selections.stamp(), stamp, "reversed {reversed}: untouched");
                         state.set_selections(vec![sel(2..5, !reversed)], window, cx);
                         assert_eq!(state.selections(), vec![sel(2..5, !reversed)], "the other side is a change");
@@ -5952,6 +5976,42 @@ mod tests {
         });
     }
 
+    // HERDR: a row scrolled partly under the top padding is drawn there
+    // (the editor clips at its outer edge), so a press on that part of the
+    // gutter is on that row; a padding with no laid-out row under it has
+    // none.
+    #[gpui::test]
+    fn gutter_presses_in_the_top_padding_are_on_the_row_drawn_there(cx: &mut TestAppContext) {
+        let text = (0..40).map(|i| i.to_string()).collect::<Vec<_>>().join("\n");
+        let (editor, mut cx) = numbered_editor(cx, &text);
+        cx.update(|window, cx| {
+            editor.update(cx, |state, cx| {
+                state.editor_paddings = Edges { top: px(8.), ..Default::default() };
+                cx.notify();
+            });
+            window.draw(cx).clear(cx);
+        });
+        let (gutter, top, line_height) = editor.read_with(&cx, |state, _| {
+            let line_height = state.last_layout.as_ref().unwrap().line_height;
+            (state.input_bounds.origin.x + px(2.), state.input_bounds.origin.y, line_height)
+        });
+        assert_eq!(
+            editor.read_with(&cx, |state, _| state.gutter_row_at(point(gutter, top - px(4.)))),
+            None,
+            "unscrolled: no row under the padding"
+        );
+        cx.update(|window, cx| {
+            editor.update(cx, |state, cx| {
+                state.set_scroll_offset(point(px(0.), -(line_height * 1.5)), cx);
+            });
+            window.draw(cx).clear(cx);
+        });
+        editor.read_with(&cx, |state, _| {
+            assert_eq!(state.gutter_row_at(point(gutter, top - px(4.))), Some(1), "row 1, half under it");
+            assert_eq!(state.gutter_row_at(point(gutter, top + px(1.))), Some(1));
+        });
+    }
+
     // HERDR: a left press on a painted fold chevron is the chevron's: it
     // folds and is not reported as a gutter click (the chevron stops the
     // press before the input sees it). The chevron ignores other buttons, so
@@ -6221,6 +6281,7 @@ mod tests {
                         .map(|offset| super::super::state::QueuedScroll::Offset {
                             offset,
                             reveal_x: None,
+                            measured: None,
                             api: false,
                         });
                 });

@@ -3168,7 +3168,8 @@ const BASE: &str = r#"  /** A row. */
     on(event: "change" | "submit" | "focus" | "blur" | "paste_other" | "selection_change" | "scroll", handler: (event: InputEvent, cx: Context) => void): boolean;
     /** A press on a line number (a left press on a fold chevron folds instead). The press
      * still places the caret, so dragging down the gutter still selects lines. Presses in the
-     * gutter's left padding (where decoration bars paint) are on their row; presses below
+     * gutter's paddings are on the row drawn there (decoration bars paint in the left one, and
+     * a row scrolled partly under the top or bottom one shows there); presses below
      * the last line or on an inline completion's extra lines report nothing, and neither
      * does a disabled editor. Needs line numbers. */
     on(event: "gutter_click", handler: (event: GutterClickEvent, cx: Context) => void): boolean;
@@ -3179,7 +3180,8 @@ const BASE: &str = r#"  /** A row. */
      * ones in the list win, and keys apply in sorted order (by character code, as JS
      * `sort()` orders them, so every uppercase letter sorts before every lowercase one):
      * on a row two keys color, the later key wins ("review" over "diff", but "diff" over
-     * "Review"), whichever was set last. */
+     * "Review"), whichever was set last. Throws a `TypeError` for a key a decoration
+     * doesn't have (a misspelled `end_row` is an error, not ignored). */
     set_line_decorations(key: string, decorations: LineDecoration[]): void;
     /** Every selection: the primary one first, then the rest in document order.
      * An empty selection is a caret. `set_value` changes it without a `selection_change`. */
@@ -3189,10 +3191,12 @@ const BASE: &str = r#"  /** A row. */
      * Pass `head` (or `start` after `end`) for a backwards selection, so `selections()`
      * round-trips. Throws a `TypeError` when `ranges` is not an array and a `RangeError`
      * when it is empty (an editor always has a caret: pass an empty range to reset to one).
-     * Passing the selections it already has changes nothing (no scroll). */
+     * Passing the selections it already has changes nothing (no scroll). A key a range
+     * or position doesn't have is a `TypeError`; `primary` is accepted and ignored, so
+     * `selections()` output sets back as is. */
     set_selections(ranges: EditorRange[]): void;
     /** Adds a selection (like Alt-click), keeping the others. Throws a `TypeError` when
-     * `range` is not a single range object. */
+     * `range` is not a single range object or has a key a range doesn't have. */
     add_selection(range: EditorRange): void;
     /** Scrolls vertically only. Before the first layout the request waits for it, and
      * after placing it the row stays where it asked across size changes (the pane

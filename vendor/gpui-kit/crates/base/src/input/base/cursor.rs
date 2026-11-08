@@ -134,15 +134,11 @@ impl RangeBounds<usize> for CursorSelection {
 pub(super) struct Selections {
     selections: Vec<CursorSelection>,
     next_id: usize,
-    /// HERDR: bumped by every mutating method but [`Self::active_mut`], so
-    /// the owner can tell cheaply that the selections may have changed (see
+    /// HERDR: bumped by every mutating method but [`Self::active_mut`]; with
+    /// the active selection by value it makes a [`Self::stamp`], so the
+    /// owner can tell cheaply that the selections may have changed (see
     /// `InputBaseState`'s selection-change report).
-    generation: u64,
-    /// HERDR: the active selection before the first [`Self::active_mut`]
-    /// since [`Self::mark_seen`]. Many callers write it with the value it
-    /// already has (`reversed = false` on every click), so the write counts
-    /// as a change only if the value differs ([`Self::generation`]).
-    active_before: Option<CursorSelection>,
+    counter: u64,
 }
 
 /// HERDR: [`Selections::stamp`].
@@ -157,8 +153,7 @@ impl Selections {
         Self {
             selections: vec![CursorSelection::new(CursorId::new(0), 0, 0)],
             next_id: 1,
-            generation: 0,
-            active_before: None,
+            counter: 0,
         }
     }
 
@@ -171,40 +166,20 @@ impl Selections {
 
     /// Returns a mutable reference to the active selection.
     pub(super) fn active_mut(&mut self) -> &mut CursorSelection {
-        if self.active_before.is_none() {
-            self.active_before = Some(*self.active());
-        }
         self.selections
             .first_mut()
             .expect("Selections always has at least one selection")
     }
 
-    /// HERDR: changes whenever a mutating method ran or the active
-    /// selection was written with a new value, since [`Self::mark_seen`]
-    /// (a method may not have changed anything; equal generations mean
-    /// nothing changed). Compare it only with the value `mark_seen`
-    /// returned: before the next mark it can count a changed active
-    /// selection as +1 and then repeat that number after a real change. A
-    /// caller that doesn't mark compares [`Self::stamp`]s instead.
-    pub(super) fn generation(&self) -> u64 {
-        let active_changed = self.active_before.is_some_and(|before| before != *self.active());
-        self.generation + u64::from(active_changed)
-    }
-
-    /// HERDR: the selections now, for comparing later without
-    /// [`Self::mark_seen`]: equal stamps mean nothing changed since. The
-    /// counter only grows, and the active selection is compared by value,
-    /// so writing it back to what it was compares equal.
+    /// HERDR: the selections now, for comparing later: equal stamps mean
+    /// nothing changed since (a mutating method may not have changed
+    /// anything; unequal stamps mean "maybe"). The counter only grows, and
+    /// the active selection is compared by value, so writing it with the
+    /// value it already has (`reversed = false` on every click), or back to
+    /// what it was, compares equal. Taking a stamp changes nothing, so
+    /// every owner can keep its own.
     pub(super) fn stamp(&self) -> SelectionsStamp {
-        SelectionsStamp { counter: self.generation, active: *self.active() }
-    }
-
-    /// HERDR: the owner has seen the selections at [`Self::generation`]:
-    /// later writes of the active selection compare against it as it is now.
-    pub(super) fn mark_seen(&mut self) -> u64 {
-        self.generation = self.generation();
-        self.active_before = None;
-        self.generation
+        SelectionsStamp { counter: self.counter, active: *self.active() }
     }
 
     pub(super) fn iter(&self) -> impl Iterator<Item = &CursorSelection> {
@@ -230,7 +205,7 @@ impl Selections {
 
     /// Adds an additional selection.
     pub(super) fn add(&mut self, selection: CursorSelection) {
-        self.generation += 1;
+        self.counter += 1;
         self.selections.push(selection);
     }
 
@@ -238,14 +213,14 @@ impl Selections {
     /// "always at least one selection" invariant.
     pub(super) fn replace_all(&mut self, selections: Vec<CursorSelection>) {
         if !selections.is_empty() {
-            self.generation += 1;
+            self.counter += 1;
             self.selections = selections;
         }
     }
 
     /// Removes every selection except the active one (index 0).
     pub(super) fn remove_all_but_active(&mut self) {
-        self.generation += 1;
+        self.counter += 1;
         self.selections.truncate(1);
     }
 
@@ -259,7 +234,7 @@ impl Selections {
             return;
         }
 
-        self.generation += 1;
+        self.counter += 1;
         self.selections = merged(std::mem::take(&mut self.selections));
     }
 }

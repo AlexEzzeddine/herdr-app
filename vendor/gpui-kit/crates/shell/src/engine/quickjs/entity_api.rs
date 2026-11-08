@@ -2021,14 +2021,18 @@ fn needs_call(ctx: &Ctx<'_>, what: &str) -> rquickjs::Error {
     )
 }
 
-// HERDR: editor positions crossing to scripts.
+// HERDR: editor positions crossing to scripts. Script input refuses keys
+// it doesn't know, as `EditorState.new` options do, so a misspelled one
+// (`column`, `haed`, `endRow`) is a TypeError rather than silently dropped.
 #[derive(Clone, Copy, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct EditorPosition {
     row: usize,
     col: usize,
 }
 
 #[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct EditorRange {
     start: EditorPosition,
     end: EditorPosition,
@@ -2036,9 +2040,14 @@ struct EditorRange {
     /// whose `start` is after its `end` is a backwards selection.
     #[serde(default)]
     head: Option<EditorPosition>,
+    /// What `selections()` reports; accepted and ignored, so its output
+    /// can be set back as is (the first range becomes primary).
+    #[serde(default, rename = "primary")]
+    _primary: Option<bool>,
 }
 
 #[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct EditorLineDecoration {
     row: usize,
     /// Inclusive.

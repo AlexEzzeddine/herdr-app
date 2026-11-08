@@ -5811,6 +5811,19 @@ export default class Code extends View {
       { start: { row: 10, col: 0 }, end: { row: 12, col: 2 }, head: { row: 10, col: 0 } },
     ]);
     this.code.add_selection({ start: { row: 20, col: 1 }, end: { row: 20, col: 1 } });
+    // What `selections()` returns (with `primary`) sets back as is.
+    try { this.code.set_selections(this.code.selections()); this.round_trip = "ok"; }
+    catch (error) { this.round_trip = error.name; }
+    // A misspelled key is refused rather than silently dropped.
+    this.typos = [];
+    for (const call of [
+      () => this.code.add_selection({ start: { row: 0, col: 0 }, end: { row: 0, col: 1 }, haed: { row: 0, col: 0 } }),
+      () => this.code.add_selection({ start: { row: 0, column: 0 }, end: { row: 0, col: 1 } }),
+      () => this.code.set_line_decorations("diff", [{ row: 10, endRow: 20, background: "#f004" }]),
+    ]) {
+      try { call(); this.typos.push("accepted"); }
+      catch (error) { this.typos.push(error.name); }
+    }
     this.code.scroll_to_row(60, "top");
     try { this.code.set_selections([]); this.empty = "accepted"; }
     catch (error) { this.empty = error.name; }
@@ -5840,7 +5853,9 @@ export default class Code extends View {
       .child("row60=" + JSON.stringify(this.code.row_bounds(60)))
       .child("scrolled=" + (this.code.scroll_position().top > 0))
       .child("scroll_seen=" + JSON.stringify(this.scroll_seen))
-      .child("empty=" + this.empty);
+      .child("empty=" + this.empty)
+      .child("round_trip=" + this.round_trip)
+      .child("typos=" + JSON.stringify(this.typos));
   }
 }
 "##;
@@ -5887,6 +5902,8 @@ export default class Code extends View {
     assert!(tree.contains(r#"bad_add=["TypeError:true","TypeError:true"]"#), "{tree}");
     let bad_row = format!("bad_row={}", serde_json::json!([vec!["TypeError:true"; 12], vec!["RangeError"]].concat()));
     assert!(tree.contains(&bad_row), "{tree}");
+    assert!(tree.contains("round_trip=ok"), "{tree}");
+    assert!(tree.contains(r#"typos=["TypeError","TypeError","TypeError"]"#), "{tree}");
 
     // A user moving the caret is reported too.
     context.update(|_, cx| editor.update(cx, |state, cx| state.set_selected_range(0..0, cx)));
