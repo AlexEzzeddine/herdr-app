@@ -562,19 +562,16 @@ pub fn install(ctx: &Ctx<'_>, module: &Object<'_>, runtime: Weak<ShellRuntime>) 
                 }
                 scope::with_current(|window, cx| {
                     state.update(cx, |state, cx| {
-                        // The caret reveal measures ghost lines, which
-                        // depend on focus.
-                        state.sync_focus(window);
                         let selections: Vec<_> = ranges
                             .iter()
                             .map(|range| editor_selection(state.text(), range))
                             .collect();
                         if add {
                             for selection in selections {
-                                state.add_selection_range(selection, cx);
+                                state.add_selection_range(selection, window, cx);
                             }
                         } else {
-                            state.set_selections(selections, cx);
+                            state.set_selections(selections, window, cx);
                         }
                     })
                 })
@@ -602,11 +599,7 @@ pub fn install(ctx: &Ctx<'_>, module: &Object<'_>, runtime: Weak<ShellRuntime>) 
                     }
                 };
                 scope::with_current(|window, cx| {
-                    state.update(cx, |state, cx| {
-                        // Ghost lines are measured only in a focused editor.
-                        state.sync_focus(window);
-                        state.scroll_to_row(row, align, cx)
-                    })
+                    state.update(cx, |state, cx| state.scroll_to_row(row, align, window, cx))
                 })
                 .ok_or_else(|| needs_call(&ctx, "scroll_to_row()"))
             },
@@ -620,14 +613,14 @@ pub fn install(ctx: &Ctx<'_>, module: &Object<'_>, runtime: Weak<ShellRuntime>) 
             move |ctx: Ctx<'_>, handle: EntityHandle| -> JsResult<String> {
                 let state = live_editor(&ctx, &read_scroll, handle)?;
                 scope::with_current(|window, cx| {
-                    state.update(cx, |state, _| state.sync_focus(window));
-                    let state = state.read(cx);
                     // A scroll queued in this handler counts, like `row_bounds`.
-                    let offset = state.queued_scroll_offset();
+                    let (offset, line_height) = state.update(cx, |state, _| {
+                        (state.queued_scroll_offset(window), state.line_height())
+                    });
                     serde_json::json!({
                         "top": -f32::from(offset.y),
                         "left": -f32::from(offset.x),
-                        "line_height": state.line_height().map(f32::from),
+                        "line_height": line_height.map(f32::from),
                     })
                     .to_string()
                 })
@@ -644,11 +637,8 @@ pub fn install(ctx: &Ctx<'_>, module: &Object<'_>, runtime: Weak<ShellRuntime>) 
                 let state = live_editor(&ctx, &read_row, handle)?;
                 let row = editor_row(&ctx, row)?;
                 scope::with_current(|window, cx| match state
-                    .update(cx, |state, _| {
-                        // Rows below ghost lines move with focus.
-                        state.sync_focus(window);
-                        state.row_bounds(row)
-                    }) {
+                    .update(cx, |state, _| state.row_bounds(row, window))
+                {
                     Some((top, height)) => serde_json::json!({
                         "top": f32::from(top),
                         "height": f32::from(height),
@@ -2067,11 +2057,12 @@ fn editor_selection(
     text: &gpui_base::input::Rope,
     range: &EditorRange,
 ) -> gpui_base::input::SelectionRange {
-    let start = editor_offset(text, range.start);
-    let end = editor_offset(text, range.end);
+    let offset = |at: EditorPosition| gpui_base::input::script_offset(text, at.row, at.col);
+    let start = offset(range.start);
+    let end = offset(range.end);
     let (low, high) = (start.min(end), start.max(end));
     let reversed = match range.head {
-        Some(head) => low != high && editor_offset(text, head) == low,
+        Some(head) => low != high && offset(head) == low,
         None => start > end,
     };
     gpui_base::input::SelectionRange {
@@ -2092,10 +2083,4 @@ fn editor_row(ctx: &Ctx<'_>, row: f64) -> JsResult<usize> {
 fn editor_position(text: &gpui_base::input::Rope, offset: usize) -> serde_json::Value {
     let (row, col) = gpui_base::input::script_position(text, offset);
     serde_json::json!({ "row": row, "col": col })
-}
-
-/// Byte offset of `{ row, col }`, clamped to the document and the line: the
-/// inverse of [`editor_position`].
-fn editor_offset(text: &gpui_base::input::Rope, position: EditorPosition) -> usize {
-    gpui_base::input::script_offset(text, position.row, position.col)
 }

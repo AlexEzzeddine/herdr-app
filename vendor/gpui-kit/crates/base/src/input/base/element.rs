@@ -3860,6 +3860,7 @@ mod tests {
                         SelectionRange { range: 0..5, reversed: false },
                         SelectionRange { range: 11..16, reversed: false },
                     ],
+                    window,
                     cx,
                 );
             });
@@ -3888,15 +3889,16 @@ mod tests {
         cx.update(|window, cx| {
             let seen = seen.clone();
             window
-                .subscribe(&editor, cx, move |editor, event: &InputEvent, _, cx| {
+                .subscribe(&editor, cx, move |editor, event: &InputEvent, window, cx| {
                     if matches!(event, InputEvent::Scroll) {
-                        seen.borrow_mut().push(editor.read(cx).row_bounds(40));
+                        let bounds = editor.update(cx, |state, _| state.row_bounds(40, window));
+                        seen.borrow_mut().push(bounds);
                     }
                 })
                 .detach();
             window.draw(cx).clear(cx);
             editor.update(cx, |state, cx| {
-                state.scroll_to_row(40, crate::input::RowScrollAlign::Top, cx)
+                state.scroll_to_row(40, crate::input::RowScrollAlign::Top, window, cx)
             });
             window.draw(cx).clear(cx);
         });
@@ -3923,10 +3925,10 @@ mod tests {
         cx.update(|window, cx| window.draw(cx).clear(cx));
         let target = text.find(&long).unwrap() + 390;
         cx.update(|window, cx| {
-            editor.update(cx, |state, cx| state.set_selections(vec![sel(target..target, false)], cx));
+            editor.update(cx, |state, cx| state.set_selections(vec![sel(target..target, false)], window, cx));
             window.draw(cx).clear(cx);
         });
-        editor.read_with(&cx, |state, _| {
+        editor.update_in(&mut cx, |state, window, _| {
             let layout = state.last_layout.as_ref().unwrap();
             // Unscrolled, in window coordinates like the caret's x.
             let bounds = state.input_bounds;
@@ -3937,7 +3939,7 @@ mod tests {
                 cursor.left() >= text_left && cursor.right() <= bounds.right(),
                 "the caret shows horizontally: {cursor:?} in {bounds:?}"
             );
-            let (top, height) = state.row_bounds(50).unwrap();
+            let (top, height) = state.row_bounds(50, window).unwrap();
             assert!(top >= px(0.) && top + height <= bounds.size.height, "row 50 shows");
         });
     }
@@ -4013,7 +4015,7 @@ mod tests {
             let state = cx.new(|cx| {
                 let mut state = EditorState::new(window, cx).soft_wrap(false);
                 // Like a mod's init(): scroll first, then load the file.
-                state.scroll_to_row(40, crate::input::RowScrollAlign::Top, cx);
+                state.scroll_to_row(40, crate::input::RowScrollAlign::Top, window, cx);
                 state.set_value(text, window, cx);
                 state
             });
@@ -4027,7 +4029,7 @@ mod tests {
             window.draw(cx).clear(cx);
         });
         let (top, _) = editor
-            .read_with(&cx, |state, _| state.row_bounds(40))
+            .update_in(&mut cx, |state, window, _| state.row_bounds(40, window))
             .expect("row 40 is laid out");
         assert_eq!(top, px(0.), "row 40 is at the top");
     }
@@ -4042,16 +4044,16 @@ mod tests {
         cx.update(|window, cx| {
             // Before the first layout: the scroll waits for it.
             editor.update(cx, |state, cx| {
-                state.set_selections(vec![sel(0..4, false), sel(2..far, false), sel(far + 2..far + 4, true)], cx)
+                state.set_selections(vec![sel(0..4, false), sel(2..far, false), sel(far + 2..far + 4, true)], window, cx)
             });
             window.draw(cx).clear(cx);
             window.draw(cx).clear(cx);
         });
-        editor.read_with(&cx, |state, _| {
+        editor.update_in(&mut cx, |state, window, _| {
             let selections = state.selections();
             assert_eq!(selections, vec![sel(0..far, false), sel(far + 2..far + 4, true)]);
             assert_eq!(selections[1].head(), far + 2);
-            let (top, height) = state.row_bounds(50).expect("row 50");
+            let (top, height) = state.row_bounds(50, window).expect("row 50");
             assert!(top >= px(0.) && top + height <= px(140.), "the merged caret on row 50 is in view: {top:?}");
         });
     }
@@ -4066,16 +4068,16 @@ mod tests {
         let at = |row: usize| text.find(&format!("line {row}\n")).unwrap();
         cx.update(|window, cx| {
             editor.update(cx, |state, cx| {
-                state.set_selections(vec![sel(0..0, false), sel(at(30)..at(35), false)], cx)
+                state.set_selections(vec![sel(0..0, false), sel(at(30)..at(35), false)], window, cx)
             });
             window.draw(cx).clear(cx);
             window.draw(cx).clear(cx);
             editor.update(cx, |state, cx| state.add_selection(at(32)..at(50), cx));
             window.draw(cx).clear(cx);
         });
-        editor.read_with(&cx, |state, _| {
+        editor.update_in(&mut cx, |state, window, _| {
             assert_eq!(state.selections(), vec![sel(0..0, false), sel(at(30)..at(50), false)]);
-            let (top, height) = state.row_bounds(50).expect("row 50");
+            let (top, height) = state.row_bounds(50, window).expect("row 50");
             assert!(top >= px(0.) && top + height <= px(140.), "row 50 is in view: {top:?}");
         });
     }
@@ -4086,7 +4088,7 @@ mod tests {
     fn add_selection_on_a_single_line_input_keeps_the_caret_side(cx: &mut TestAppContext) {
         cx.update(crate::init);
         let mut input = None;
-        let _window = cx.open_window(size(px(240.), px(40.)), |window, cx| {
+        let window = cx.open_window(size(px(240.), px(40.)), |window, cx| {
             let state = cx.new(|cx| crate::input::InputState::new(window, cx).default_value("abcdefgh"));
             input = Some(state.clone());
             gpui::Empty
@@ -4094,11 +4096,14 @@ mod tests {
         let input = input.unwrap();
         for reversed in [false, true] {
             cx.update(|cx| {
-                input.update(cx, |state, cx| {
-                    state.set_selected_range(0..1, cx);
-                    state.add_selection_range(sel(2..6, reversed), cx);
+                window.update(cx, |_, window, cx| {
+                    input.update(cx, |state, cx| {
+                        state.set_selected_range(0..1, cx);
+                        state.add_selection_range(sel(2..6, reversed), window, cx);
+                    })
                 })
-            });
+            })
+            .unwrap();
             let state = cx.read(|cx| input.read(cx).selections());
             assert_eq!(state, vec![sel(2..6, reversed)], "reversed: {reversed}");
         }
@@ -4115,10 +4120,14 @@ mod tests {
             gpui::Empty
         });
         let input = input.unwrap();
-        let _ = window;
         cx.update(|cx| {
-            input.update(cx, |state, cx| state.set_selections(vec![sel(0..3, false), sel(5..8, false)], cx))
-        });
+            window.update(cx, |_, window, cx| {
+                input.update(cx, |state, cx| {
+                    state.set_selections(vec![sel(0..3, false), sel(5..8, false)], window, cx)
+                })
+            })
+        })
+        .unwrap();
         assert_eq!(cx.read(|cx| input.read(cx).selections()), vec![sel(0..3, false)]);
     }
 
@@ -4139,7 +4148,7 @@ mod tests {
         assert!(before.x < px(0.), "scrolled right to the caret");
         cx.update(|window, cx| {
             editor.update(cx, |state, cx| {
-                state.scroll_to_row(1, crate::input::RowScrollAlign::Nearest, cx)
+                state.scroll_to_row(1, crate::input::RowScrollAlign::Nearest, window, cx)
             });
             window.draw(cx).clear(cx);
         });
@@ -4189,12 +4198,12 @@ mod tests {
             window.draw(cx).clear(cx);
             editor.update(cx, |state, cx| {
                 state.set_value(sixty_lines("line"), window, cx);
-                state.scroll_to_row(40, crate::input::RowScrollAlign::Top, cx);
+                state.scroll_to_row(40, crate::input::RowScrollAlign::Top, window, cx);
             });
             window.draw(cx).clear(cx);
             window.draw(cx).clear(cx);
         });
-        let (top, _) = editor.read_with(&cx, |state, _| state.row_bounds(40)).expect("row 40");
+        let (top, _) = editor.update_in(&mut cx, |state, window, _| state.row_bounds(40, window)).expect("row 40");
         assert_eq!(top, px(0.), "row 40 is at the top");
     }
 
@@ -4207,12 +4216,12 @@ mod tests {
         cx.update(|window, cx| {
             window.draw(cx).clear(cx);
             editor.update(cx, |state, cx| {
-                state.scroll_to_row(50, crate::input::RowScrollAlign::Top, cx);
-                state.scroll_to_row(0, crate::input::RowScrollAlign::Nearest, cx);
+                state.scroll_to_row(50, crate::input::RowScrollAlign::Top, window, cx);
+                state.scroll_to_row(0, crate::input::RowScrollAlign::Nearest, window, cx);
             });
             window.draw(cx).clear(cx);
         });
-        let (top, _) = editor.read_with(&cx, |state, _| state.row_bounds(0)).expect("row 0");
+        let (top, _) = editor.update_in(&mut cx, |state, window, _| state.row_bounds(0, window)).expect("row 0");
         assert_eq!(top, px(0.), "row 0 is in view");
     }
 
@@ -4228,7 +4237,7 @@ mod tests {
             let state = cx.new(|cx| {
                 let mut state = EditorState::new(window, cx).soft_wrap(false);
                 state.set_value(placeholder, window, cx);
-                state.set_selections(vec![sel(far..far, false)], cx);
+                state.set_selections(vec![sel(far..far, false)], window, cx);
                 state.set_value(sixty_lines("new"), window, cx);
                 state
             });
@@ -4253,7 +4262,7 @@ mod tests {
         cx.update(|window, cx| {
             window.draw(cx).clear(cx);
             editor.update(cx, |state, cx| {
-                state.scroll_to_row(40, crate::input::RowScrollAlign::Top, cx)
+                state.scroll_to_row(40, crate::input::RowScrollAlign::Top, window, cx)
             });
             window.draw(cx).clear(cx);
             let counter = scrolls.clone();
@@ -4291,13 +4300,13 @@ mod tests {
                 })
                 .detach();
             editor.update(cx, |state, cx| {
-                state.scroll_to_row(40, crate::input::RowScrollAlign::Top, cx);
+                state.scroll_to_row(40, crate::input::RowScrollAlign::Top, window, cx);
                 state.set_value(sixty_lines("other"), window, cx);
             });
             window.draw(cx).clear(cx);
         });
         cx.run_until_parked();
-        let (top, _) = editor.read_with(&cx, |state, _| state.row_bounds(40)).expect("laid out");
+        let (top, _) = editor.update_in(&mut cx, |state, window, _| state.row_bounds(40, window)).expect("laid out");
         assert_eq!(top, px(0.), "row 40 is at the top");
         assert_eq!(scrolls.get(), 1, "the kept scroll is reported");
     }
@@ -4318,7 +4327,7 @@ mod tests {
                 let state = cx.new(|cx| {
                     let mut state = EditorState::new(window, cx).soft_wrap(false);
                     state.set_value(text, window, cx);
-                    state.set_selections(vec![sel(far..far, false)], cx);
+                    state.set_selections(vec![sel(far..far, false)], window, cx);
                     match edit {
                         "delete_lines" => state.replace_text_in_range_silent(Some(0..cut), "", window, cx),
                         // Shorter, multi-byte: the old offset is past its end.
@@ -4335,11 +4344,11 @@ mod tests {
                 window.draw(cx).clear(cx);
                 window.draw(cx).clear(cx);
             });
-            let (row, (top, height), view, scroll) = editor.read_with(&cx, |state, _| {
+            let (row, (top, height), view, scroll) = editor.update_in(&mut cx, |state, window, _| {
                 let row = state.text.offset_to_point(state.cursor()).row;
                 (
                     row,
-                    state.row_bounds(row).unwrap(),
+                    state.row_bounds(row, window).unwrap(),
                     state.last_bounds.unwrap().size.height,
                     state.scroll_offset().y,
                 )
@@ -4362,7 +4371,7 @@ mod tests {
                 let state = cx.new(|cx| {
                     let mut state = EditorState::new(window, cx).soft_wrap(false);
                     state.set_value(text, window, cx);
-                    state.set_selections(vec![sel(far..far, false)], cx);
+                    state.set_selections(vec![sel(far..far, false)], window, cx);
                     match later {
                         "set_scroll_offset" => state.set_scroll_offset(point(px(0.), px(0.)), cx),
                         _ => state.set_selected_range(0..0, cx),
@@ -4397,7 +4406,7 @@ mod tests {
         cx.update(|window, cx| {
             window.draw(cx).clear(cx);
             editor.update(cx, |state, cx| {
-                state.set_selections(vec![sel(far..far, false)], cx);
+                state.set_selections(vec![sel(far..far, false)], window, cx);
                 state.set_value(sixty_lines("new"), window, cx);
             });
             window.draw(cx).clear(cx);
@@ -4416,12 +4425,12 @@ mod tests {
         cx.update(|window, cx| {
             window.draw(cx).clear(cx);
             editor.update(cx, |state, cx| {
-                state.scroll_to_row(40, crate::input::RowScrollAlign::Top, cx);
-                state.set_selections(vec![sel(far..far, false)], cx);
+                state.scroll_to_row(40, crate::input::RowScrollAlign::Top, window, cx);
+                state.set_selections(vec![sel(far..far, false)], window, cx);
             });
             window.draw(cx).clear(cx);
         });
-        let (top, _) = editor.read_with(&cx, |state, _| state.row_bounds(40)).expect("row 40");
+        let (top, _) = editor.update_in(&mut cx, |state, window, _| state.row_bounds(40, window)).expect("row 40");
         assert_eq!(top, px(0.), "row 40 stays at the top");
     }
 
@@ -4440,14 +4449,14 @@ mod tests {
             editor.update(cx, |state, cx| show_inline_completion(state, 1, 2, cx));
             window.draw(cx).clear(cx);
         });
-        editor.read_with(&cx, |state, _| {
+        editor.update_in(&mut cx, |state, window, _| {
             let at = |row_y: Pixels| state.gutter_row_at(point(gutter, top + row_y));
             assert_eq!(at(line_height * 0.5), Some(0));
             assert_eq!(at(line_height * 1.5), Some(1));
             assert_eq!(at(line_height * 2.5), None, "on the ghost lines");
             assert_eq!(at(line_height * 4.5), Some(2), "row 2 is drawn below them");
-            let (row0, _) = state.row_bounds(0).unwrap();
-            let (row2, _) = state.row_bounds(2).unwrap();
+            let (row0, _) = state.row_bounds(0, window).unwrap();
+            let (row2, _) = state.row_bounds(2, window).unwrap();
             assert_eq!(row2 - row0, line_height * 2. + ghost);
         });
     }
@@ -4575,7 +4584,7 @@ mod tests {
                 editor.update(cx, |state, cx| {
                     match scroll {
                         "scroll_to_row" => {
-                            state.scroll_to_row(40, crate::input::RowScrollAlign::Top, cx)
+                            state.scroll_to_row(40, crate::input::RowScrollAlign::Top, window, cx)
                         }
                         _ => {
                             let line_height = state.last_layout.as_ref().unwrap().line_height;
@@ -4587,7 +4596,7 @@ mod tests {
                 window.draw(cx).clear(cx);
             });
             let (top, _) = editor
-                .read_with(&cx, |state, _| state.row_bounds(40))
+                .update_in(&mut cx, |state, window, _| state.row_bounds(40, window))
                 .expect("row 40");
             assert_eq!(top, px(0.), "{scroll}: row 40 stays at the top");
         }
@@ -4610,7 +4619,7 @@ mod tests {
                     window,
                     cx,
                 );
-                state.scroll_to_row(9, crate::input::RowScrollAlign::Top, cx);
+                state.scroll_to_row(9, crate::input::RowScrollAlign::Top, window, cx);
                 (
                     state.deferred_scroll_offset().expect("queued"),
                     state.last_layout.as_ref().unwrap().line_height,
@@ -4636,23 +4645,23 @@ mod tests {
         let (editor, window) = decoration_editor(cx, &sixty_lines("line"), false);
         let mut cx = VisualTestContext::from_window(window.into(), cx);
         cx.update(|window, cx| window.draw(cx).clear(cx));
-        editor.update_in(&mut cx, |state, _, cx| {
-            state.scroll_to_row(40, crate::input::RowScrollAlign::Top, cx);
+        editor.update_in(&mut cx, |state, window, cx| {
+            state.scroll_to_row(40, crate::input::RowScrollAlign::Top, window, cx);
             assert_eq!(
-                state.row_bounds(40).expect("row 40").0,
+                state.row_bounds(40, window).expect("row 40").0,
                 px(0.),
                 "row 40 is at the top"
             );
             state.set_scroll_offset(point(px(0.), px(500.)), cx);
             assert_eq!(
-                state.queued_scroll_offset().y,
+                state.queued_scroll_offset(window).y,
                 px(0.),
                 "nothing above the first row"
             );
         });
-        let lowest = editor.update_in(&mut cx, |state, _, cx| {
+        let lowest = editor.update_in(&mut cx, |state, window, cx| {
             state.set_scroll_offset(point(px(-1000.), px(-100_000.)), cx);
-            state.queued_scroll_offset()
+            state.queued_scroll_offset(window)
         });
         cx.update(|window, cx| window.draw(cx).clear(cx));
         assert_eq!(
@@ -4671,19 +4680,19 @@ mod tests {
         cx.update(|window, cx| {
             window.draw(cx).clear(cx);
             editor.update(cx, |state, cx| {
-                state.scroll_to_row(40, crate::input::RowScrollAlign::Top, cx);
-                let queued = state.queued_scroll_offset();
+                state.scroll_to_row(40, crate::input::RowScrollAlign::Top, window, cx);
+                let queued = state.queued_scroll_offset(window);
                 let line_height = state.last_layout.as_ref().unwrap().line_height;
                 let visible = (state.last_bounds.unwrap().size.height / line_height) as usize;
                 let row = 40 + visible / 2;
                 let start: usize = state.value().split('\n').take(row).map(|line| line.len() + 1).sum();
-                state.set_selections(vec![sel(start..start + 2, false)], cx);
-                assert_eq!(state.queued_scroll_offset(), queued, "row {row} is visible there");
+                state.set_selections(vec![sel(start..start + 2, false)], window, cx);
+                assert_eq!(state.queued_scroll_offset(window), queued, "row {row} is visible there");
                 state.set_value(sixty_lines("new"), window, cx);
             });
             window.draw(cx).clear(cx);
         });
-        let (top, _) = editor.read_with(&cx, |state, _| state.row_bounds(40)).expect("row 40");
+        let (top, _) = editor.update_in(&mut cx, |state, window, _| state.row_bounds(40, window)).expect("row 40");
         assert_eq!(top, px(0.), "row 40 stays at the top");
     }
 
@@ -4694,21 +4703,21 @@ mod tests {
         let (editor, window) = decoration_editor(cx, &sixty_lines("line"), false);
         let mut cx = VisualTestContext::from_window(window.into(), cx);
         focus_and_draw(&editor, &mut cx);
-        editor.update_in(&mut cx, |state, _, cx| {
+        editor.update_in(&mut cx, |state, window, cx| {
             let line_height = state.last_layout.as_ref().unwrap().line_height;
             show_inline_completion(state, 2, 3, cx);
             assert_eq!(
-                state.row_bounds(4).expect("row 4").0,
+                state.row_bounds(4, window).expect("row 4").0,
                 line_height * 7.,
                 "below the visible ghost lines"
             );
-            state.scroll_to_row(1, crate::input::RowScrollAlign::Top, cx);
-            assert_eq!(state.row_bounds(1).expect("row 1").0, px(0.), "rows above the ghost lines");
+            state.scroll_to_row(1, crate::input::RowScrollAlign::Top, window, cx);
+            assert_eq!(state.row_bounds(1, window).expect("row 1").0, px(0.), "rows above the ghost lines");
             // At the top of the view, row 20 is far below the caret row, which
             // that frame doesn't lay out, so it draws no ghost lines.
-            state.scroll_to_row(20, crate::input::RowScrollAlign::Top, cx);
-            assert_eq!(state.queued_scroll_offset().y, -(line_height * 20.));
-            assert_eq!(state.row_bounds(20).expect("row 20").0, px(0.), "row 20 is at the top");
+            state.scroll_to_row(20, crate::input::RowScrollAlign::Top, window, cx);
+            assert_eq!(state.queued_scroll_offset(window).y, -(line_height * 20.));
+            assert_eq!(state.row_bounds(20, window).expect("row 20").0, px(0.), "row 20 is at the top");
         });
     }
 
@@ -4720,18 +4729,18 @@ mod tests {
         let (editor, window) = decoration_editor(cx, &sixty_lines("line"), false);
         let mut cx = VisualTestContext::from_window(window.into(), cx);
         focus_and_draw(&editor, &mut cx);
-        editor.update_in(&mut cx, |state, _, cx| {
+        editor.update_in(&mut cx, |state, window, cx| {
             let line_height = state.last_layout.as_ref().unwrap().line_height;
             let view = state.last_bounds.unwrap().size.height;
             let rows_in_view = (view / line_height).floor() as usize;
             show_inline_completion(state, 0, 3, cx);
             // Fits in the view without the ghost lines, hidden below with them.
             let row = rows_in_view - 2;
-            let (top, height) = state.row_bounds(row).unwrap();
+            let (top, height) = state.row_bounds(row, window).unwrap();
             assert!(top + height > view, "hidden by the ghost lines");
-            state.scroll_to_row(row, crate::input::RowScrollAlign::Nearest, cx);
-            assert!(state.queued_scroll_offset().y < px(0.), "it scrolls");
-            let (top, height) = state.row_bounds(row).unwrap();
+            state.scroll_to_row(row, crate::input::RowScrollAlign::Nearest, window, cx);
+            assert!(state.queued_scroll_offset(window).y < px(0.), "it scrolls");
+            let (top, height) = state.row_bounds(row, window).unwrap();
             assert!(top >= px(0.) && top + height <= view, "row {row} shows: {top:?}");
         });
     }
@@ -4745,10 +4754,10 @@ mod tests {
             (state.input_bounds.origin.x + px(2.), state.input_bounds.origin.y)
         });
         cx.update(|_, cx| editor.update(cx, |state, cx| show_inline_completion(state, 1, 2, cx)));
-        editor.read_with(&cx, |state, _| {
+        editor.update_in(&mut cx, |state, window, _| {
             let line_height = state.last_layout.as_ref().unwrap().line_height;
-            let (row0, _) = state.row_bounds(0).unwrap();
-            let (row2, _) = state.row_bounds(2).unwrap();
+            let (row0, _) = state.row_bounds(0, window).unwrap();
+            let (row2, _) = state.row_bounds(2, window).unwrap();
             assert_eq!(row2 - row0, line_height * 2., "no ghost lines");
             assert_eq!(state.gutter_row_at(point(gutter, top + line_height * 2.5)), Some(2));
         });
@@ -4777,14 +4786,14 @@ mod tests {
         cx.update(|window, cx| {
             editor.update(cx, |state, cx| {
                 show_inline_completion(state, 58, 3, cx);
-                state.scroll_to_row(59, crate::input::RowScrollAlign::Top, cx);
+                state.scroll_to_row(59, crate::input::RowScrollAlign::Top, window, cx);
             });
             window.draw(cx).clear(cx);
         });
-        let queued = editor.update_in(&mut cx, |state, _, cx| {
-            state.set_selections(vec![sel(0..0, false)], cx);
-            state.scroll_to_row(59, crate::input::RowScrollAlign::Top, cx);
-            state.queued_scroll_offset()
+        let queued = editor.update_in(&mut cx, |state, window, cx| {
+            state.set_selections(vec![sel(0..0, false)], window, cx);
+            state.scroll_to_row(59, crate::input::RowScrollAlign::Top, window, cx);
+            state.queued_scroll_offset(window)
         });
         cx.update(|window, cx| window.draw(cx).clear(cx));
         let painted = editor.read_with(&cx, |state, _| state.scroll_handle.offset());
@@ -4804,9 +4813,9 @@ mod tests {
                 let state = cx.new(|cx| {
                     let mut state = EditorState::new(window, cx).soft_wrap(false).default_value(text);
                     if caret {
-                        state.set_selections(vec![sel(target..target, false)], cx);
+                        state.set_selections(vec![sel(target..target, false)], window, cx);
                     } else {
-                        state.scroll_to_row(40, crate::input::RowScrollAlign::Top, cx);
+                        state.scroll_to_row(40, crate::input::RowScrollAlign::Top, window, cx);
                     }
                     state
                 });
@@ -4815,15 +4824,15 @@ mod tests {
             });
             let editor = editor.unwrap();
             // Opening the window draws the first frame: read it as drawn.
-            let cx = VisualTestContext::from_window(window.into(), cx);
-            editor.read_with(&cx, |state, _| {
+            let mut cx = VisualTestContext::from_window(window.into(), cx);
+            editor.update_in(&mut cx, |state, window, _| {
                 let layout = state.last_layout.as_ref().expect("the first frame is drawn");
                 assert!(
                     layout.visible_range.contains(&40),
                     "caret {caret}: the first frame lays out row 40, not {:?}",
                     layout.visible_range
                 );
-                let (top, height) = state.row_bounds(40).unwrap();
+                let (top, height) = state.row_bounds(40, window).unwrap();
                 let view = state.last_bounds.unwrap().size.height;
                 assert!(top >= px(0.) && top + height <= view, "caret {caret}: row 40 shows");
             });
@@ -4843,13 +4852,13 @@ mod tests {
             });
             window.draw(cx).clear(cx);
         });
-        editor.update_in(&mut cx, |state, _, cx| {
+        editor.update_in(&mut cx, |state, window, cx| {
             let line_height = state.last_layout.as_ref().unwrap().line_height;
-            assert_eq!(state.row_bounds(2).expect("row 2").0, line_height * 3.);
+            assert_eq!(state.row_bounds(2, window).expect("row 2").0, line_height * 3.);
             show_inline_completion(state, 1, 4, cx);
-            assert_eq!(state.row_bounds(2).expect("row 2").0, line_height * 6.);
+            assert_eq!(state.row_bounds(2, window).expect("row 2").0, line_height * 6.);
             show_inline_completion(state, 3, 4, cx);
-            assert_eq!(state.row_bounds(2).expect("row 2").0, line_height * 2., "the caret moved below it");
+            assert_eq!(state.row_bounds(2, window).expect("row 2").0, line_height * 2., "the caret moved below it");
         });
     }
 
@@ -4861,13 +4870,13 @@ mod tests {
         let (editor, window) = decoration_editor(cx, &sixty_lines("line"), false);
         let mut cx = VisualTestContext::from_window(window.into(), cx);
         focus_and_draw(&editor, &mut cx);
-        editor.update_in(&mut cx, |state, _, cx| {
+        editor.update_in(&mut cx, |state, window, cx| {
             let line_height = state.last_layout.as_ref().unwrap().line_height;
             show_inline_completion(state, 2, 3, cx);
-            state.set_selections(vec![sel(0..0, false)], cx);
-            state.scroll_to_row(20, crate::input::RowScrollAlign::Top, cx);
-            assert_eq!(state.queued_scroll_offset().y, -(line_height * 20.), "no ghost lines in the target");
-            assert_eq!(state.row_bounds(20).expect("row 20").0, px(0.));
+            state.set_selections(vec![sel(0..0, false)], window, cx);
+            state.scroll_to_row(20, crate::input::RowScrollAlign::Top, window, cx);
+            assert_eq!(state.queued_scroll_offset(window).y, -(line_height * 20.), "no ghost lines in the target");
+            assert_eq!(state.row_bounds(20, window).expect("row 20").0, px(0.));
         });
     }
 
@@ -4881,7 +4890,7 @@ mod tests {
         let queued = editor.update_in(&mut cx, |state, window, cx| {
             state.set_value("x".repeat(600), window, cx);
             state.set_scroll_offset(point(px(-800.), px(0.)), cx);
-            state.queued_scroll_offset().x
+            state.queued_scroll_offset(window).x
         });
         assert_eq!(queued, px(-800.));
         cx.update(|window, cx| window.draw(cx).clear(cx));
@@ -4911,14 +4920,14 @@ mod tests {
         assert_eq!(editor.read_with(&cx, |state, _| state.scroll_offset().x), px(-300.));
         cx.update(|window, cx| {
             editor.update(cx, |state, cx| {
-                state.scroll_to_row(40, crate::input::RowScrollAlign::Top, cx);
+                state.scroll_to_row(40, crate::input::RowScrollAlign::Top, window, cx);
                 state.set_value(sixty_wide_lines("other"), window, cx);
             });
             window.draw(cx).clear(cx);
         });
-        editor.read_with(&cx, |state, _| {
+        editor.update_in(&mut cx, |state, window, _| {
             assert_eq!(state.scroll_offset().x, px(0.), "the new text starts at its left edge");
-            assert_eq!(state.row_bounds(40).expect("laid out").0, px(0.), "row 40 is at the top");
+            assert_eq!(state.row_bounds(40, window).expect("laid out").0, px(0.), "row 40 is at the top");
         });
     }
 
@@ -4937,24 +4946,24 @@ mod tests {
         cx.update(|window, cx| {
             window.draw(cx).clear(cx);
             editor.update(cx, |state, cx| {
-                state.scroll_to_row(40, crate::input::RowScrollAlign::Top, cx)
+                state.scroll_to_row(40, crate::input::RowScrollAlign::Top, window, cx)
             });
             window.draw(cx).clear(cx);
         });
         let target = text.find(&long).unwrap() + 390;
         cx.update(|window, cx| {
             editor.update(cx, |state, cx| {
-                state.scroll_to_row(40, crate::input::RowScrollAlign::Top, cx);
-                let y = state.queued_scroll_offset().y;
-                state.set_selections(vec![sel(target..target, false)], cx);
-                let queued = state.queued_scroll_offset();
+                state.scroll_to_row(40, crate::input::RowScrollAlign::Top, window, cx);
+                let y = state.queued_scroll_offset(window).y;
+                state.set_selections(vec![sel(target..target, false)], window, cx);
+                let queued = state.queued_scroll_offset(window);
                 assert_eq!(queued.y, y, "row 42 shows at row 40's scroll");
                 assert!(queued.x < px(0.), "the caret is revealed sideways");
                 state.set_value(sixty_lines("other"), window, cx);
             });
             window.draw(cx).clear(cx);
         });
-        let (top, _) = editor.read_with(&cx, |state, _| state.row_bounds(40)).expect("laid out");
+        let (top, _) = editor.update_in(&mut cx, |state, window, _| state.row_bounds(40, window)).expect("laid out");
         assert_eq!(top, px(0.), "row 40 is still at the top");
     }
 
@@ -4975,23 +4984,52 @@ mod tests {
                     }
                 })
                 .detach();
-            editor.update(cx, |state, cx| state.set_selections(vec![sel(1..3, false)], cx));
+            editor.update(cx, |state, cx| state.set_selections(vec![sel(1..3, false)], window, cx));
         });
         cx.run_until_parked();
         assert_eq!(seen.get(), 0, "nobody asked");
         cx.update(|_, cx| editor.update(cx, |state, cx| state.report_selection_changes(cx)));
         cx.run_until_parked();
         assert_eq!(seen.get(), 0, "the selections when asked are the baseline");
-        cx.update(|_, cx| {
-            editor.update(cx, |state, cx| state.set_selections(vec![sel(2..4, false)], cx))
+        cx.update(|window, cx| {
+            editor.update(cx, |state, cx| state.set_selections(vec![sel(2..4, false)], window, cx))
         });
         cx.run_until_parked();
         assert_eq!(seen.get(), 1);
     }
 
+    // HERDR: undo moves the caret back with the text, and a listener hears
+    // about the text first: `change`, then `selection_change`.
+    #[gpui::test]
+    fn undo_reports_the_text_before_the_selection(cx: &mut TestAppContext) {
+        let (editor, window) = decoration_editor(cx, "alpha\nbeta", false);
+        let mut cx = VisualTestContext::from_window(window.into(), cx);
+        let events = Rc::new(std::cell::RefCell::new(Vec::new()));
+        cx.update(|window, cx| {
+            editor.update(cx, |state, cx| {
+                state.set_selections(vec![sel(5..5, false)], window, cx);
+                state.report_selection_changes(cx);
+            });
+            let events = events.clone();
+            window
+                .subscribe(&editor, cx, move |_, event: &InputEvent, _, _| match event {
+                    InputEvent::Change => events.borrow_mut().push("change"),
+                    InputEvent::SelectionChange => events.borrow_mut().push("selection_change"),
+                    _ => {}
+                })
+                .detach();
+        });
+        cx.update(|window, cx| editor.update(cx, |state, cx| state.insert("!", window, cx)));
+        cx.run_until_parked();
+        assert_eq!(*events.borrow(), ["change", "selection_change"], "typing");
+        events.borrow_mut().clear();
+        cx.update(|window, cx| editor.update(cx, |state, cx| state.undo(&Undo, window, cx)));
+        cx.run_until_parked();
+        assert_eq!(*events.borrow(), ["change", "selection_change"], "undo");
+    }
+
     // HERDR: a blur earlier in the handler, before any paint, drops the
-    // ghost lines from the measurements once focus is read from the window
-    // (the script API does before it scrolls or measures).
+    // ghost lines from the measurements: they read focus from the window.
     #[gpui::test]
     fn a_blur_in_the_handler_drops_ghost_lines_from_measurements(cx: &mut TestAppContext) {
         let (editor, mut cx) = numbered_editor(cx, "a\nb\nc\nd\ne");
@@ -5002,11 +5040,51 @@ mod tests {
         });
         cx.update(|window, cx| {
             let line_height = editor.read(cx).last_layout.as_ref().unwrap().line_height;
-            let gap = |state: &EditorState| state.row_bounds(2).unwrap().0 - state.row_bounds(0).unwrap().0;
-            assert_eq!(gap(editor.read(cx)), line_height * 4., "drawn with ghost lines");
+            let gap = |window: &Window, cx: &mut App| {
+                editor.update(cx, |state, _| {
+                    state.row_bounds(2, window).unwrap().0 - state.row_bounds(0, window).unwrap().0
+                })
+            };
+            assert_eq!(gap(window, cx), line_height * 4., "drawn with ghost lines");
             window.blur(cx);
-            editor.update(cx, |state, _| state.sync_focus(window));
-            assert_eq!(gap(editor.read(cx)), line_height * 2., "the next frame draws none");
+            assert_eq!(gap(window, cx), line_height * 2., "the next frame draws none");
+        });
+    }
+
+    // HERDR: Rust code that focuses the editor and scrolls in one handler,
+    // before any paint, scrolls to where the next (focused) frame draws the
+    // row: below the ghost lines it now shows.
+    #[gpui::test]
+    fn a_focus_in_the_handler_counts_ghost_lines_in_measurements(cx: &mut TestAppContext) {
+        let (editor, window) = decoration_editor(cx, &sixty_lines("line"), false);
+        let mut cx = VisualTestContext::from_window(window.into(), cx);
+        cx.update(|window, cx| {
+            editor.update(cx, |state, cx| show_inline_completion(state, 2, 3, cx));
+            window.draw(cx).clear(cx);
+        });
+        let row = cx.update(|window, cx| {
+            editor.update(cx, |state, cx| {
+                let line_height = state.last_layout.as_ref().unwrap().line_height;
+                let view = state.last_bounds.unwrap().size.height;
+                // In view without the ghost lines, pushed below it by them.
+                let row = (view / line_height).floor() as usize - 2;
+                assert_eq!(state.row_bounds(4, window).unwrap().0, line_height * 4., "unfocused");
+                state.focus(window, cx);
+                assert_eq!(
+                    state.row_bounds(4, window).unwrap().0,
+                    line_height * 7.,
+                    "below the ghost lines the focused frame draws"
+                );
+                state.scroll_to_row(row, crate::input::RowScrollAlign::Nearest, window, cx);
+                assert!(state.queued_scroll_offset(window).y < px(0.), "it scrolls");
+                row
+            })
+        });
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        editor.update_in(&mut cx, |state, window, _| {
+            let (top, height) = state.row_bounds(row, window).unwrap();
+            let view = state.last_bounds.unwrap().size.height;
+            assert!(top >= px(0.) && top + height <= view, "row {row} shows: {top:?}");
         });
     }
 
@@ -5030,7 +5108,9 @@ mod tests {
             let at = |row_y: Pixels| state.gutter_row_at(point(gutter, top + row_y));
             assert_eq!(at(line_height * 2.5), None, "on the ghost lines as drawn");
             assert_eq!(at(line_height * 4.5), Some(2), "row 2 as drawn");
-            let gap = state.row_bounds(2).unwrap().0 - state.row_bounds(0).unwrap().0;
+            let gap = editor.update(cx, |state, _| {
+                state.row_bounds(2, window).unwrap().0 - state.row_bounds(0, window).unwrap().0
+            });
             assert_eq!(gap, line_height * 2., "scroll measurements use the current completion");
         });
     }

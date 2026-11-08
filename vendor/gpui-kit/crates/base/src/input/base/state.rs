@@ -162,15 +162,17 @@ pub(in crate::input) enum QueuedScroll {
     Caret(super::selection::CursorId),
 }
 
-/// HERDR: one selection as scripts read it, which is what
-/// [`InputEvent::SelectionChange`] compares: [`script_position`] of each
-/// end, and the caret's side only where scripts can see it (a non-empty
-/// selection; a caret's head is its start and its end).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct ReportedSelection {
-    start: (usize, usize),
-    end: (usize, usize),
-    reversed: bool,
+/// HERDR: the selections as last reported by
+/// [`InputEvent::SelectionChange`], kept as byte ranges with the text they
+/// index (a rope clone shares its nodes), and converted to script positions
+/// only when the text has changed since.
+struct SelectionReport {
+    /// [`InputBaseState::selections`], with a caret's side cleared: scripts
+    /// can't see it (a caret's head is its start and its end).
+    selections: Vec<SelectionRange>,
+    text: Rope,
+    /// `document_revision` of `text`.
+    revision: u64,
 }
 
 /// HERDR: `(row, col)` of byte `offset`, 0-based, `col` in UTF-16 code
@@ -599,8 +601,8 @@ pub struct InputBaseState<M: InputModeKind> {
     /// paint and by [`Self::sync_focus`]. Only a focused editor draws an
     /// inline completion, so the ghost-line measurement
     /// ([`Self::ghost_block_in`]) asks this rather than whether a completion
-    /// exists. Reading focus needs the window, which the scroll API doesn't
-    /// take.
+    /// exists. The public scroll and measurement methods refresh it from
+    /// their `window`; upstream paths (`scroll_to`) use the last paint's.
     pub(crate) focused: bool,
     /// HERDR: `document_revision` when the last frame was painted: while it
     /// is unchanged, the last frame's `scroll_size.width` is the text's.
@@ -671,10 +673,9 @@ pub struct InputBaseState<M: InputModeKind> {
     pub(super) emit_events: bool,
 
     _subscriptions: Vec<Subscription>,
-    /// The selections last reported by [`InputEvent::SelectionChange`], in
-    /// [`Self::selections`] order.
-    reported_selections: Vec<ReportedSelection>,
-    /// [`Selections::generation`] when `reported_selections` was last
+    /// The selections last reported by [`InputEvent::SelectionChange`].
+    selection_report: SelectionReport,
+    /// [`Selections::generation`] when `selection_report` was last
     /// checked: an unchanged generation skips the comparison (cursor blinks
     /// notify without touching the selections).
     reported_selections_generation: u64,
@@ -1012,11 +1013,11 @@ impl<M: InputModeKind> InputBaseState<M> {
             silent_replace_text: false,
             emit_events: true,
             _subscriptions,
-            reported_selections: vec![ReportedSelection {
-                start: (0, 0),
-                end: (0, 0),
-                reversed: false,
-            }],
+            selection_report: SelectionReport {
+                selections: Vec::new(),
+                text: Rope::new(),
+                revision: 0,
+            },
             reported_selections_generation: 0,
             reports_selection_changes: false,
             _pending_update: false,
@@ -2859,7 +2860,7 @@ impl<M: InputModeKind> InputBaseState<M> {
         // `scroll_to_row` earlier in the same handler), so revealing an
         // offset that is visible there keeps that scroll instead of
         // replacing it with the current one.
-        let mut scroll_offset = self.queued_scroll_offset();
+        let mut scroll_offset = self.next_scroll_offset();
         let was_offset = scroll_offset;
         let line_height = last_layout.line_height;
 
@@ -2978,8 +2979,15 @@ impl<M: InputModeKind> InputBaseState<M> {
     /// in this handler (clamped to what the text can reach, since
     /// `set_scroll_offset` stores any offset), or the current one. Before
     /// the first layout a row or caret scroll has no offset yet and isn't
-    /// counted.
-    pub fn queued_scroll_offset(&self) -> Point<Pixels> {
+    /// counted. Reads focus from `window`: ghost lines, drawn only while
+    /// focused, change how far the text reaches.
+    pub fn queued_scroll_offset(&mut self, window: &Window) -> Point<Pixels> {
+        self.sync_focus(window);
+        self.next_scroll_offset()
+    }
+
+    /// [`Self::queued_scroll_offset`] with the focus as last seen.
+    fn next_scroll_offset(&self) -> Point<Pixels> {
         let Some(mut offset) = self.deferred_scroll_offset() else {
             return self.scroll_handle.offset();
         };
@@ -3445,8 +3453,11 @@ impl<M: InputModeKind> InputBaseState<M> {
     /// On a single-line input there is no second cursor to add, so the call
     /// replaces the selection instead.
     /// The view scrolls to the new selection.
+    ///
+    /// The reveal uses the focus as last painted (this keeps upstream's
+    /// signature); [`Self::add_selection_range`] reads it from the window.
     pub fn add_selection(&mut self, range: Range<usize>, cx: &mut Context<Self>) {
-        self.add_selection_range(
+        self.push_selection(
             SelectionRange {
                 range,
                 reversed: false,
@@ -3455,8 +3466,19 @@ impl<M: InputModeKind> InputBaseState<M> {
         );
     }
 
-    /// [`Self::add_selection`], keeping which side the caret is on.
-    pub fn add_selection_range(&mut self, selection: SelectionRange, cx: &mut Context<Self>) {
+    /// [`Self::add_selection`], keeping which side the caret is on, with
+    /// focus read from `window`.
+    pub fn add_selection_range(
+        &mut self,
+        selection: SelectionRange,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.sync_focus(window);
+        self.push_selection(selection, cx);
+    }
+
+    fn push_selection(&mut self, selection: SelectionRange, cx: &mut Context<Self>) {
         if !self.is_multi_line() {
             // The path `add_selection` has always taken on single-line inputs.
             self.select_range(selection.range, selection.reversed, cx);
@@ -3527,8 +3549,15 @@ impl<M: InputModeKind> InputBaseState<M> {
     /// input keeps only the first.
     ///
     /// Ranges are clipped and snapped like [`Self::add_selection`];
-    /// overlapping ones are merged.
-    pub fn set_selections(&mut self, selections: Vec<SelectionRange>, cx: &mut Context<Self>) {
+    /// overlapping ones are merged. Reads focus from `window` for the
+    /// reveal: ghost lines, drawn only while focused, move the rows below.
+    pub fn set_selections(
+        &mut self,
+        selections: Vec<SelectionRange>,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.sync_focus(window);
         let limit = if self.is_multi_line() { usize::MAX } else { 1 };
         let mut built: Vec<CursorSelection> = Vec::with_capacity(selections.len().min(limit));
         for (index, selection) in selections.into_iter().take(limit).enumerate() {
@@ -3623,7 +3652,21 @@ impl<M: InputModeKind> InputBaseState<M> {
     /// Only the vertical scroll changes.
     ///
     /// Before the first layout the request is kept and applied after it.
-    pub fn scroll_to_row(&mut self, row: usize, align: RowScrollAlign, cx: &mut Context<Self>) {
+    /// Reads focus from `window`: ghost lines, drawn only while focused,
+    /// move the rows below them.
+    pub fn scroll_to_row(
+        &mut self,
+        row: usize,
+        align: RowScrollAlign,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.sync_focus(window);
+        self.scroll_to_row_now(row, align, cx);
+    }
+
+    /// [`Self::scroll_to_row`] with the focus as last seen.
+    fn scroll_to_row_now(&mut self, row: usize, align: RowScrollAlign, cx: &mut Context<Self>) {
         let (Some(line_height), Some(bounds)) =
             (self.last_layout.as_ref().map(|layout| layout.line_height), self.last_bounds)
         else {
@@ -3635,7 +3678,7 @@ impl<M: InputModeKind> InputBaseState<M> {
         self.drop_pending_row_scroll();
         // Measure against a scroll already queued this frame, so "nearest"
         // can't keep an earlier target that would hide the row.
-        let mut scroll_offset = self.queued_scroll_offset();
+        let mut scroll_offset = self.next_scroll_offset();
         let Some(y) = self.row_scroll_y(row, align, line_height, bounds.size.height, scroll_offset.y)
         else {
             return;
@@ -3803,14 +3846,16 @@ impl<M: InputModeKind> InputBaseState<M> {
     /// the row is scrolled out of view; a soft-wrapped row is taller than one
     /// line. `None` before the first layout or when a fold hides the row.
     /// A scroll queued earlier in the same handler (`scroll_to_row`, a caret
-    /// reveal) is already counted.
-    pub fn row_bounds(&self, row: usize) -> Option<(Pixels, Pixels)> {
+    /// reveal) is already counted. Reads focus from `window`: rows below
+    /// ghost lines, drawn only while focused, move with it.
+    pub fn row_bounds(&mut self, row: usize, window: &Window) -> Option<(Pixels, Pixels)> {
+        self.sync_focus(window);
         let line_height = self.last_layout.as_ref()?.line_height;
         if row >= self.text.lines_len() {
             return None;
         }
         let rows = self.display_map.buffer_line_to_display_row_range(row)?;
-        let scroll_y = self.queued_scroll_offset().y;
+        let scroll_y = self.next_scroll_offset().y;
         let (top, height) = self.row_span(row, rows, line_height, scroll_y);
         Some((top + scroll_y, height))
     }
@@ -3845,15 +3890,6 @@ impl<M: InputModeKind> InputBaseState<M> {
         (ghost_lines > 0).then(|| (row, ghost_lines as f32 * line_height))
     }
 
-    /// HERDR: the caret row and height of the current completion's ghost
-    /// lines, wherever the view is ([`Self::ghost_block_in`] every row), so
-    /// a completion shown, replaced or cleared, or a caret moved, earlier in
-    /// the same handler is already counted, and a completion kept while
-    /// unfocused is not.
-    fn ghost_lines(&self, line_height: Pixels) -> Option<(usize, Pixels)> {
-        self.ghost_block_in(0..usize::MAX, line_height)
-    }
-
     /// HERDR: the inline completion a frame showing buffer lines `visible`
     /// draws, in an editor that is `focused`: the caret row it is drawn at
     /// and its text. The one rule `TextElement::layout_inline_completion`
@@ -3874,9 +3910,9 @@ impl<M: InputModeKind> InputBaseState<M> {
 
     /// HERDR: read focus from `window` for the scroll measurements
     /// ([`Self::focused`]), so a focus change earlier in the same handler,
-    /// before any paint, is counted. The script API calls this before it
-    /// scrolls or measures.
-    pub fn sync_focus(&mut self, window: &Window) {
+    /// before any paint, is counted. Every public method that scrolls to or
+    /// measures a row takes the window and calls this first.
+    fn sync_focus(&mut self, window: &Window) {
         self.focused = self.focus_handle.is_focused(window);
     }
 
@@ -3886,12 +3922,14 @@ impl<M: InputModeKind> InputBaseState<M> {
     }
 
     /// HERDR: [`Self::ghost_block_in`] a frame scrolled to `scroll_y`: the
-    /// ghost lines are drawn only while the caret row is laid out. Returns
-    /// before measuring the visible range when there are no ghost lines, the
-    /// usual case.
+    /// ghost lines are drawn only while the caret row is laid out. Uses the
+    /// current completion and caret, so a completion shown, replaced or
+    /// cleared, or a caret moved, earlier in the same handler is already
+    /// counted. Returns before measuring the visible range when there are no
+    /// ghost lines (every row counted as visible), the usual case.
     fn ghost_block_at(&self, scroll_y: Pixels) -> Option<(usize, Pixels)> {
         let (layout, bounds) = (self.last_layout.as_ref()?, self.last_bounds?);
-        let block = self.ghost_lines(layout.line_height)?;
+        let block = self.ghost_block_in(0..usize::MAX, layout.line_height)?;
         let height = bounds.size.height;
         let scroll_top = super::element::clamp_auto_grow_vertical_scroll_offset(
             &self.mode,
@@ -3914,25 +3952,6 @@ impl<M: InputModeKind> InputBaseState<M> {
         if matches!(self.queued_scroll, Some(QueuedScroll::Row(..) | QueuedScroll::Caret(_))) {
             self.queued_scroll = None;
         }
-    }
-
-    /// The selections as scripts read them, in [`Self::selections`] order.
-    fn reported_selection_positions(&self) -> Vec<ReportedSelection> {
-        self.selections()
-            .into_iter()
-            .map(|sel| ReportedSelection {
-                start: script_position(&self.text, sel.range.start),
-                end: script_position(&self.text, sel.range.end),
-                reversed: sel.reversed && !sel.range.is_empty(),
-            })
-            .collect()
-    }
-
-    /// Whether the selections still match the last report, as scripts
-    /// see them.
-    #[cfg(test)]
-    fn selections_match_reported(&self) -> bool {
-        self.reported_selection_positions() == self.reported_selections
     }
 
     fn mark_selections_reported(&mut self) {
@@ -3959,22 +3978,52 @@ impl<M: InputModeKind> InputBaseState<M> {
 
     /// Record the current selections as reported; returns whether scripts
     /// would see them differently from the last report.
+    ///
+    /// In the same text, byte offsets and script positions map one to one,
+    /// so the byte ranges are compared as they are: moving carets or
+    /// rewriting a selection with the same value converts nothing. After an
+    /// edit, both sides are converted pair by pair, stopping at the first
+    /// difference (with many carets, an edit usually moves the first).
     fn take_selection_report(&mut self) -> bool {
         self.reported_selections_generation = self.selections.generation();
-        let current = self.reported_selection_positions();
-        let changed = current != self.reported_selections;
-        self.reported_selections = current;
+        let mut current = self.selections();
+        for sel in &mut current {
+            sel.reversed &= !sel.range.is_empty();
+        }
+        let report = &self.selection_report;
+        let changed = if report.revision == self.document_revision {
+            current != report.selections
+        } else {
+            let moved = |new: usize, old: usize| {
+                script_position(&self.text, new) != script_position(&report.text, old)
+            };
+            current.len() != report.selections.len()
+                || current.iter().zip(&report.selections).any(|(new, old)| {
+                    new.reversed != old.reversed
+                        || moved(new.range.start, old.range.start)
+                        || moved(new.range.end, old.range.end)
+                })
+        };
+        self.selection_report = SelectionReport {
+            selections: current,
+            text: self.text.clone(),
+            revision: self.document_revision,
+        };
         changed
     }
 
     /// Runs on every notify. Every selection mutation goes through
     /// [`Selections`]' mutating methods, which bump its generation, so a
     /// notify that touched no selection (a cursor blink, a hover) returns
-    /// after one integer compare.
+    /// after one integer compare. A bump that wrote nothing new costs one
+    /// compare of byte ranges ([`Self::take_selection_report`]).
     ///
     /// It runs after the update that changed the selections, when
-    /// `emit_events` is on again, so `emit_events` can't silence it: a
-    /// silent path calls [`Self::mark_selections_reported`] instead.
+    /// `emit_events` is on again, so `emit_events` can't silence it. Only
+    /// `set_value` edits without a `change` event, and it calls
+    /// [`Self::mark_selections_reported`]; undo and redo of token-aware
+    /// edits silence each step but emit one `change` at the end, before
+    /// this runs.
     ///
     /// Compared whole, in `selections()` order, so two equal carets can't
     /// both stand for one reported entry.
@@ -4021,7 +4070,7 @@ impl<M: InputModeKind> InputBaseState<M> {
     /// it is applied now.
     pub(super) fn apply_queued_scroll(&mut self, cx: &mut Context<Self>) {
         match self.queued_scroll.take() {
-            Some(QueuedScroll::Row(row, align)) => self.scroll_to_row(row, align, cx),
+            Some(QueuedScroll::Row(row, align)) => self.scroll_to_row_now(row, align, cx),
             Some(QueuedScroll::Caret(id)) => self.scroll_to(self.caret_of(id), None, cx),
             Some(QueuedScroll::Offset { .. }) | None => {}
         }
@@ -8407,7 +8456,6 @@ mod tests {
             add(state, 5, 5);
             add(state, 12, 12);
             assert_eq!(state.selections(), caret_first);
-            assert!(state.selections_match_reported());
             assert!(!state.take_selection_report(), "no change to report");
         });
     }
@@ -8430,7 +8478,31 @@ mod tests {
             state.selections.remove_all_but_active();
             add(state, 5);
             add(state, 5);
-            assert!(!state.selections_match_reported());
+            assert!(state.take_selection_report());
+        });
+    }
+
+    /// HERDR: after an edit, selections are compared as scripts read them
+    /// (row and UTF-16 column), not by byte offset: text inserted on an
+    /// earlier row moves a caret's offset but not its position.
+    #[gpui::test]
+    fn an_edit_compares_script_positions(cx: &mut TestAppContext) {
+        let input_view = InputView::build_textarea(cx, |state| state.default_value("ab\ncd"));
+        let mut cx = VisualTestContext::from_window(input_view.window_handle.into(), cx);
+        input_view.input.update_in(&mut cx, |state, window, cx| {
+            state.set_selected_range(4..4, cx);
+            state.take_selection_report();
+            state.replace_text_in_range(Some(0..0), "xx", window, cx);
+            // Row 1, column 1 of "xxab\ncd", where the report had it.
+            state.set_selected_range(6..6, cx);
+            assert!(!state.take_selection_report(), "same row and column");
+            state.set_selected_range(7..7, cx);
+            assert!(state.take_selection_report(), "a column further");
+            state.replace_text_in_range(Some(7..7), "é", window, cx);
+            state.set_selected_range(7..7, cx);
+            assert!(!state.take_selection_report(), "same place, before the edit");
+            state.set_selected_range(9..9, cx);
+            assert!(state.take_selection_report(), "after the edit");
         });
     }
 
@@ -8446,7 +8518,6 @@ mod tests {
             state.active_selection_mut().reversed = true;
             state.take_selection_report();
             state.active_selection_mut().reversed = false;
-            assert!(state.selections_match_reported());
             assert!(!state.take_selection_report(), "a caret's side is not reported");
 
             state.set_selected_range(2..5, cx);
@@ -8475,11 +8546,11 @@ mod tests {
                 .detach();
         });
         cx.run_until_parked();
-        input.update_in(&mut cx, |state, _, cx| {
+        input.update_in(&mut cx, |state, window, cx| {
             // Asking for reports is a no-op outside code editors.
             state.report_selection_changes(cx);
             state.set_selected_range(2..4, cx);
-            state.scroll_to_row(40, RowScrollAlign::Top, cx);
+            state.scroll_to_row(40, RowScrollAlign::Top, window, cx);
         });
         cx.run_until_parked();
         assert_eq!(seen.get(), 0);

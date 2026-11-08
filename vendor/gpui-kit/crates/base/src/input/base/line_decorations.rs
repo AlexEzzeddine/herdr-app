@@ -54,27 +54,12 @@ pub(crate) struct RowPaint {
 #[derive(Default)]
 pub(crate) struct LineDecorations {
     /// Applied in key order, later keys winning: JS `sort()` order, what
-    /// scripts are told ([`SortKey`]).
-    by_key: BTreeMap<SortKey, KeyDecorations>,
-}
-
-/// A decoration key ordered as JS `sort()` orders strings: by UTF-16 code
-/// unit. Byte (code-point) order agrees except between characters at or
-/// above U+E000 and characters outside the BMP (surrogates sort first in
-/// UTF-16), so the documented order holds for every key.
-#[derive(Clone, PartialEq, Eq)]
-struct SortKey(SharedString);
-
-impl Ord for SortKey {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.0.encode_utf16().cmp(other.0.encode_utf16())
-    }
-}
-
-impl PartialOrd for SortKey {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
-    }
+    /// scripts are told. Keyed by the key's UTF-16 code units, encoded once
+    /// per set, because that is how JS `sort()` compares strings. Byte
+    /// (code-point) order agrees except between characters at or above
+    /// U+E000 and characters outside the BMP (surrogates sort first in
+    /// UTF-16), so the documented order holds for every key.
+    by_key: BTreeMap<Vec<u16>, KeyDecorations>,
 }
 
 /// One key's decorations, indexed so painting finds those over the visible
@@ -121,7 +106,7 @@ impl LineDecorations {
     /// the end of the text are kept (the text may still grow) and simply
     /// don't paint. Returns whether anything changed.
     pub(crate) fn set(&mut self, key: SharedString, decorations: Vec<LineDecoration>) -> bool {
-        let key = SortKey(key);
+        let key: Vec<u16> = key.encode_utf16().collect();
         let decorations: Vec<LineDecoration> = decorations
             .into_iter()
             .filter(|decoration| {
