@@ -2724,10 +2724,18 @@ impl<M: InputModeKind> Element for TextElement<M> {
         // HERDR: a row or caret scroll waiting for a usable layout becomes
         // an offset now that rows are wrapped and the line height is known,
         // so this frame is laid out and drawn there.
-        let focused = self.state.read(cx).focus_handle.is_focused(window);
-        let placed = self.state.update(cx, |state, _| {
-            state.resolve_pending_scroll(line_height, bounds.size, focused)
-        });
+        // Most frames have nothing waiting: they skip the update.
+        let (focused, waiting) = {
+            let state = self.state.read(cx);
+            (state.focus_handle.is_focused(window), state.has_waiting_scroll())
+        };
+        let placed = waiting
+            .then(|| {
+                self.state.update(cx, |state, _| {
+                    state.resolve_pending_scroll(line_height, bounds.size, focused)
+                })
+            })
+            .flatten();
         let token_width = (bounds.size.width - line_number_width - RIGHT_MARGIN).max(px(1.));
         let mut token_elements =
             self.measure_tokens(token_width, line_height, bounds.size.height, window, cx);

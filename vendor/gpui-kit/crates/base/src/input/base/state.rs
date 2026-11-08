@@ -420,12 +420,24 @@ pub fn script_offset(text: &Rope, row: usize, col: usize) -> usize {
 /// One selection as a byte range, with the side its caret is on.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SelectionRange {
+    /// A range given backwards (`10..2`) is taken in order (`2..10`):
+    /// only `reversed` says which side the caret is on.
     pub range: Range<usize>,
     /// The caret is at `range.start` (the selection was made backwards).
     pub reversed: bool,
 }
 
 impl SelectionRange {
+    /// HERDR: the range in order. A backwards `Range` is empty to Rust, so
+    /// clipping would collapse it to a caret at its start.
+    fn ordered(self) -> Self {
+        let Range { start, end } = self.range;
+        Self {
+            range: start.min(end)..start.max(end),
+            reversed: self.reversed,
+        }
+    }
+
     /// Byte offset of the caret.
     pub fn head(&self) -> usize {
         if self.reversed { self.range.start } else { self.range.end }
@@ -3805,6 +3817,7 @@ impl<M: InputModeKind> InputBaseState<M> {
         api: bool,
         cx: &mut Context<Self>,
     ) {
+        let selection = selection.ordered();
         if !self.is_multi_line() {
             // The path `add_selection` has always taken on single-line inputs.
             self.select_range(selection.range, selection.reversed, cx);
@@ -3900,7 +3913,7 @@ impl<M: InputModeKind> InputBaseState<M> {
             // One path for a code-set selection on a single-line input,
             // shared with `add_selection` (`push_selection`), unless it is
             // the selection already there.
-            if let Some(first) = selections.into_iter().next()
+            if let Some(first) = selections.into_iter().next().map(SelectionRange::ordered)
                 && !self.single_line_selection_is(&first)
             {
                 self.push_selection(first, focused, true, cx);
@@ -3915,6 +3928,7 @@ impl<M: InputModeKind> InputBaseState<M> {
         let mut built: Vec<CursorSelection> = selections
             .into_iter()
             .map(|selection| {
+                let selection = selection.ordered();
                 let (start, end) = self.clip_selection_range(selection.range);
                 Self::code_selection(active_id, start, end, selection.reversed)
             })
@@ -4265,6 +4279,13 @@ impl<M: InputModeKind> InputBaseState<M> {
         });
         self.queued_scroll = self.placed_offset(request, line_height, view_height, focused);
         Some(request)
+    }
+
+    /// HERDR: whether [`Self::resolve_pending_scroll`] has anything to do:
+    /// a queued scroll, or an early one still settling. It returns at once
+    /// otherwise, so prepaint skips the update.
+    pub(super) fn has_waiting_scroll(&self) -> bool {
+        !self.is_single_line() && (self.queued_scroll.is_some() || self.settling_scroll.is_some())
     }
 
     /// HERDR: [`Self::resolve_pending_scroll`] placed `request` before the
@@ -9251,6 +9272,31 @@ mod tests {
                 assert!(expected.is_some(), "laid out");
                 assert_eq!(sel.column_anchor, expected, "{:?}", sel.start..sel.end);
             }
+        });
+    }
+
+    /// HERDR: a range given backwards is the same selection given in
+    /// order; `reversed` alone places the caret. Clipped as given, `10..2`
+    /// was a caret at 10.
+    #[gpui::test]
+    fn a_backwards_range_is_taken_in_order(cx: &mut TestAppContext) {
+        let input_view = InputView::build_textarea(cx, |state| state.default_value("abcdef\nghijkl"));
+        let mut vcx = VisualTestContext::from_window(input_view.window_handle.into(), cx);
+        input_view.input.update_in(&mut vcx, |state, window, cx| {
+            let range = |r: Range<usize>, reversed| SelectionRange { range: r, reversed };
+            state.set_selections(vec![range(10..2, false)], window, cx);
+            assert_eq!(state.selections(), vec![range(2..10, false)]);
+            state.set_selections(vec![range(10..2, true), range(13..12, false)], window, cx);
+            assert_eq!(state.selections(), vec![range(2..10, true), range(12..13, false)]);
+            state.add_selection_range(range(1..0, true), window, cx);
+            assert!(state.selections().contains(&range(0..1, true)), "{:?}", state.selections());
+        });
+        let input_view = InputView::build(cx, |state| state.default_value("abcdef"));
+        let mut cx = VisualTestContext::from_window(input_view.window_handle.into(), cx);
+        input_view.input.update_in(&mut cx, |state, window, cx| {
+            let range = |r: Range<usize>, reversed| SelectionRange { range: r, reversed };
+            state.set_selections(vec![range(5..1, true)], window, cx);
+            assert_eq!(state.selections(), vec![range(1..5, true)], "single line");
         });
     }
 

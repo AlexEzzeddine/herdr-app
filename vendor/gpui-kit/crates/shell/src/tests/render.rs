@@ -5786,6 +5786,63 @@ export default class Code extends View {
     assert!(tree.contains(r#"after={"top":0,"#), "{tree}");
 }
 
+// HERDR: a `head` is compared with the ends after clipping, as the ends
+// are placed: `col: 999` and the line's length are the same caret. Ranges are
+// an array: another iterable is a TypeError naming the method.
+#[gpui::test]
+fn a_script_editor_compares_head_after_clipping_and_takes_only_arrays(cx: &mut TestAppContext) {
+    cx.update(|cx| crate::init(cx));
+    let runtime = ShellRuntime::new_isolated().expect("runtime");
+    cx.update(|cx| runtime.set_global(cx));
+    let source = r##"
+import { View, div } from "gpui-kit";
+import { Editor, EditorState } from "gpui-base";
+export default class Code extends View {
+  init() {
+    this.code = EditorState.new({ language: "rust", value: "hello\nworld" });
+    const range = { start: { row: 0, col: 0 }, end: { row: 0, col: 1 } };
+    this.calls = [];
+    for (const call of [
+      () => this.code.set_selections([{ start: { row: 0, col: 0 }, end: { row: 0, col: 999 }, head: { row: 0, col: 5 } }]),
+      () => this.code.add_selection({ start: { row: 1, col: 99 }, end: { row: 1, col: 2 }, head: { row: 1, col: 5 } }),
+      () => this.code.set_selections(new Map([[range, range]])),
+      () => this.code.set_selections(new Set([range])),
+      () => this.code.set_line_decorations("k", new Set([{ row: 0 }])),
+    ]) {
+      try { call(); this.calls.push("accepted"); }
+      catch (error) { this.calls.push(error.name + ":" + /set_selections|set_line_decorations|head/.test(error.message)); }
+    }
+  }
+  render(cx) {
+    return div()
+      .child(Editor.new(this.code).h(100))
+      .child("calls=" + JSON.stringify(this.calls))
+      .child("sel=" + JSON.stringify(this.code.selections()));
+  }
+}
+"##;
+    let view_type = runtime.load_source("head_clip", source).expect("load");
+    let window = cx.add_window(|_, _| Empty);
+    let mut context = VisualTestContext::from_window(*window.deref(), cx);
+    let object = context
+        .update(|window, cx| runtime.instantiate(&view_type, window, cx))
+        .expect("instantiate");
+    let view = context.update(|_, cx| cx.new(|_| ScriptView::new(runtime.clone(), object.clone())));
+    draw(&mut context, &view);
+    let tree = context
+        .update(|window, cx| runtime.render_to_spec(&object, None, window, cx))
+        .expect("render")
+        .replace("\\\"", "\"");
+    assert!(
+        tree.contains(r#"calls=["accepted","accepted","TypeError:true","TypeError:true","TypeError:true"]"#),
+        "{tree}"
+    );
+    // The clamped head was the end: a forward selection over the line.
+    assert!(tree.contains(r#"{"start":{"row":0,"col":0},"end":{"row":0,"col":5},"head":{"row":0,"col":5},"primary":true}"#), "{tree}");
+    // `col: 99` clips to 5, where the head is: the caret is at the range's end.
+    assert!(tree.contains(r#"{"start":{"row":1,"col":2},"end":{"row":1,"col":5},"head":{"row":1,"col":5},"primary":false}"#), "{tree}");
+}
+
 // HERDR: scripts read and set multiple selections by row/col and scroll to rows.
 #[gpui::test]
 fn a_script_editor_reads_sets_and_scrolls_to_selections(cx: &mut TestAppContext) {

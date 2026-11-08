@@ -551,17 +551,6 @@ pub fn install(ctx: &Ctx<'_>, module: &Object<'_>, runtime: Weak<ShellRuntime>) 
                         &format!("expected {{ start: {{ row, col }}, end: {{ row, col }} }}: {error}"),
                     )
                 })?;
-                // A `head` names which end the caret is on: anything else
-                // (a position inside the range, or one computed in another
-                // coordinate space) is a mistake, not a forward selection.
-                if ranges.iter().any(|range| {
-                    range.head.is_some_and(|head| head != range.start && head != range.end)
-                }) {
-                    return Err(Exception::throw_type(
-                        &ctx,
-                        "a range's head must be its start or its end",
-                    ));
-                }
                 // `set_selections([])` would leave no caret; the editor keeps
                 // its selections then, which a caller clearing them wouldn't
                 // expect, so it is refused rather than silently ignored.
@@ -571,12 +560,17 @@ pub fn install(ctx: &Ctx<'_>, module: &Object<'_>, runtime: Weak<ShellRuntime>) 
                         "set_selections needs at least one range (a caret is an empty range)",
                     ));
                 }
-                scope::with_current(|window, cx| {
+                let applied = scope::with_current(|window, cx| {
                     state.update(cx, |state, cx| {
-                        let selections: Vec<_> = ranges
+                        // Every range is checked before any is applied, so a
+                        // bad one in a list changes nothing.
+                        let Some(selections) = ranges
                             .iter()
                             .map(|range| editor_selection(state.text(), range))
-                            .collect();
+                            .collect::<Option<Vec<_>>>()
+                        else {
+                            return false;
+                        };
                         if add {
                             for selection in selections {
                                 state.add_selection_range(selection, window, cx);
@@ -584,9 +578,15 @@ pub fn install(ctx: &Ctx<'_>, module: &Object<'_>, runtime: Weak<ShellRuntime>) 
                         } else {
                             state.set_selections(selections, window, cx);
                         }
+                        true
                     })
                 })
-                .ok_or_else(|| needs_call(&ctx, "set_selections()"))
+                .ok_or_else(|| needs_call(&ctx, "set_selections()"))?;
+                if applied {
+                    Ok(())
+                } else {
+                    Err(Exception::throw_type(&ctx, "a range's head must be its start or its end"))
+                }
             },
         ),
     )?;
@@ -2113,22 +2113,28 @@ struct EditorLineDecoration {
 }
 
 /// A script range as a byte selection, keeping which side the caret is on.
+/// `None` when its `head` is neither end: a position inside the range, or one
+/// computed in another coordinate space, is a mistake, not a forward
+/// selection. Compared as offsets, after clipping like the ends, so a head
+/// that lands where an end clips to (`col: 999` and the line's length) is
+/// that end.
 fn editor_selection(
     text: &gpui_base::input::Rope,
     range: &EditorRange,
-) -> gpui_base::input::SelectionRange {
+) -> Option<gpui_base::input::SelectionRange> {
     let offset = |at: EditorPosition| gpui_base::input::script_offset(text, at.row, at.col);
     let start = offset(range.start);
     let end = offset(range.end);
     let (low, high) = (start.min(end), start.max(end));
-    let reversed = match range.head {
-        Some(head) => low != high && offset(head) == low,
+    let reversed = match range.head.map(offset) {
+        Some(head) if head != low && head != high => return None,
+        Some(head) => low != high && head == low,
         None => start > end,
     };
-    gpui_base::input::SelectionRange {
+    Some(gpui_base::input::SelectionRange {
         range: low..high,
         reversed,
-    }
+    })
 }
 
 fn editor_row(ctx: &Ctx<'_>, row: f64) -> JsResult<usize> {

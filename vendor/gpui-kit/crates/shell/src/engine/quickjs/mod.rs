@@ -5581,10 +5581,12 @@ globalThis.__gpui = (() => {
   globalThis.__diagnostics = false;
 
   const editorList = (method, value) => {
-    if (value == null || typeof value === "string" || typeof value[Symbol.iterator] !== "function") {
+    // An array only, as typed: another iterable (a `Map` gives
+    // `[key, value]` pairs) would fail later with a raw parse error.
+    if (!Array.isArray(value)) {
       throw new TypeError(`EditorState.${method} expects an array`);
     }
-    return Array.from(value);
+    return value;
   };
   const editorRange = (method, value) => {
     if (value == null || typeof value !== "object" || Array.isArray(value)) {
