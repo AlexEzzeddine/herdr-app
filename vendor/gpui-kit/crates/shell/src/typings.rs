@@ -3192,8 +3192,9 @@ const BASE: &str = r#"  /** A row. */
     set_selections(ranges: EditorRange[]): void;
     /** Adds a selection (like Alt-click), keeping the others. */
     add_selection(range: EditorRange): void;
-    /** Scrolls vertically only. Before the first layout the request waits for it.
-     * Defaults to "nearest". */
+    /** Scrolls vertically only. Before the first layout the request waits for it, and
+     * while the editor is still being sized it is placed again for each new height,
+     * until something else scrolls. Defaults to "nearest". */
     scroll_to_row(row: number, align?: "nearest" | "top" | "center"): void;
     /** Pixels scrolled from the top left, counting a scroll asked for earlier in the same
      * handler (`scroll_to_row`, `set_selections`). Before the first layout `line_height` is
