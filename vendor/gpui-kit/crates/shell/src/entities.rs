@@ -1274,6 +1274,32 @@ fn allocate_store_id(next: u32) -> Option<(u32, u32)> {
     (next <= MAX_STORE_ID).then(|| (next, next + 1))
 }
 
+/// HERDR: which text state a script subscribes on. Decides which
+/// [`InputEventName`]s it reports and names it in errors.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TextStateKind {
+    Input,
+    Textarea,
+    Editor,
+}
+
+impl TextStateKind {
+    /// The name scripts know the state by, in errors.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Input => "input",
+            Self::Textarea => "textarea",
+            Self::Editor => "editor",
+        }
+    }
+
+    /// Whether a state of this kind reports `event`: the
+    /// [`InputEventName::editor_only`] ones only on an `EditorState`.
+    pub fn reports(self, event: InputEventName) -> bool {
+        self == Self::Editor || !event.editor_only()
+    }
+}
+
 /// The events a script can subscribe to, named for what they mean rather than
 /// for the key that produced them.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -1305,12 +1331,12 @@ impl InputEventName {
         Self::GutterClick,
     ];
 
-    /// The event called `name`, if a state of this kind reports it:
+    /// The event called `name`, if a `kind` state reports it:
     /// [`Self::editor_only`] events only on an `EditorState`.
-    pub fn from_name(name: &str, editor: bool) -> Option<Self> {
+    pub fn from_name(name: &str, kind: TextStateKind) -> Option<Self> {
         Self::ALL
             .into_iter()
-            .find(|event| event.name() == name && (editor || !event.editor_only()))
+            .find(|event| event.name() == name && kind.reports(*event))
     }
 
     /// The name scripts subscribe with.
@@ -1335,11 +1361,11 @@ impl InputEventName {
         matches!(self, Self::SelectionChange | Self::Scroll | Self::GutterClick)
     }
 
-    /// The names [`Self::from_name`] accepts for a state of this kind.
-    pub fn names(editor: bool) -> Vec<&'static str> {
+    /// The names [`Self::from_name`] accepts for a `kind` state.
+    pub fn names(kind: TextStateKind) -> Vec<&'static str> {
         Self::ALL
             .into_iter()
-            .filter(|event| editor || !event.editor_only())
+            .filter(|event| kind.reports(*event))
             .map(Self::name)
             .collect()
     }

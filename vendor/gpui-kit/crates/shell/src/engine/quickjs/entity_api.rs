@@ -22,7 +22,7 @@ use rquickjs::{
 };
 
 use crate::{
-    entities::{EntityHandle, InputEventName, OtpEventName, SliderEventName},
+    entities::{EntityHandle, InputEventName, OtpEventName, SliderEventName, TextStateKind},
     scope::{self, ScopePhase},
     spec::{Component, SpecId},
 };
@@ -262,7 +262,7 @@ pub fn install(ctx: &Ctx<'_>, module: &Object<'_>, runtime: Weak<ShellRuntime>) 
                     handle,
                     &name,
                     handler,
-                    StateKind::Input,
+                    TextStateKind::Input,
                 )
             },
         ),
@@ -343,7 +343,7 @@ pub fn install(ctx: &Ctx<'_>, module: &Object<'_>, runtime: Weak<ShellRuntime>) 
                     handle,
                     &name,
                     handler,
-                    StateKind::Textarea,
+                    TextStateKind::Textarea,
                 )
             },
         ),
@@ -725,7 +725,7 @@ pub fn install(ctx: &Ctx<'_>, module: &Object<'_>, runtime: Weak<ShellRuntime>) 
                     handle,
                     &name,
                     handler,
-                    StateKind::Editor,
+                    TextStateKind::Editor,
                 )
             },
         ),
@@ -1551,16 +1551,15 @@ fn subscribe(
     handle: EntityHandle,
     name: &str,
     handler: Handler,
-    what: StateKind,
+    what: TextStateKind,
 ) -> JsResult<bool> {
-    let editor = what == StateKind::Editor;
-    let event = InputEventName::from_name(name, editor).ok_or_else(|| {
+    let event = InputEventName::from_name(name, what).ok_or_else(|| {
         Exception::throw_type(
             ctx,
             &format!(
                 "unknown {} event `{name}`; expected one of: {}",
                 what.name(),
-                InputEventName::names(editor).join(", ")
+                InputEventName::names(what).join(", ")
             ),
         )
     })?;
@@ -2007,24 +2006,6 @@ fn subscribe_calendar(
         ));
     }
     Ok(subscribed)
-}
-
-/// Which text state [`subscribe`] is called for.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum StateKind {
-    Input,
-    Textarea,
-    Editor,
-}
-
-impl StateKind {
-    fn name(self) -> &'static str {
-        match self {
-            Self::Input => "input",
-            Self::Textarea => "textarea",
-            Self::Editor => "editor",
-        }
-    }
 }
 
 fn alive(ctx: &Ctx<'_>, runtime: &Weak<ShellRuntime>) -> JsResult<std::rc::Rc<ShellRuntime>> {

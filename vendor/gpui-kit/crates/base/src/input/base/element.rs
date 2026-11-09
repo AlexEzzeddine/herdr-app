@@ -2731,18 +2731,16 @@ impl<M: InputModeKind> Element for TextElement<M> {
         // an offset now that rows are wrapped and the line height is known,
         // so this frame is laid out and drawn there.
         // Most frames have nothing waiting: they skip the update.
-        let (focused, waiting) = {
+        let (focused, work) = {
             let state = self.state.read(cx);
             let focused = state.focus_handle.is_focused(window);
-            (focused, state.has_waiting_scroll(bounds.size, line_height, focused))
+            (focused, state.scroll_work(bounds.size, line_height, focused))
         };
-        let placed = waiting
-            .then(|| {
-                self.state.update(cx, |state, _| {
-                    state.resolve_pending_scroll(line_height, bounds.size, focused)
-                })
+        let placed = work.and_then(|work| {
+            self.state.update(cx, |state, _| {
+                state.resolve_pending_scroll(work, line_height, bounds.size.height, focused)
             })
-            .flatten();
+        });
         let token_width = (bounds.size.width - line_number_width - RIGHT_MARGIN).max(px(1.));
         let mut token_elements =
             self.measure_tokens(token_width, line_height, bounds.size.height, window, cx);
@@ -4817,17 +4815,17 @@ mod tests {
         editor.read_with(&cx, |state, _| {
             let view = state.last_bounds.unwrap().size;
             let lh = state.line_height().unwrap();
-            assert!(!state.has_waiting_scroll(view, lh, false), "an idle frame skips the update");
+            assert!(state.scroll_work(view, lh, false).is_none(), "an idle frame skips the update");
             assert!(
-                state.has_waiting_scroll(size(view.width, view.height + px(80.)), lh, false),
+                state.scroll_work(size(view.width, view.height + px(80.)), lh, false).is_some(),
                 "a resize places it again"
             );
             assert!(
-                state.has_waiting_scroll(view, lh + px(4.), false),
+                state.scroll_work(view, lh + px(4.), false).is_some(),
                 "so does a new line height, which moves the row"
             );
             assert!(
-                !state.has_waiting_scroll(size(view.width, px(0.)), lh, false),
+                state.scroll_work(size(view.width, px(0.)), lh, false).is_none(),
                 "a view with no height has nowhere to place it: no update"
             );
         });
@@ -4943,7 +4941,7 @@ mod tests {
             assert!(state.deferred_scroll_offset().is_some(), "an offset is queued");
             let view = state.last_bounds.unwrap().size;
             let lh = state.line_height().unwrap();
-            assert!(!state.has_waiting_scroll(view, lh, false), "an offset skips the update");
+            assert!(state.scroll_work(view, lh, false).is_none(), "an offset skips the update");
         });
         cx.update(|window, cx| window.draw(cx).clear(cx));
         editor.read_with(&cx, |state, _| {
@@ -6710,6 +6708,67 @@ mod tests {
             vec![(2, MouseButton::Left, false), (1, MouseButton::Right, true)],
             "a press in the text is not a gutter click"
         );
+    }
+
+    // HERDR: a `gutter_click` handler that selects the pressed line ends
+    // the press's drag, so moving the still-held pointer doesn't stretch
+    // the selection it set. Same for a selection added while dragging.
+    #[gpui::test]
+    fn a_selection_set_by_code_ends_the_drag(cx: &mut TestAppContext) {
+        let (editor, mut cx) = numbered_editor(cx, "alpha\nbeta\ngamma\ndelta");
+        cx.update(|window, cx| {
+            window
+                .subscribe(&editor, cx, move |editor, event: &InputEvent, window, cx| {
+                    if let InputEvent::GutterClick { row: 1, .. } = event {
+                        editor.update(cx, |state, cx| {
+                            state.set_selections(
+                                vec![SelectionRange { range: 6..10, reversed: false }],
+                                window,
+                                cx,
+                            );
+                        });
+                    }
+                })
+                .detach();
+        });
+        let (gutter, text, top, line_height) = editor.read_with(&cx, |state, _| {
+            let layout = state.last_layout.as_ref().unwrap();
+            let origin = state.input_bounds.origin;
+            (
+                origin.x + px(2.),
+                origin.x + layout.line_number_width + px(10.),
+                origin.y,
+                layout.line_height,
+            )
+        });
+        let y = |row: f32| top + line_height * (row + 0.5);
+        let none = gpui::Modifiers::default();
+
+        cx.simulate_mouse_down(point(gutter, y(1.)), MouseButton::Left, none);
+        cx.run_until_parked();
+        assert_eq!(editor.read_with(&cx, |state, _| state.selected_range()), 6..10);
+        cx.simulate_mouse_move(point(text, y(3.)), MouseButton::Left, none);
+        cx.run_until_parked();
+        assert_eq!(
+            editor.read_with(&cx, |state, _| state.selected_range()),
+            6..10,
+            "the move doesn't stretch the selection the handler set"
+        );
+        cx.simulate_mouse_up(point(text, y(3.)), MouseButton::Left, none);
+
+        // A press in the text starts a drag; a selection added during it
+        // ends it too.
+        cx.simulate_mouse_down(point(text, y(0.)), MouseButton::Left, none);
+        cx.update(|window, cx| {
+            editor.update(cx, |state, cx| {
+                state.add_selection_range(SelectionRange { range: 17..22, reversed: false }, window, cx);
+            });
+        });
+        let before = editor.read_with(&cx, |state, _| state.selections());
+        cx.simulate_mouse_move(point(text, y(2.)), MouseButton::Left, none);
+        cx.run_until_parked();
+        assert_eq!(editor.read_with(&cx, |state, _| state.selections()), before);
+        cx.simulate_mouse_up(point(text, y(2.)), MouseButton::Left, none);
     }
 
     // HERDR: a disabled editor reports no gutter presses.

@@ -233,6 +233,17 @@ pub(super) struct SettleView {
     ghost: Option<(usize, Pixels)>,
 }
 
+/// HERDR: what a frame's prepaint does about an early scroll
+/// ([`InputBaseState::scroll_work`]).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) enum ScrollWork {
+    /// The reader took over a settling early scroll: end it.
+    End,
+    /// Place `request` (waiting for layout, or settling and its row moved);
+    /// `view` is where its row is drawn in this frame.
+    Place { request: PendingScroll, view: SettleView },
+}
+
 /// HERDR: a position the frame applying a queued offset reveals
 /// horizontally.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -3176,22 +3187,23 @@ impl<M: InputModeKind> InputBaseState<M> {
     ) {
         // Without a layout this queues nothing, as upstream: a row or caret
         // scroll waiting for the first layout stays.
-        if self.last_layout.is_none() || self.last_bounds.is_none() {
-            return;
-        }
-        // In a view with no height yet (a pane being sized), a waiting row or
-        // caret scroll stays too: an offset measured against no height would
-        // replace it with nothing meaningful. With nothing waiting, this
-        // still queues as upstream does.
-        if !self.has_usable_layout() && self.queued_scroll.is_some_and(|queued| queued.is_pending()) {
-            return;
-        }
-        // The newest scroll request wins over one kept for after layout.
-        self.drop_pending_scroll();
         let (Some(last_layout), Some(bounds)) = (self.last_layout.as_ref(), self.last_bounds.as_ref())
         else {
             return;
         };
+        if self.queued_scroll.is_some_and(|queued| queued.is_pending()) {
+            // In a view with no height yet (a pane being sized), a waiting
+            // row or caret scroll stays too: an offset measured against no
+            // height would replace it with nothing meaningful. With nothing
+            // waiting, this still queues as upstream does.
+            if bounds.size.height <= px(0.) {
+                return;
+            }
+            // The newest scroll request wins over one kept for after layout
+            // ([`Self::drop_pending_scroll`], written out: `last_layout`
+            // borrows `self`).
+            self.queued_scroll = None;
+        }
 
         // HERDR: measure against a scroll already queued this frame (a
         // `scroll_to_row` earlier in the same handler), so revealing an
@@ -3867,7 +3879,19 @@ impl<M: InputModeKind> InputBaseState<M> {
         cx: &mut Context<Self>,
     ) {
         let focused = self.focus_handle.is_focused(window);
+        self.end_pointer_selection();
         self.push_selection(selection, focused, true, cx);
+    }
+
+    /// HERDR: end a mouse or touch drag that is selecting, as releasing the
+    /// button does: a selection set by code (a `gutter_click` handler runs
+    /// while its press is still held) is not then stretched to the pointer
+    /// by the next move. Through the HERDR API only; upstream's
+    /// `add_selection` keeps its behavior.
+    fn end_pointer_selection(&mut self) {
+        self.selecting = false;
+        self.column_select_start = None;
+        self.auto_scroll.stop();
     }
 
     /// Ghost lines are measured as an editor that is `focused` draws them.
@@ -3981,6 +4005,13 @@ impl<M: InputModeKind> InputBaseState<M> {
         cx: &mut Context<Self>,
     ) {
         let focused = self.focus_handle.is_focused(window);
+        // An empty list changes nothing, a drag included.
+        if selections.is_empty() {
+            return;
+        }
+        // Even when the selections are already these: the script wants them
+        // to stay, not to follow the pointer.
+        self.end_pointer_selection();
         if !self.is_multi_line() {
             // One path for a code-set selection on a single-line input,
             // shared with `add_selection` (`push_selection`), unless it is
@@ -4005,9 +4036,6 @@ impl<M: InputModeKind> InputBaseState<M> {
                 Self::code_selection(active_id, start, end, selection.reversed)
             })
             .collect();
-        if built.is_empty() {
-            return;
-        }
         // The current selections are read once, for both checks.
         let mut current = std::mem::take(&mut self.selection_scratch);
         self.selections_into(&mut current);
@@ -4314,32 +4342,23 @@ impl<M: InputModeKind> InputBaseState<M> {
     /// ([`SettlingScroll`]). `focused`: whether this frame draws an inline
     /// completion's ghost lines.
     ///
+    /// `work` is what [`Self::scroll_work`] found for this frame, read just
+    /// before in the same prepaint; nothing changes the state in between.
     /// Returns the request it placed, for [`Self::place_again_after_measuring`].
     pub(super) fn resolve_pending_scroll(
         &mut self,
+        work: ScrollWork,
         line_height: Pixels,
-        view_size: gpui::Size<Pixels>,
+        view_height: Pixels,
         focused: bool,
     ) -> Option<PendingScroll> {
-        let view_height = view_size.height;
-        if self.is_single_line() || view_height <= px(0.) {
+        let ScrollWork::Place { request, view } = work else {
+            self.settling_scroll = None;
             return None;
-        }
-        if let Some(settling) = &self.settling_scroll
-            && settling.painted.is_some()
-        {
-            if self.reader_took_over(settling) {
-                self.settling_scroll = None;
-            } else if settling.view
-                != self.settle_view(settling.request, line_height, view_size, focused)
-            {
-                self.queued_scroll = Some(QueuedScroll::Pending(settling.request));
-            }
-        }
-        let request = self.queued_scroll?.pending()?;
+        };
         self.settling_scroll = Some(SettlingScroll {
             request,
-            view: self.settle_view(request, line_height, view_size, focused),
+            view,
             painted: None,
             selections: self.selections.stamp(),
             folds: self.display_map.folded_ranges().to_vec(),
@@ -4349,38 +4368,44 @@ impl<M: InputModeKind> InputBaseState<M> {
         Some(request)
     }
 
-    /// HERDR: whether [`Self::resolve_pending_scroll`] has anything to do
-    /// for a `view_size` view drawn with `line_height` rows, `focused` or
-    /// not: a row or caret waiting for layout, or an early one settling
-    /// whose row would now be drawn elsewhere ([`SettleView`]). It returns
-    /// at once otherwise, so prepaint skips the update. A view with no
-    /// height has nowhere to place a row, so nothing waits in it.
-    /// A queued offset (keys, mouse, search, or the HERDR API once laid
-    /// out) is applied by paint and needs no update of its own. A settling
-    /// early scroll the reader took over ([`Self::reader_took_over`]: a
-    /// few compares) takes one update, which ends it, so later frames don't
-    /// look up where its row is drawn; one still in place takes an update
-    /// only when its row would be drawn elsewhere.
-    pub(super) fn has_waiting_scroll(
+    /// HERDR: what [`Self::resolve_pending_scroll`] has to do for a
+    /// `view_size` view drawn with `line_height` rows, `focused` or not
+    /// (whether the frame draws ghost lines). The one place that decides
+    /// it; `None` when there is nothing, so prepaint skips the update:
+    ///
+    /// - A row or caret waiting for layout is placed. It replaces a
+    ///   settling one (a new request is the reader taking over).
+    /// - A painted settling early scroll the reader took over
+    ///   ([`Self::reader_took_over`]: a few compares) is ended, so later
+    ///   frames don't look up where its row is drawn.
+    /// - One still in place is placed again only when its row would be
+    ///   drawn elsewhere ([`SettleView`]).
+    ///
+    /// A view with no height has nowhere to place a row, so nothing waits
+    /// in it. A queued offset (keys, mouse, search, or the HERDR API once
+    /// laid out) is applied by paint and needs no update of its own, unless
+    /// it ends a settling scroll. Each frame looks up where the row is drawn
+    /// at most once: the [`SettleView`] found here is the one stored.
+    pub(super) fn scroll_work(
         &self,
         view_size: gpui::Size<Pixels>,
         line_height: Pixels,
         focused: bool,
-    ) -> bool {
-        !self.is_single_line()
-            && view_size.height > px(0.)
-            && (self.queued_scroll.is_some_and(|queued| queued.is_pending())
-                || self.settling_scroll.as_ref().is_some_and(|settling| {
-                    settling.painted.is_some()
-                        && (self.reader_took_over(settling)
-                            || settling.view
-                                != self.settle_view(
-                                    settling.request,
-                                    line_height,
-                                    view_size,
-                                    focused,
-                                ))
-                }))
+    ) -> Option<ScrollWork> {
+        if self.is_single_line() || view_size.height <= px(0.) {
+            return None;
+        }
+        let view = |request| self.settle_view(request, line_height, view_size, focused);
+        if let Some(request) = self.queued_scroll.and_then(|queued| queued.pending()) {
+            return Some(ScrollWork::Place { request, view: view(request) });
+        }
+        let settling = self.settling_scroll.as_ref().filter(|s| s.painted.is_some())?;
+        if self.reader_took_over(settling) {
+            return Some(ScrollWork::End);
+        }
+        let request = settling.request;
+        let view = view(request);
+        (view != settling.view).then_some(ScrollWork::Place { request, view })
     }
 
     /// HERDR: whether an early scroll is settling ([`SettlingScroll`]).

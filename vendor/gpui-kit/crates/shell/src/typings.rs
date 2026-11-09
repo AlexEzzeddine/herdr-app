@@ -3193,12 +3193,14 @@ const BASE: &str = r#"  /** A row. */
      * when it is empty (an editor always has a caret: pass an empty range to reset to one).
      * Passing the selections it already has changes nothing (no scroll). A key a range
      * or position doesn't have is a `TypeError`; `primary` is accepted and ignored, so
-     * `selections()` output sets back as is. */
+     * `selections()` output sets back as is. A mouse drag in progress ends (as in a
+     * `gutter_click` handler, while its press is held), so the pointer doesn't stretch them. */
     set_selections(ranges: EditorRange[]): void;
     /** Adds a selection (like Alt-click), keeping the others, and scrolls to its caret.
      * A range inside an existing selection adds nothing but still scrolls there; one
      * that overlaps is merged into it. Throws a `TypeError` when
-     * `range` is not a single range object or has a key a range doesn't have. */
+     * `range` is not a single range object or has a key a range doesn't have.
+     * Ends a mouse drag in progress, like `set_selections`. */
     add_selection(range: EditorRange): void;
     /** Scrolls vertically only. Before the first layout the request waits for it, and
      * after placing it the row stays where it asked when the view changes (the pane
@@ -4811,11 +4813,11 @@ mod tests {
         };
         assert!(declarations.contains(&format!(
             "on(event: {}, handler: (event: InputEvent, cx: Context)",
-            union(&crate::entities::InputEventName::names(false))
+            union(&crate::entities::InputEventName::names(crate::entities::TextStateKind::Input))
         )));
         // HERDR: editors add `selection_change` and `scroll` to the same
         // handler type, and `gutter_click` with its own payload.
-        let editor_names: Vec<_> = crate::entities::InputEventName::names(true)
+        let editor_names: Vec<_> = crate::entities::InputEventName::names(crate::entities::TextStateKind::Editor)
             .into_iter()
             .filter(|name| *name != "gutter_click")
             .collect();
