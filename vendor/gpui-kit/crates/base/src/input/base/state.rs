@@ -172,12 +172,33 @@ pub(in crate::input) enum QueuedScroll {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(in crate::input) enum PendingScroll {
     /// [`InputBaseState::scroll_to_row`]; the row is clamped when placed,
-    /// since the text may still change.
-    Row(usize, RowScrollAlign),
+    /// since the text may still change. `x`: what it does horizontally,
+    /// so that is the same whether it was asked for before layout or after.
+    Row {
+        row: usize,
+        align: RowScrollAlign,
+        x: RowX,
+    },
     /// Reveal this selection's caret ([`InputBaseState::set_selections`]).
     /// Kept by id, not offset: selections follow edits made before layout,
     /// so the caret is still a valid position in the text when resolved.
     Caret(super::selection::CursorId),
+}
+
+/// HERDR: what a [`PendingScroll::Row`] does horizontally when placed. After
+/// layout, [`InputBaseState::scroll_to_row`] changes only the vertical
+/// scroll of what was queued before it in the handler; before layout the
+/// same is carried here until it is placed.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(in crate::input) enum RowX {
+    /// Nothing was queued: the x the view has then.
+    Current,
+    /// An offset queued before it (`set_scroll_offset`): its x.
+    At(Pixels),
+    /// A reveal queued before it, or the added caret of an `add_selection`
+    /// that isn't its own selection: revealed sideways by the frame that
+    /// lays out its line, as a queued offset's `reveal_x` is.
+    Reveal(RevealX),
 }
 
 /// HERDR: a row or caret scroll asked for before layout, after prepaint
@@ -1207,7 +1228,7 @@ impl<M: InputModeKind> InputBaseState<M> {
         let blink_cursor = cx.new(|_| BlinkCursor::new());
         let undo_manager = UndoManager::new();
 
-        let mut _subscriptions = vec![
+        let _subscriptions = vec![
             // Key bindings can consume events before on_key_down. Observe input
             // before action dispatch so every keystroke resets the blink delay.
             cx.intercept_keystrokes({
@@ -3237,46 +3258,16 @@ impl<M: InputModeKind> InputBaseState<M> {
             }
         }
 
-        // Scroll the row into view. Use the same edge clearance helper as
-        // `TextElement::layout_cursors` so both scroll-into-view paths agree
-        // (a mismatch flickered on `Down` at end-of-buffer with a small
-        // `cursor_surrounding_lines` override).
-        let edge_height =
-            if matches!(padding, ScrollPadding::SurroundingLines) && self.is_code_editor() {
-                super::element::cursor_surrounding_padding(
-                    self.mode.is_auto_grow(),
-                    self.cursor_surrounding_lines,
-                    super::element::viewport_visible_lines(bounds.size.height, line_height),
-                    line_height,
-                )
-            } else {
-                line_height
-            };
-        scroll_offset.y = super::element::reveal_y(
+        scroll_offset.y = self.reveal_scroll_y(
             row_offset_y,
-            scroll_offset.y,
+            was_offset.y,
             bounds.size.height,
             line_height,
-            edge_height,
-        );
-
-        // Avoid necessary scroll, when it was already in the correct position.
-        if direction == Some(MoveDirection::Up) {
-            scroll_offset.y = scroll_offset.y.max(was_offset.y);
-        } else if direction == Some(MoveDirection::Down) {
-            scroll_offset.y = scroll_offset.y.min(was_offset.y);
-        }
-
-        // Clamp the deferred target into the same safe range that
-        // `update_scroll_offset` enforces on persist, so paint never shows an
-        // over-scrolled frame before the post-paint clamp pulls it back.
-        let safe_y_min = self.scroll_y_min(
-            line_height,
-            bounds.size.height,
-            self.ghost_block_at(scroll_offset.y, line_height, bounds.size.height, focused),
+            padding,
+            direction,
+            focused,
         );
         scroll_offset.x = scroll_offset.x.min(px(0.));
-        scroll_offset.y = scroll_offset.y.clamp(safe_y_min, px(0.));
         // HERDR: a row the last frame didn't lay out has no column yet: the
         // frame that applies this scroll reveals it horizontally, rather than
         // drawing at this offset's x instead of its own cursor-follow. A
@@ -3297,6 +3288,57 @@ impl<M: InputModeKind> InputBaseState<M> {
         self.queued_scroll =
             Some(QueuedScroll::Offset { offset: scroll_offset, reveal_x, measured, api });
         cx.notify();
+    }
+
+    /// The vertical scroll that reveals a row whose top is `row_y` in a
+    /// `view_height` view now scrolled to `scroll_y`, clamped to the range
+    /// paint keeps. HERDR: shared by [`Self::reveal_offset`] and an early
+    /// caret scroll ([`Self::placed_offset`]), so both land alike.
+    #[allow(clippy::too_many_arguments)]
+    fn reveal_scroll_y(
+        &self,
+        row_y: Pixels,
+        scroll_y: Pixels,
+        view_height: Pixels,
+        line_height: Pixels,
+        padding: ScrollPadding,
+        direction: Option<MoveDirection>,
+        focused: bool,
+    ) -> Pixels {
+        // Use the same edge clearance helper as `TextElement::layout_cursors`
+        // so both scroll-into-view paths agree (a mismatch flickered on
+        // `Down` at end-of-buffer with a small `cursor_surrounding_lines`
+        // override).
+        let edge_height =
+            if matches!(padding, ScrollPadding::SurroundingLines) && self.is_code_editor() {
+                super::element::cursor_surrounding_padding(
+                    self.mode.is_auto_grow(),
+                    self.cursor_surrounding_lines,
+                    super::element::viewport_visible_lines(view_height, line_height),
+                    line_height,
+                )
+            } else {
+                line_height
+            };
+        let mut y =
+            super::element::reveal_y(row_y, scroll_y, view_height, line_height, edge_height);
+
+        // Avoid necessary scroll, when it was already in the correct position.
+        if direction == Some(MoveDirection::Up) {
+            y = y.max(scroll_y);
+        } else if direction == Some(MoveDirection::Down) {
+            y = y.min(scroll_y);
+        }
+
+        // Clamp the deferred target into the same safe range that
+        // `update_scroll_offset` enforces on persist, so paint never shows an
+        // over-scrolled frame before the post-paint clamp pulls it back.
+        let safe_y_min = self.scroll_y_min(
+            line_height,
+            view_height,
+            self.ghost_block_at(y, line_height, view_height, focused),
+        );
+        y.clamp(safe_y_min, px(0.))
     }
 
     /// HERDR: what to reveal horizontally for byte `offset`: the caret at
@@ -3852,8 +3894,9 @@ impl<M: InputModeKind> InputBaseState<M> {
     /// covered by a selection adds nothing. Overlapping selections are merged.
     /// On a single-line input there is no second cursor to add, so the call
     /// replaces the selection instead.
-    /// The view scrolls to the added range's caret, also when it was covered
-    /// or merged (HERDR: so whether it scrolls doesn't depend on overlap).
+    /// The view scrolls to the new selection; a range merged into another
+    /// scrolls to where it ends. A covered range doesn't scroll (unlike
+    /// [`Self::add_selection_range`], which scrolls whatever the overlap).
     ///
     /// The reveal uses the focus as last painted (this keeps upstream's
     /// signature); [`Self::add_selection_range`] reads it from the window.
@@ -3871,7 +3914,9 @@ impl<M: InputModeKind> InputBaseState<M> {
     }
 
     /// [`Self::add_selection`], keeping which side the caret is on, with
-    /// focus read from `window`.
+    /// focus read from `window`. It scrolls to the added range's caret also
+    /// when a selection already covers the range, so whether a script's call
+    /// scrolls doesn't depend on overlap it can't see.
     pub fn add_selection_range(
         &mut self,
         selection: SelectionRange,
@@ -3918,10 +3963,15 @@ impl<M: InputModeKind> InputBaseState<M> {
         // range. The covering selection's caret can be far away.
         let caret = if selection.reversed { start } else { end };
         if self.selections.iter().any(|sel| sel.start <= start && end <= sel.end) {
-            // Already selected: nothing changes, but it scrolls like a range
-            // merged into one that overlapped it, whatever the overlap.
-            self.reveal_added_caret(caret, focused, api, cx);
-            cx.notify();
+            // Already selected: nothing changes. Through the HERDR API it
+            // scrolls like a range merged into one that overlapped it,
+            // whatever the overlap. Upstream's `add_selection` returns
+            // without scrolling, as it always has: a caller re-adding the
+            // ranges it already shows doesn't move the view.
+            if api {
+                self.reveal_added_caret(caret, focused, api, cx);
+                cx.notify();
+            }
             return;
         }
 
@@ -3943,10 +3993,14 @@ impl<M: InputModeKind> InputBaseState<M> {
     /// range's caret offset.
     fn reveal_added_caret(&mut self, caret: usize, focused: bool, api: bool, cx: &mut Context<Self>) {
         if api && !self.has_usable_layout() {
-            // No id to follow edits by: its row, vertically.
+            // No id to follow edits by: its row, then its offset sideways
+            // once the line is laid out, as a merged reveal after layout.
             let row = self.text.offset_to_point(caret).row;
-            self.queued_scroll =
-                Some(QueuedScroll::Pending(PendingScroll::Row(row, RowScrollAlign::Nearest)));
+            self.queued_scroll = Some(QueuedScroll::Pending(PendingScroll::Row {
+                row,
+                align: RowScrollAlign::Nearest,
+                x: RowX::Reveal(RevealX::Offset(caret)),
+            }));
         } else {
             let by = RevealBy::Offset { api };
             self.reveal_offset(caret, None, ScrollPadding::Minimal, focused, by, cx);
@@ -4196,7 +4250,8 @@ impl<M: InputModeKind> InputBaseState<M> {
     /// earlier in the same handler.
     ///
     /// Before a usable layout (none yet, or one with no height) the request
-    /// replaces any queued scroll, is kept and applied once there is one. Reads focus from `window`:
+    /// replaces any queued scroll (keeping its horizontal part, as above),
+    /// is kept and applied once there is one. Reads focus from `window`:
     /// ghost lines, drawn only while focused, move the rows below them.
     /// A later `set_value` drops it: the new text starts at the top, so
     /// scroll after setting the text.
@@ -4225,7 +4280,8 @@ impl<M: InputModeKind> InputBaseState<M> {
             self.has_usable_layout(),
         ) else {
             // Clamp when applied: the text may still change before layout.
-            self.queued_scroll = Some(QueuedScroll::Pending(PendingScroll::Row(row, align)));
+            let x = self.queued_row_x();
+            self.queued_scroll = Some(QueuedScroll::Pending(PendingScroll::Row { row, align, x }));
             cx.notify();
             return;
         };
@@ -4260,6 +4316,43 @@ impl<M: InputModeKind> InputBaseState<M> {
             api: true,
         });
         cx.notify();
+    }
+
+    /// HERDR: what a row scroll asked for before layout keeps of the
+    /// scroll queued before it horizontally: the rule `scroll_to_row`
+    /// applies after layout, carried until it is placed.
+    fn queued_row_x(&self) -> RowX {
+        match self.queued_scroll {
+            None => RowX::Current,
+            Some(queued @ QueuedScroll::Offset { offset, .. }) => match queued.revealed() {
+                Some(reveal) => RowX::Reveal(reveal),
+                None => RowX::At(offset.x),
+            },
+            Some(QueuedScroll::Pending(PendingScroll::Row { x, .. })) => x,
+            Some(QueuedScroll::Pending(PendingScroll::Caret(id))) => RowX::Reveal(RevealX::Caret(id)),
+        }
+    }
+
+    /// HERDR: queue `x` for a waiting row scroll that is applied after
+    /// layout by [`Self::scroll_to_row_at`] (single-line, or a view that had
+    /// no height in prepaint), so it keeps that as a scroll queued before it.
+    fn queue_row_x(&mut self, x: RowX) {
+        let offset = self.scroll_handle.offset();
+        self.queued_scroll = match x {
+            RowX::Current => None,
+            RowX::At(x) => Some(QueuedScroll::Offset {
+                offset: point(x, offset.y),
+                reveal_x: None,
+                measured: None,
+                api: true,
+            }),
+            RowX::Reveal(reveal) => Some(QueuedScroll::Offset {
+                offset,
+                reveal_x: Some(reveal),
+                measured: None,
+                api: true,
+            }),
+        };
     }
 
     /// HERDR: the vertical scroll that places buffer `row` (clamped to the
@@ -4437,7 +4530,7 @@ impl<M: InputModeKind> InputBaseState<M> {
         focused: bool,
     ) -> SettleView {
         let offset = match request {
-            PendingScroll::Row(row, _) => self
+            PendingScroll::Row { row, .. } => self
                 .text
                 .line_start_offset(row.min(self.text.lines_len().saturating_sub(1))),
             PendingScroll::Caret(id) => self.caret_of(id),
@@ -4487,32 +4580,38 @@ impl<M: InputModeKind> InputBaseState<M> {
     ) -> Option<QueuedScroll> {
         let scroll = self.scroll_handle.offset();
         match request {
-            PendingScroll::Row(row, align) => self
-                .row_scroll_y(row, align, line_height, view_height, scroll.y, focused)
-                .map(|y| QueuedScroll::Offset {
-                    offset: point(scroll.x, y),
-                    reveal_x: None,
+            PendingScroll::Row { row, align, x } => {
+                let y = self.row_scroll_y(row, align, line_height, view_height, scroll.y, focused);
+                // Its horizontal part ([`RowX`]) applies even when "nearest"
+                // finds the row in view, as after layout, where that leaves
+                // the scroll queued before it.
+                let (offset_x, reveal_x) = match x {
+                    RowX::Current => (scroll.x, None),
+                    RowX::At(x) => (x, None),
+                    RowX::Reveal(reveal) => (scroll.x, Some(reveal)),
+                };
+                if y.is_none() && x == RowX::Current {
+                    return None;
+                }
+                Some(QueuedScroll::Offset {
+                    offset: point(offset_x, y.unwrap_or(scroll.y)),
+                    reveal_x,
                     measured: None,
                     api: true,
-                }),
+                })
+            }
             PendingScroll::Caret(id) => {
                 // Vertically as `scroll_to` reveals it (minimal padding); the
                 // caret's line isn't shaped yet, so the horizontal part
                 // follows once it is (`reveal_x`).
-                let y = super::element::reveal_y(
+                let y = self.reveal_scroll_y(
                     self.display_row_y(self.caret_of(id), line_height),
                     scroll.y,
                     view_height,
                     line_height,
-                    line_height,
-                );
-                let y = y.clamp(
-                    self.scroll_y_min(
-                        line_height,
-                        view_height,
-                        self.ghost_block_at(y, line_height, view_height, focused),
-                    ),
-                    px(0.),
+                    ScrollPadding::Minimal,
+                    None,
+                    focused,
                 );
                 Some(QueuedScroll::Offset {
                     offset: point(scroll.x, y),
@@ -4881,7 +4980,10 @@ impl<M: InputModeKind> InputBaseState<M> {
             return;
         }
         match pending {
-            PendingScroll::Row(row, align) => self.scroll_to_row_at(row, align, focused, cx),
+            PendingScroll::Row { row, align, x } => {
+                self.queue_row_x(x);
+                self.scroll_to_row_at(row, align, focused, cx);
+            }
             PendingScroll::Caret(id) => self.reveal_caret(id, focused, true, cx),
         }
     }

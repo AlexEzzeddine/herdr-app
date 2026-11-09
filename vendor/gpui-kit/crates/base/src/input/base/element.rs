@@ -4397,7 +4397,7 @@ mod tests {
             editor.update(cx, |state, cx| {
                 state.scroll_to_row(40, crate::input::RowScrollAlign::Top, window, cx);
                 assert!(
-                    matches!(state.queued_scroll, Some(super::super::state::QueuedScroll::Pending(super::super::state::PendingScroll::Row(40, _)))),
+                    matches!(state.queued_scroll, Some(super::super::state::QueuedScroll::Pending(super::super::state::PendingScroll::Row { row: 40, .. }))),
                     "the row waits for layout"
                 );
                 state.set_value(sixty_lines("other"), window, cx);
@@ -5285,7 +5285,7 @@ mod tests {
     // to its caret like one merged into an overlapping selection: whether
     // add_selection scrolls doesn't depend on the overlap.
     #[gpui::test]
-    fn add_selection_inside_a_selection_scrolls_to_the_added_caret(cx: &mut TestAppContext) {
+    fn add_selection_inside_a_selection_scrolls_only_through_the_api(cx: &mut TestAppContext) {
         let text = sixty_lines("line");
         let (editor, window) = decoration_editor(cx, &text, false);
         let mut cx = VisualTestContext::from_window(window.into(), cx);
@@ -5309,8 +5309,13 @@ mod tests {
             });
             editor.update_in(&mut cx, |state, window, _| {
                 assert_eq!(state.selections(), vec![sel(at(0)..at(55), false)], "nothing changed");
-                let (top, height) = state.row_bounds(50, window).expect("row 50");
-                assert!(top >= px(0.) && top + height <= px(140.), "row 50 is in view ({api}): {top:?}");
+                if api {
+                    let (top, height) = state.row_bounds(50, window).expect("row 50");
+                    assert!(top >= px(0.) && top + height <= px(140.), "row 50 is in view: {top:?}");
+                } else {
+                    // Upstream's no-op for a covered range.
+                    assert_eq!(state.scroll_offset().y, px(0.), "add_selection doesn't scroll");
+                }
             });
         }
     }
@@ -6214,6 +6219,62 @@ mod tests {
                 assert!(top >= px(0.) && top + height <= view, "caret {caret}: row 40 shows");
             });
         }
+    }
+
+    // HERDR: a row scroll asked for before layout keeps the x of an offset
+    // queued before it in the same handler, as it does after layout
+    // (`a_row_scroll_keeps_a_queued_horizontal_offset`).
+    #[gpui::test]
+    fn a_row_scroll_before_layout_keeps_a_queued_horizontal_offset(cx: &mut TestAppContext) {
+        cx.update(crate::init);
+        let (text, _) = text_with_a_far_column();
+        let mut editor = None;
+        let window = cx.open_window(size(px(240.), px(140.)), |window, cx| {
+            let state = cx.new(|cx| {
+                let mut state = EditorState::new(window, cx).soft_wrap(false).default_value(text);
+                state.set_scroll_offset(point(px(-100.), px(0.)), cx);
+                state.scroll_to_row(48, crate::input::RowScrollAlign::Top, window, cx);
+                state
+            });
+            editor = Some(state.clone());
+            DecorationHarness(state)
+        });
+        let editor = editor.unwrap();
+        let mut cx = VisualTestContext::from_window(window.into(), cx);
+        editor.update_in(&mut cx, |state, window, _| {
+            assert_eq!(state.scroll_handle.offset().x, px(-100.), "the queued x is kept");
+            let (top, _) = state.row_bounds(48, window).unwrap();
+            assert!(top.abs() < px(0.5), "row 48 is at the top: {top:?}");
+        });
+    }
+
+    // HERDR: `add_selection_range` before layout, for a range a selection
+    // already covers, reveals the added caret sideways too, as one that
+    // stays its own selection does: the first frame scrolls right to it.
+    #[gpui::test]
+    fn a_covered_add_selection_before_layout_is_revealed_sideways(cx: &mut TestAppContext) {
+        cx.update(crate::init);
+        let (text, target) = text_with_a_far_column();
+        let mut editor = None;
+        let window = cx.open_window(size(px(240.), px(140.)), |window, cx| {
+            let state = cx.new(|cx| {
+                let mut state = EditorState::new(window, cx).soft_wrap(false).default_value(text);
+                // Upstream reveals nothing before layout, so only the added
+                // range below scrolls. Its caret is the active one's, which
+                // the check below reads.
+                state.set_selected_range(target - 6..target, cx);
+                state.add_selection_range(sel(target - 3..target, false), window, cx);
+                state
+            });
+            editor = Some(state.clone());
+            DecorationHarness(state)
+        });
+        let editor = editor.unwrap();
+        // Opening the window draws the first frame: read it as drawn.
+        let mut cx = VisualTestContext::from_window(window.into(), cx);
+        let scroll_x = editor.read_with(&cx, |state, _| state.scroll_handle.offset().x);
+        assert!(scroll_x < px(0.), "it scrolled right: {scroll_x:?}");
+        assert_caret_on_row_50_shows(&editor, &mut cx);
     }
 
     // HERDR: an upstream reveal before the first layout queues nothing (as
