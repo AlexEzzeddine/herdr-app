@@ -844,7 +844,13 @@ impl<M: InputModeKind> TextElement<M> {
             // horizontally as `InputBaseState::scroll_to` does.
             if let Some((id, mut caret)) = state.queued_reveal_x() {
                 let row = state.text.offset_to_point(caret).row;
-                if visible_buffer_lines.contains(&row) {
+                // A caret inside a fold is drawn at the start of the fold's
+                // header row (`caret_for` falls back to the row's origin), so
+                // that is what is revealed: the reveal is applied with this
+                // frame's scroll and dropped after it.
+                if visible_buffer_lines.contains(&row)
+                    || state.display_map.is_buffer_line_hidden(row)
+                {
                     if state.masked {
                         caret = masked_display_offset(&state.text, caret);
                     }
@@ -4024,6 +4030,51 @@ mod tests {
         assert_caret_on_row_50_shows(&editor, &mut cx);
     }
 
+    // HERDR: a caret set by code inside a fold is drawn at the start of the
+    // fold's header row. The frame that scrolls to it reveals it there
+    // sideways too, rather than dropping the sideways step because its own
+    // row isn't laid out.
+    #[gpui::test]
+    fn a_caret_inside_a_fold_is_revealed_where_it_is_drawn(cx: &mut TestAppContext) {
+        let long = "x".repeat(400);
+        let text = (0..60)
+            .map(|i| if i == 5 || i == 50 { long.clone() } else { format!("line {i}") })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let row_5 = text.find(&long).unwrap() + 390;
+        let row_50 = text.rfind(&long).unwrap() + 390;
+        let (editor, window) = decoration_editor(cx, &text, false);
+        let mut cx = VisualTestContext::from_window(window.into(), cx);
+        cx.update(|window, cx| {
+            editor.update(cx, |state, cx| {
+                state.display_map.set_fold_candidates(vec![crate::input::FoldRange::new(45, 55)]);
+                state.display_map.toggle_fold(45);
+                cx.notify();
+            });
+            window.draw(cx).clear(cx);
+            editor.update(cx, |state, cx| state.set_selections(vec![sel(row_5..row_5, false)], window, cx));
+            window.draw(cx).clear(cx);
+        });
+        let scroll_x = editor.read_with(&cx, |state, _| state.scroll_handle.offset().x);
+        assert!(scroll_x < px(0.), "scrolled right to row 5's far column");
+        cx.update(|window, cx| {
+            editor.update(cx, |state, cx| {
+                assert!(state.display_map.is_buffer_line_hidden(50), "row 50 is folded");
+                state.set_selections(vec![sel(row_50..row_50, false)], window, cx)
+            });
+            window.draw(cx).clear(cx);
+        });
+        editor.read_with(&cx, |state, _| {
+            let layout = state.last_layout.as_ref().unwrap();
+            let cursor = layout.cursor_bounds.expect("the caret is drawn");
+            let text_left = state.input_bounds.left() + layout.line_number_width;
+            assert!(
+                cursor.left() >= text_left && cursor.right() <= state.input_bounds.right(),
+                "the caret shows at the fold's header: {cursor:?}"
+            );
+        });
+    }
+
     // HERDR: a caret followed past the left edge by layout's cursor-follow
     // (no `scroll_to`: a click, typing) sits on the edge, as upstream's
     // cursor-follow always has: sharing `reveal_x` changes no input's
@@ -4779,6 +4830,50 @@ mod tests {
                 !state.has_waiting_scroll(size(view.width, px(0.)), lh, false),
                 "a view with no height has nowhere to place it: no update"
             );
+        });
+    }
+
+    // HERDR: once the reader takes over the view, the next frame ends a
+    // placed early scroll, so later frames don't look up where its row is
+    // drawn, though the view never changes size.
+    #[gpui::test]
+    fn a_taken_over_early_scroll_ends_without_a_resize(cx: &mut TestAppContext) {
+        cx.update(crate::init);
+        let height = Rc::new(std::cell::Cell::new(px(0.)));
+        let mut editor = None;
+        let window = cx.open_window(size(px(240.), px(200.)), {
+            let height = height.clone();
+            |window, cx| {
+                let state = cx.new(|cx| {
+                    let mut state =
+                        EditorState::new(window, cx).soft_wrap(false).default_value(sixty_lines("line"));
+                    state.scroll_to_row(40, crate::input::RowScrollAlign::Top, window, cx);
+                    state
+                });
+                editor = Some(state.clone());
+                SizedHarness(state, height)
+            }
+        });
+        let editor = editor.unwrap();
+        let mut cx = VisualTestContext::from_window(window.into(), cx);
+        height.set(px(100.));
+        cx.update(|window, cx| {
+            window.draw(cx).clear(cx);
+            window.refresh();
+            window.draw(cx).clear(cx);
+        });
+        assert!(editor.read_with(&cx, |state, _| state.has_settling_scroll()), "placed");
+        cx.update(|window, cx| {
+            // The reader scrolls (a wheel moves the scroll handle).
+            editor.update(cx, |state, cx| {
+                state.scroll_handle.set_offset(point(px(0.), px(-40.)));
+                cx.notify();
+            });
+            window.draw(cx).clear(cx);
+        });
+        editor.read_with(&cx, |state, _| {
+            assert!(!state.has_settling_scroll(), "ended by the next frame");
+            assert_eq!(state.scroll_handle.offset().y, px(-40.), "where the reader scrolled");
         });
     }
 
@@ -5646,6 +5741,31 @@ mod tests {
             let (row0, _) = state.row_bounds(0, window).unwrap();
             let (row2, _) = state.row_bounds(2, window).unwrap();
             assert_eq!(row2 - row0, line_height * 2. + ghost);
+        });
+    }
+
+    // HERDR: paint extends the gutter by the ghost lines' height; a press on
+    // a line number drawn in that strip is on its row, as it is above it.
+    #[gpui::test]
+    fn gutter_presses_below_the_view_count_the_ghost_lines(cx: &mut TestAppContext) {
+        let (editor, mut cx) = numbered_editor(cx, &sixty_lines("line"));
+        focus_and_draw(&editor, &mut cx);
+        cx.update(|window, cx| {
+            editor.update(cx, |state, cx| show_inline_completion(state, 1, 2, cx));
+            window.draw(cx).clear(cx);
+        });
+        editor.read_with(&cx, |state, _| {
+            let layout = state.last_layout.as_ref().unwrap();
+            let ghost = layout.ghost_block.expect("the ghost lines are drawn");
+            let bottom = state.input_bounds.bottom() + state.editor_paddings.bottom;
+            let gutter = state.input_bounds.origin.x + px(2.);
+            let y = bottom + ghost.1 / 2.;
+            let top = state.last_bounds.unwrap().origin.y;
+            let row = visible_row_spans(layout, Some(ghost))
+                .find(|span| y - top >= span.top && y - top < span.top + span.height)
+                .map(|span| span.row);
+            assert!(row.is_some(), "a row is laid out in the strip");
+            assert_eq!(state.gutter_row_at(point(gutter, y)), row);
         });
     }
 

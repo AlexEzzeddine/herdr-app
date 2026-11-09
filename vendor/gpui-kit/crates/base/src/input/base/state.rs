@@ -3605,8 +3605,11 @@ impl<M: InputModeKind> InputBaseState<M> {
         // HERDR: also ends placing an early scroll again ([`SettlingScroll`]).
         self.document_revision = self.document_revision.wrapping_add(1);
         // HERDR: `range` is in the text before this edit, whose bytes before
-        // `range.start` it leaves alone.
-        self.selection_report.record_edit(text, range.start);
+        // `range.start` it leaves alone. Only while reports are on: turning
+        // them on takes a fresh report, which needs no earlier edit.
+        if self.reports_selection_changes {
+            self.selection_report.record_edit(text, range.start);
+        }
         let token_delta = self.edit_tokens(range, new_text.len());
         if self.undo_manager.is_ignoring() {
             return false;
@@ -3879,6 +3882,8 @@ impl<M: InputModeKind> InputBaseState<M> {
         let selection = selection.ordered();
         if !self.is_multi_line() {
             // The path `add_selection` has always taken on single-line inputs.
+            // It needs no `begin_programmatic_selection`: `select_range`
+            // starts with `move_to`, which does the same.
             self.select_range(selection.range, selection.reversed, cx);
             return;
         }
@@ -4321,16 +4326,9 @@ impl<M: InputModeKind> InputBaseState<M> {
             return None;
         }
         if let Some(settling) = &self.settling_scroll
-            && let Some(painted) = settling.painted
+            && settling.painted.is_some()
         {
-            if self.queued_scroll.is_some()
-                || self.scroll_handle.offset() != painted
-                || self.selections.stamp() != settling.selections
-                || self.display_map.folded_ranges() != settling.folds.as_slice()
-                || self.document_revision != settling.revision
-            {
-                // Something else scrolled, a caret moved, or the rows were
-                // folded or edited since: it no longer applies.
+            if self.reader_took_over(settling) {
                 self.settling_scroll = None;
             } else if settling.view
                 != self.settle_view(settling.request, line_height, view_size, focused)
@@ -4358,13 +4356,11 @@ impl<M: InputModeKind> InputBaseState<M> {
     /// at once otherwise, so prepaint skips the update. A view with no
     /// height has nowhere to place a row, so nothing waits in it.
     /// A queued offset (keys, mouse, search, or the HERDR API once laid
-    /// out) is applied by paint and needs no update: the settling scroll it
-    /// ends is compared as state at the next change of the view (the
-    /// scroll handle no longer matches). An early scroll whose row stays
-    /// where it was placed has nothing to place, so whether the reader
-    /// took over the view is checked only when that changes, not on every
-    /// frame. (Undone changes, such as a fold unfolded before it, are then
-    /// not seen; the view is as it was placed.)
+    /// out) is applied by paint and needs no update of its own. A settling
+    /// early scroll the reader took over ([`Self::reader_took_over`]: a
+    /// few compares) takes one update, which ends it, so later frames don't
+    /// look up where its row is drawn; one still in place takes an update
+    /// only when its row would be drawn elsewhere.
     pub(super) fn has_waiting_scroll(
         &self,
         view_size: gpui::Size<Pixels>,
@@ -4376,9 +4372,34 @@ impl<M: InputModeKind> InputBaseState<M> {
             && (self.queued_scroll.is_some_and(|queued| queued.is_pending())
                 || self.settling_scroll.as_ref().is_some_and(|settling| {
                     settling.painted.is_some()
-                        && settling.view
-                            != self.settle_view(settling.request, line_height, view_size, focused)
+                        && (self.reader_took_over(settling)
+                            || settling.view
+                                != self.settle_view(
+                                    settling.request,
+                                    line_height,
+                                    view_size,
+                                    focused,
+                                ))
                 }))
+    }
+
+    /// HERDR: whether an early scroll is settling ([`SettlingScroll`]).
+    #[cfg(test)]
+    pub(super) fn has_settling_scroll(&self) -> bool {
+        self.settling_scroll.is_some()
+    }
+
+    /// HERDR: whether a painted [`SettlingScroll`] no longer applies:
+    /// something else scrolled (a queued scroll, or the scroll handle moved
+    /// from where it was painted), a caret moved, or the rows were folded
+    /// or edited since it was placed. Compared as state, cheaply, before
+    /// any lookup of where its row is drawn.
+    fn reader_took_over(&self, settling: &SettlingScroll) -> bool {
+        self.queued_scroll.is_some()
+            || settling.painted.is_some_and(|painted| self.scroll_handle.offset() != painted)
+            || self.selections.stamp() != settling.selections
+            || self.display_map.folded_ranges() != settling.folds.as_slice()
+            || self.document_revision != settling.revision
     }
 
     /// HERDR: where `request`'s row is drawn in a `view_size` view with
@@ -4504,11 +4525,13 @@ impl<M: InputModeKind> InputBaseState<M> {
         let Some(layout) = self.last_layout.as_ref() else {
             return false;
         };
+        // The ghost lines' height, as paint extends the gutter by it.
+        let ghost_lines_height = layout.ghost_block.map_or(px(0.), |(_, height)| height);
         self.mode.line_number()
             && super::element::editor_gutter_bounds(
                 self.input_bounds,
                 layout.line_number_width,
-                px(0.),
+                ghost_lines_height,
                 self.editor_paddings,
             )
             .contains(&position)
@@ -9302,6 +9325,8 @@ mod tests {
         let input_view = InputView::build_textarea(cx, |state| state.default_value("ab\ncd"));
         let mut cx = VisualTestContext::from_window(input_view.window_handle.into(), cx);
         input_view.input.update_in(&mut cx, |state, window, cx| {
+            // Edits are recorded only while reports are on.
+            state.reports_selection_changes = true;
             state.set_selected_range(4..4, cx);
             state.take_selection_report();
             state.replace_text_in_range(Some(0..0), "xx", window, cx);
@@ -9326,6 +9351,8 @@ mod tests {
         let input_view = InputView::build_textarea(cx, |state| state.default_value("ab\ncd\nef"));
         let mut cx = VisualTestContext::from_window(input_view.window_handle.into(), cx);
         input_view.input.update_in(&mut cx, |state, window, cx| {
+            // Edits are recorded only while reports are on.
+            state.reports_selection_changes = true;
             state.set_selected_range(1..1, cx);
             state.take_selection_report();
             assert_eq!(state.selection_report.edit_floor, usize::MAX, "no edit yet");
@@ -9353,6 +9380,8 @@ mod tests {
         let input_view = InputView::build_textarea(cx, |state| state.default_value("ab\ncd\nef"));
         let mut cx = VisualTestContext::from_window(input_view.window_handle.into(), cx);
         input_view.input.update_in(&mut cx, |state, window, cx| {
+            // Edits are recorded only while reports are on.
+            state.reports_selection_changes = true;
             // (1, 1) to (2, 1).
             state.set_selected_range(4..7, cx);
             state.take_selection_report();
@@ -9468,6 +9497,8 @@ mod tests {
         let input_view = InputView::build_textarea(cx, |state| state.default_value("ab\ncd\nef"));
         let mut cx = VisualTestContext::from_window(input_view.window_handle.into(), cx);
         input_view.input.update_in(&mut cx, |state, window, cx| {
+            // Edits are recorded only while reports are on.
+            state.reports_selection_changes = true;
             let caret = |at: usize| SelectionRange { range: at..at, reversed: false };
             // Active (1, 1), then (0, 1) and (2, 1): reported in that order.
             state.set_selections(vec![caret(4), caret(1), caret(7)], window, cx);
@@ -9504,6 +9535,45 @@ mod tests {
                 assert_eq!(set, added, "{range:?} reversed {reversed}");
                 assert_eq!(set.0.len(), 1, "a single-line input keeps one selection");
             }
+        });
+    }
+
+    /// HERDR: an editor nobody listens to for selection changes records
+    /// nothing for them on an edit; turning reports on starts from a fresh
+    /// report.
+    #[gpui::test]
+    fn edits_record_nothing_while_reports_are_off(cx: &mut TestAppContext) {
+        let input_view = InputView::build_textarea(cx, |state| state.default_value("ab\ncd"));
+        let mut cx = VisualTestContext::from_window(input_view.window_handle.into(), cx);
+        input_view.input.update_in(&mut cx, |state, window, cx| {
+            state.set_selected_range(4..4, cx);
+            state.replace_text_in_range(Some(0..0), "xx", window, cx);
+            assert_eq!(state.selection_report.edit_floor, usize::MAX, "nothing recorded");
+            state.reports_selection_changes = true;
+            state.take_selection_report();
+            state.replace_text_in_range(Some(0..0), "y", window, cx);
+            assert_eq!(state.selection_report.edit_floor, 0, "recorded once on");
+        });
+    }
+
+    /// HERDR: a single-line `set_selections` ends typing coalescing, as on a
+    /// multi-line input: the edit after it is its own undo step, even one
+    /// adjacent to the last. `select_range`'s `move_to` breaks it.
+    #[gpui::test]
+    fn single_line_set_selections_ends_typing_coalescing(cx: &mut TestAppContext) {
+        let input_view = InputView::build(cx, |state| state);
+        let mut cx = VisualTestContext::from_window(input_view.window_handle.into(), cx);
+        input_view.input.update_in(&mut cx, |state, window, cx| {
+            state.replace_text_in_range(None, "a", window, cx);
+            state.replace_text_in_range(None, "b", window, cx);
+            // Away and back to where typing left off: the next edit is
+            // adjacent to the last one, but not part of it.
+            state.set_selections(vec![SelectionRange { range: 0..0, reversed: false }], window, cx);
+            state.set_selections(vec![SelectionRange { range: 2..2, reversed: false }], window, cx);
+            state.replace_text_in_range(None, "x", window, cx);
+            assert_eq!(state.value().as_ref(), "abx");
+            state.undo(&Undo, window, cx);
+            assert_eq!(state.value().as_ref(), "ab", "only the edit after it is undone");
         });
     }
 
