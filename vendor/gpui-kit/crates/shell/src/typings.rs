@@ -3032,6 +3032,18 @@ const BASE: &str = r#"  /** A row. */
     readonly shift?: boolean;
   }
 
+  /** An `EditorState` `gutter_click`: a press on a line number. */
+  export interface GutterClickEvent {
+    /** 0-based buffer row. */
+    readonly row: number;
+    /** As in `on_mouse_down`; a middle press is not reported. */
+    readonly button: "left" | "right";
+    /** 1 for a single press, 2 on the second press of a double-click, 3 for a
+     * triple-click. Every press is reported: act on `click_count === 1` to toggle. */
+    readonly click_count: number;
+    readonly modifiers: Modifiers;
+  }
+
   /** The OTP event payload is currently empty; read the value from the state. */
   export interface OtpEvent {}
 
@@ -3143,10 +3155,102 @@ const BASE: &str = r#"  /** A row. */
   // HERDR: built-in source editing and read-only code viewing.
   export interface EditorState {
     value(): string;
-    /** Programmatic replacement works even in readonly mode. */
+    /** Programmatic replacement works even in readonly mode. It is silent: it resets the
+     * selections to a caret at the start and scrolls to the top without a `change`,
+     * `selection_change` or `scroll`, so read `selections()` / `scroll_position()` after it.
+     * Any scroll asked for before it is dropped: to open a file at a row, set the text
+     * first, then `scroll_to_row`. A scroll the reader caused just before it (a key or a
+     * click revealing the caret) still applies and is reported by `scroll`. */
     set_value(value: string): void;
-    on(event: "change" | "submit" | "focus" | "blur" | "paste_other", handler: (event: InputEvent, cx: Context) => void): boolean;
+    /** `selection_change`: selections or carets moved, were added or removed; read `selections()`.
+     * `scroll`: the view scrolled; `scroll_position()` and `row_bounds()` are current in the handler.
+     * Only editors report these two (inputs and textareas reject them). */
+    on(event: "change" | "submit" | "focus" | "blur" | "paste_other" | "selection_change" | "scroll", handler: (event: InputEvent, cx: Context) => void): boolean;
+    /** A press on a line number (a left press on a fold chevron folds instead). The press
+     * still places the caret, so dragging down the gutter still selects lines. Presses in the
+     * gutter's paddings are on the row drawn there (decoration bars paint in the left one, and
+     * a row scrolled partly under the top or bottom one shows there); presses below
+     * the last line or on an inline completion's extra lines report nothing, and neither
+     * does a disabled editor. Needs line numbers. */
+    on(event: "gutter_click", handler: (event: GutterClickEvent, cx: Context) => void): boolean;
+    /** Replaces the line decorations under `key` (each owner uses its own key, so they
+     * don't replace each other); an empty list removes them. Rows are fixed: they don't
+     * move with edits, so set them again on `change`. Rows past the end of the text
+     * are kept and paint once the text reaches them. Where decorations overlap, later
+     * ones in the list win, and keys apply in sorted order (by character code, as JS
+     * `sort()` orders them, so every uppercase letter sorts before every lowercase one):
+     * on a row two keys color, the later key wins ("review" over "diff", but "diff" over
+     * "Review"), whichever was set last. Throws a `TypeError` for a key a decoration
+     * doesn't have (a misspelled `end_row` is an error, not ignored). */
+    set_line_decorations(key: string, decorations: LineDecoration[]): void;
+    /** Every selection: the primary one first, then the rest in document order.
+     * An empty selection is a caret. `set_value` changes it without a `selection_change`. */
+    selections(): EditorSelection[];
+    /** Replaces every selection; the first becomes primary and its caret is scrolled
+     * into view (after the first layout, if there is none yet). Overlapping ranges merge.
+     * Pass `head` (or `start` after `end`) for a backwards selection, so `selections()`
+     * round-trips; a `head` that is neither `start` nor `end` (once all three are clipped to the text) is a `TypeError`. Throws a `TypeError` when `ranges` is not an array and a `RangeError`
+     * when it is empty (an editor always has a caret: pass an empty range to reset to one).
+     * Passing the selections it already has changes nothing (no scroll). A key a range
+     * or position doesn't have is a `TypeError`; `primary` is accepted and ignored, so
+     * `selections()` output sets back as is. A mouse drag in progress ends (as in a
+     * `gutter_click` handler, while its press is held), so the pointer doesn't stretch them. */
+    set_selections(ranges: EditorRange[]): void;
+    /** Adds a selection (like Alt-click), keeping the others, and scrolls to its caret.
+     * A range inside an existing selection adds nothing but still scrolls there; one
+     * that overlaps is merged into it. Throws a `TypeError` when
+     * `range` is not a single range object or has a key a range doesn't have.
+     * Ends a mouse drag in progress, like `set_selections`. */
+    add_selection(range: EditorRange): void;
+    /** Scrolls vertically only. Before the first layout the request waits for it, and
+     * after placing it the row stays where it asked when the view changes (the pane
+     * being sized, a later resize, a width change rewrapping soft-wrapped rows, a new
+     * font size, line numbers turned on or off, ghost lines shown) until
+     * the reader takes over the view: another scroll, a press in the editor, a
+     * selection change or an edit. A later `set_value` drops it. Defaults to
+     * "nearest". Throws a TypeError when `row` isn't a number and a RangeError when it
+     * isn't a non-negative integer. */
+    scroll_to_row(row: number, align?: "nearest" | "top" | "center"): void;
+    /** Pixels scrolled from the top left, counting a scroll asked for earlier in the same
+     * handler (`scroll_to_row`, `set_selections`). Before the first layout `line_height` is
+     * null and such a scroll is still waiting: it isn't counted until the editor is laid out.
+     * A caret on a row out of view is revealed sideways only once its row is drawn: `top`
+     * counts it at once, `left` in the next frame, which reports `scroll`. */
+    scroll_position(): { top: number; left: number; line_height: number | null };
+    /** Pixels from the top of the visible text area; null before layout, for a row past
+     * the last one, or inside a fold.
+     * A soft-wrapped row is taller than one line. Counts a scroll asked for earlier in the
+     * same handler, like `scroll_position()`. Throws for a `row` that isn't a
+     * non-negative integer, like `scroll_to_row`. */
+    row_bounds(row: number): { top: number; height: number } | null;
     release(): boolean;
+  }
+  export interface LineDecoration {
+    /** 0-based buffer row. */
+    row: number;
+    /** Last row (inclusive) for a range of rows; defaults to `row`. */
+    end_row?: number;
+    /** Fill behind the rows' text and line numbers, under the selection. Use a
+     * translucent color (`#rrggbbaa`) so the active line still shows. */
+    background?: Color;
+    /** A bar at the gutter's left edge. Needs line numbers. */
+    gutter?: Color;
+  }
+  /** 0-based; `col` counts UTF-16 code units, so it indexes the line as a JS string. */
+  export interface EditorPosition {
+    row: number;
+    col: number;
+  }
+  export interface EditorRange {
+    start: EditorPosition;
+    end: EditorPosition;
+    /** Where the caret goes: `start` or `end`. Defaults to `end`. */
+    head?: EditorPosition;
+  }
+  export interface EditorSelection extends EditorRange {
+    /** Where the caret is: `start` or `end`. */
+    head: EditorPosition;
+    primary: boolean;
   }
   export const EditorState: {
     new: (options?: {
@@ -3164,6 +3268,8 @@ const BASE: &str = r#"  /** A row. */
       readonly?: boolean;
       /** Defaults to false. */
       soft_wrap?: boolean;
+      /** Keep showing selections while the editor is not focused (e.g. lines chosen by code). Defaults to false. */
+      show_unfocused_selection?: boolean;
       /** Semantic colors: keyword, string, comment, function, type, number,
        * constant, variable, operator, punctuation, boolean, string.escape.
        * Values are concrete hex colors; unspecified UI colors follow the theme. */
@@ -4707,8 +4813,21 @@ mod tests {
         };
         assert!(declarations.contains(&format!(
             "on(event: {}, handler: (event: InputEvent, cx: Context)",
-            union(crate::entities::InputEventName::NAMES)
+            union(&crate::entities::InputEventName::names(crate::entities::TextStateKind::Input))
         )));
+        // HERDR: editors add `selection_change` and `scroll` to the same
+        // handler type, and `gutter_click` with its own payload.
+        let editor_names: Vec<_> = crate::entities::InputEventName::names(crate::entities::TextStateKind::Editor)
+            .into_iter()
+            .filter(|name| *name != "gutter_click")
+            .collect();
+        assert!(declarations.contains(&format!(
+            "on(event: {}, handler: (event: InputEvent, cx: Context)",
+            union(&editor_names)
+        )));
+        assert!(declarations.contains(
+            "on(event: \"gutter_click\", handler: (event: GutterClickEvent, cx: Context)"
+        ));
         assert!(declarations.contains(&format!(
             "on(event: {}, handler: (event: OtpEvent, cx: Context)",
             union(crate::entities::OtpEventName::NAMES)

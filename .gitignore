@@ -2,3 +2,5 @@
 /dist
 /.brain
 /AGENTS.local.md
+/vendor/*/target
+/vendor/gpui-kit/Cargo.lock

@@ -67,6 +67,9 @@ mod rope_ext;
 mod search;
 #[path = "base/selection.rs"]
 mod selection;
+#[path = "base/line_decorations.rs"]
+mod line_decorations;
+pub use line_decorations::LineDecoration;
 #[path = "base/state.rs"]
 mod state;
 mod textarea;

@@ -184,6 +184,8 @@ pub(crate) struct EditorOptions {
     pub syntax: HashMap<String, String>,
     pub font_family: Option<String>,
     pub font_size: Option<f32>,
+    /// HERDR: paint selections while unfocused.
+    pub show_unfocused_selection: bool,
 }
 
 impl Default for EditorOptions {
@@ -198,6 +200,7 @@ impl Default for EditorOptions {
             syntax: HashMap::new(),
             font_family: None,
             font_size: None,
+            show_unfocused_selection: false,
         }
     }
 }
@@ -462,6 +465,7 @@ impl EntityStore {
                 .folding(options.folding)
                 .soft_wrap(options.soft_wrap);
             state.set_readonly(options.readonly, cx);
+            state.set_show_unfocused_selection(options.show_unfocused_selection, cx);
             state.set_editor_style(style);
             state.set_highlighter_factory(
                 Rc::new(|language| {
@@ -812,6 +816,9 @@ impl EntityStore {
         cx: &mut App,
         handler: impl Fn(&InputEvent, &mut Window, &mut App) + 'static,
     ) -> bool {
+        // HERDR: the editor, kept to turn its reports on once the
+        // subscription is stored.
+        let mut editor = None;
         let subscription = match self.record(handle) {
             Some(Record::Input { state, .. }) => {
                 subscribe_to_events(&state.clone(), event, window, cx, handler)
@@ -821,7 +828,10 @@ impl EntityStore {
             }
             // HERDR: code editors emit the same input events.
             Some(Record::Editor { state, .. }) => {
-                subscribe_to_events(&state.clone(), event, window, cx, handler)
+                let state = state.clone();
+                let subscription = subscribe_to_events(&state, event, window, cx, handler);
+                editor = Some(state);
+                subscription
             }
             _ => return false,
         };
@@ -831,12 +841,22 @@ impl EntityStore {
                 Record::Input { subscriptions, .. }
                 | Record::Textarea { subscriptions, .. }
                 | Record::Editor { subscriptions, .. },
-            ) => {
-                subscriptions.push(subscription);
-                true
-            }
-            _ => false,
+            ) => subscriptions.push(subscription),
+            _ => return false,
         }
+        // HERDR: selection changes and scrolls are reported only once a
+        // subscription that receives them is kept, so an editor whose
+        // subscription was dropped pays nothing.
+        if let Some(state) = editor {
+            match event {
+                InputEventName::SelectionChange => {
+                    state.update(cx, |state, cx| state.report_selection_changes(cx))
+                }
+                InputEventName::Scroll => state.update(cx, |state, _| state.report_scrolls()),
+                _ => {}
+            }
+        }
+        true
     }
 
     /// Subscribes to one slider event for as long as the handle lives.
@@ -1254,6 +1274,32 @@ fn allocate_store_id(next: u32) -> Option<(u32, u32)> {
     (next <= MAX_STORE_ID).then(|| (next, next + 1))
 }
 
+/// HERDR: which text state a script subscribes on. Decides which
+/// [`InputEventName`]s it reports and names it in errors.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TextStateKind {
+    Input,
+    Textarea,
+    Editor,
+}
+
+impl TextStateKind {
+    /// The name scripts know the state by, in errors.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Input => "input",
+            Self::Textarea => "textarea",
+            Self::Editor => "editor",
+        }
+    }
+
+    /// Whether a state of this kind reports `event`: the
+    /// [`InputEventName::editor_only`] ones only on an `EditorState`.
+    pub fn reports(self, event: InputEventName) -> bool {
+        self == Self::Editor || !event.editor_only()
+    }
+}
+
 /// The events a script can subscribe to, named for what they mean rather than
 /// for the key that produced them.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -1264,21 +1310,65 @@ pub enum InputEventName {
     Blur,
     /// A paste with no text on the clipboard (an image): the script reads it.
     PasteOther,
+    /// HERDR: selections or carets changed.
+    SelectionChange,
+    /// HERDR: the view scrolled.
+    Scroll,
+    /// HERDR: a press in the line-number gutter.
+    GutterClick,
 }
 
 impl InputEventName {
-    pub fn from_name(name: &str) -> Option<Self> {
-        match name {
-            "change" => Some(Self::Change),
-            "submit" => Some(Self::Submit),
-            "focus" => Some(Self::Focus),
-            "blur" => Some(Self::Blur),
-            "paste_other" => Some(Self::PasteOther),
-            _ => None,
+    /// HERDR: every event, in the order [`Self::names`] lists them.
+    const ALL: [Self; 8] = [
+        Self::Change,
+        Self::Submit,
+        Self::Focus,
+        Self::Blur,
+        Self::PasteOther,
+        Self::SelectionChange,
+        Self::Scroll,
+        Self::GutterClick,
+    ];
+
+    /// The event called `name`, if a `kind` state reports it:
+    /// [`Self::editor_only`] events only on an `EditorState`.
+    pub fn from_name(name: &str, kind: TextStateKind) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|event| event.name() == name && kind.reports(*event))
+    }
+
+    /// The name scripts subscribe with.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Change => "change",
+            Self::Submit => "submit",
+            Self::Focus => "focus",
+            Self::Blur => "blur",
+            Self::PasteOther => "paste_other",
+            Self::SelectionChange => "selection_change",
+            Self::Scroll => "scroll",
+            Self::GutterClick => "gutter_click",
         }
     }
 
-    pub const NAMES: &'static [&'static str] = &["change", "submit", "focus", "blur", "paste_other"];
+    /// HERDR: whether only an `EditorState` reports it to scripts. Inputs
+    /// and textareas reject these instead of accepting a handler they can't
+    /// act on: they have no gutter, and no `selections()` or
+    /// `scroll_position()` to read after a `selection_change` or `scroll`.
+    pub fn editor_only(self) -> bool {
+        matches!(self, Self::SelectionChange | Self::Scroll | Self::GutterClick)
+    }
+
+    /// The names [`Self::from_name`] accepts for a `kind` state.
+    pub fn names(kind: TextStateKind) -> Vec<&'static str> {
+        Self::ALL
+            .into_iter()
+            .filter(|event| kind.reports(*event))
+            .map(Self::name)
+            .collect()
+    }
 
     fn matches(self, event: &InputEvent) -> bool {
         matches!(
@@ -1288,6 +1378,9 @@ impl InputEventName {
                 | (Self::Focus, InputEvent::Focus)
                 | (Self::Blur, InputEvent::Blur)
                 | (Self::PasteOther, InputEvent::PasteWithoutText)
+                | (Self::SelectionChange, InputEvent::SelectionChange)
+                | (Self::Scroll, InputEvent::Scroll)
+                | (Self::GutterClick, InputEvent::GutterClick { .. })
         )
     }
 }

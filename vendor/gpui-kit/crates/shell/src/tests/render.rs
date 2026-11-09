@@ -5739,6 +5739,340 @@ export default class Code extends View {
     assert!(tree.contains("changes=1"), "{tree}");
 }
 
+// HERDR: a script's set_value starts the new text at the top, dropping a
+// scroll asked for before it; scroll_to_row after it opens the text there.
+#[gpui::test]
+fn a_script_editor_set_value_drops_an_earlier_scroll(cx: &mut TestAppContext) {
+    cx.update(|cx| crate::init(cx));
+    let runtime = ShellRuntime::new_isolated().expect("runtime");
+    cx.update(|cx| runtime.set_global(cx));
+    let source = r##"
+import { View, div } from "gpui-kit";
+import { Editor, EditorState } from "gpui-base";
+const text = (name) => Array.from({ length: 80 }, (_, i) => name + " " + i).join("\n");
+export default class Code extends View {
+  init() {
+    this.before = EditorState.new({ value: text("old") });
+    this.after = EditorState.new({ value: text("old") });
+    this.before.scroll_to_row(60, "top");
+    this.before.set_value(text("new"));
+    this.after.set_value(text("new"));
+    this.after.scroll_to_row(60, "top");
+  }
+  render(cx) {
+    return div()
+      .child(Editor.new(this.before).h(200))
+      .child(Editor.new(this.after).h(200))
+      .child("before=" + this.before.scroll_position().top)
+      .child("after=" + JSON.stringify(this.after.row_bounds(60)));
+  }
+}
+"##;
+    let view_type = runtime.load_source("set_value_scroll", source).expect("load");
+    let window = cx.add_window(|_, _| Empty);
+    let mut context = VisualTestContext::from_window(*window.deref(), cx);
+    let object = context
+        .update(|window, cx| runtime.instantiate(&view_type, window, cx))
+        .expect("instantiate");
+    let view = context.update(|_, cx| cx.new(|_| ScriptView::new(runtime.clone(), object.clone())));
+    for _ in 0..3 {
+        draw(&mut context, &view);
+    }
+    let tree = context
+        .update(|window, cx| runtime.render_to_spec(&object, None, window, cx))
+        .expect("render")
+        .replace("\\\"", "\"");
+    assert!(tree.contains("before=0"), "{tree}");
+    assert!(tree.contains(r#"after={"top":0,"#), "{tree}");
+}
+
+// HERDR: a `head` is compared with the ends after clipping, as the ends
+// are placed: `col: 999` and the line's length are the same caret. Ranges are
+// an array: another iterable is a TypeError naming the method.
+#[gpui::test]
+fn a_script_editor_compares_head_after_clipping_and_takes_only_arrays(cx: &mut TestAppContext) {
+    cx.update(|cx| crate::init(cx));
+    let runtime = ShellRuntime::new_isolated().expect("runtime");
+    cx.update(|cx| runtime.set_global(cx));
+    let source = r##"
+import { View, div } from "gpui-kit";
+import { Editor, EditorState } from "gpui-base";
+export default class Code extends View {
+  init() {
+    this.code = EditorState.new({ language: "rust", value: "hello\nworld" });
+    const range = { start: { row: 0, col: 0 }, end: { row: 0, col: 1 } };
+    this.calls = [];
+    for (const call of [
+      () => this.code.set_selections([{ start: { row: 0, col: 0 }, end: { row: 0, col: 999 }, head: { row: 0, col: 5 } }]),
+      () => this.code.add_selection({ start: { row: 1, col: 99 }, end: { row: 1, col: 2 }, head: { row: 1, col: 5 } }),
+      () => this.code.set_selections(new Map([[range, range]])),
+      () => this.code.set_selections(new Set([range])),
+      () => this.code.set_line_decorations("k", new Set([{ row: 0 }])),
+    ]) {
+      try { call(); this.calls.push("accepted"); }
+      catch (error) { this.calls.push(error.name + ":" + /set_selections|set_line_decorations|head/.test(error.message)); }
+    }
+  }
+  render(cx) {
+    return div()
+      .child(Editor.new(this.code).h(100))
+      .child("calls=" + JSON.stringify(this.calls))
+      .child("sel=" + JSON.stringify(this.code.selections()));
+  }
+}
+"##;
+    let view_type = runtime.load_source("head_clip", source).expect("load");
+    let window = cx.add_window(|_, _| Empty);
+    let mut context = VisualTestContext::from_window(*window.deref(), cx);
+    let object = context
+        .update(|window, cx| runtime.instantiate(&view_type, window, cx))
+        .expect("instantiate");
+    let view = context.update(|_, cx| cx.new(|_| ScriptView::new(runtime.clone(), object.clone())));
+    draw(&mut context, &view);
+    let tree = context
+        .update(|window, cx| runtime.render_to_spec(&object, None, window, cx))
+        .expect("render")
+        .replace("\\\"", "\"");
+    assert!(
+        tree.contains(r#"calls=["accepted","accepted","TypeError:true","TypeError:true","TypeError:true"]"#),
+        "{tree}"
+    );
+    // The clamped head was the end: a forward selection over the line.
+    assert!(tree.contains(r#"{"start":{"row":0,"col":0},"end":{"row":0,"col":5},"head":{"row":0,"col":5},"primary":true}"#), "{tree}");
+    // `col: 99` clips to 5, where the head is: the caret is at the range's end.
+    assert!(tree.contains(r#"{"start":{"row":1,"col":2},"end":{"row":1,"col":5},"head":{"row":1,"col":5},"primary":false}"#), "{tree}");
+}
+
+// HERDR: scripts read and set multiple selections by row/col and scroll to rows.
+#[gpui::test]
+fn a_script_editor_reads_sets_and_scrolls_to_selections(cx: &mut TestAppContext) {
+    cx.update(|cx| crate::init(cx));
+    let runtime = ShellRuntime::new_isolated().expect("runtime");
+    cx.update(|cx| runtime.set_global(cx));
+    let source = r##"
+import { View, div } from "gpui-kit";
+import { Editor, EditorState } from "gpui-base";
+export default class Code extends View {
+  init() {
+    const lines = [];
+    for (let i = 0; i < 80; i++) lines.push(i === 3 ? "a😀bc" : "line " + i);
+    this.code = EditorState.new({
+      language: "rust", value: lines.join("\n"), show_unfocused_selection: true,
+    });
+    this.selection_events = 0;
+    this.scroll_seen = [];
+    this.code.on("scroll", () => { this.scroll_seen.push(this.code.row_bounds(60)?.top); });
+    this.code.on("selection_change", () => { this.selection_events += 1; });
+    this.code.set_selections([
+      { start: { row: 3, col: 3 }, end: { row: 3, col: 5 } },
+      { start: { row: 10, col: 0 }, end: { row: 12, col: 2 }, head: { row: 10, col: 0 } },
+    ]);
+    this.code.add_selection({ start: { row: 20, col: 1 }, end: { row: 20, col: 1 } });
+    // What `selections()` returns (with `primary`) sets back as is.
+    try { this.code.set_selections(this.code.selections()); this.round_trip = "ok"; }
+    catch (error) { this.round_trip = error.name; }
+    // A misspelled key is refused rather than silently dropped.
+    this.typos = [];
+    for (const call of [
+      () => this.code.add_selection({ start: { row: 0, col: 0 }, end: { row: 0, col: 1 }, haed: { row: 0, col: 0 } }),
+      () => this.code.add_selection({ start: { row: 0, column: 0 }, end: { row: 0, col: 1 } }),
+      () => this.code.set_line_decorations("diff", [{ row: 10, endRow: 20, background: "#f004" }]),
+      // A head inside the range names neither end.
+      () => this.code.add_selection({ start: { row: 0, col: 0 }, end: { row: 0, col: 4 }, head: { row: 0, col: 2 } }),
+      () => this.code.set_selections([{ start: { row: 0, col: 0 }, end: { row: 0, col: 4 }, head: { row: 1, col: 0 } }]),
+    ]) {
+      try { call(); this.typos.push("accepted"); }
+      catch (error) { this.typos.push(error.name); }
+    }
+    // A row past what fits in an integer is past the end, as in
+    // `scroll_to_row`; a row that isn't a non-negative integer is refused.
+    this.rows = [];
+    for (const call of [
+      () => this.code.set_line_decorations("far", [{ row: 1e20 }, { row: 70, end_row: 1e20 }]),
+      () => this.code.set_line_decorations("far", [{ row: 1.5 }]),
+      () => this.code.set_line_decorations("far", [{ row: 2, end_row: -1 }]),
+      () => this.code.add_selection({ start: { row: 0, col: 0.5 }, end: { row: 0, col: 1 } }),
+    ]) {
+      try { call(); this.rows.push("accepted"); }
+      catch (error) { this.rows.push(error.name); }
+    }
+    this.code.set_line_decorations("far", []);
+    // Not scrolled yet: `0`, not `-0`.
+    const unscrolled = this.code.scroll_position();
+    this.zero = [Object.is(unscrolled.top, 0), Object.is(unscrolled.left, 0)];
+    this.code.scroll_to_row(60, "top");
+    try { this.code.set_selections([]); this.empty = "accepted"; }
+    catch (error) { this.empty = error.name; }
+    this.bad_add = [];
+    for (const bad of [[{ start: { row: 0, col: 0 }, end: { row: 0, col: 0 } }], undefined]) {
+      try { this.code.add_selection(bad); this.bad_add.push("accepted"); }
+      catch (error) { this.bad_add.push(error.name + ":" + error.message.includes("add_selection")); }
+    }
+    // Not coerced to row 0: a TypeError naming the method.
+    this.bad_row = [];
+    for (const bad of [null, "", [], false, "5", undefined]) {
+      for (const method of ["scroll_to_row", "row_bounds"]) {
+        try { this.code[method](bad); this.bad_row.push("accepted"); }
+        catch (error) { this.bad_row.push(error.name + ":" + error.message.includes(method)); }
+      }
+    }
+    try { this.code.scroll_to_row(-1); this.bad_row.push("accepted"); }
+    catch (error) { this.bad_row.push(error.name); }
+  }
+  render(cx) {
+    return div()
+      .child(Editor.new(this.code).h(200))
+      .child("bad_add=" + JSON.stringify(this.bad_add))
+      .child("bad_row=" + JSON.stringify(this.bad_row))
+      .child("sel=" + JSON.stringify(this.code.selections()))
+      .child("events=" + this.selection_events)
+      .child("row60=" + JSON.stringify(this.code.row_bounds(60)))
+      .child("scrolled=" + (this.code.scroll_position().top > 0))
+      .child("scroll_seen=" + JSON.stringify(this.scroll_seen))
+      .child("empty=" + this.empty)
+      .child("round_trip=" + this.round_trip)
+      .child("typos=" + JSON.stringify(this.typos))
+      .child("zero=" + JSON.stringify(this.zero))
+      .child("rows=" + JSON.stringify(this.rows));
+  }
+}
+"##;
+    let view_type = runtime.load_source("selections", source).expect("load");
+    let window = cx.add_window(|_, _| Empty);
+    let mut context = VisualTestContext::from_window(*window.deref(), cx);
+    let object = context
+        .update(|window, cx| runtime.instantiate(&view_type, window, cx))
+        .expect("instantiate");
+    let view = context.update(|_, cx| cx.new(|_| ScriptView::new(runtime.clone(), object.clone())));
+    for _ in 0..3 {
+        draw(&mut context, &view);
+    }
+    let editor = runtime.entities().first_editor().expect("editor");
+    context.update(|_, cx| {
+        let state = editor.read(cx);
+        let text = state.value().to_string();
+        let selections = state.selections();
+        assert_eq!(selections.len(), 3);
+        // The emoji is two UTF-16 units, so col 3..5 is "bc".
+        assert_eq!(&text[selections[0].range.clone()], "bc");
+        assert!(f32::from(state.scroll_offset().y) < 0., "scrolled to row 60");
+    });
+    let tree = context
+        .update(|window, cx| runtime.render_to_spec(&object, None, window, cx))
+        .expect("render")
+        .replace("\\\"", "\"");
+    assert!(
+        tree.contains(r#"{"start":{"row":3,"col":3},"end":{"row":3,"col":5},"head":{"row":3,"col":5},"primary":true}"#),
+        "{tree}"
+    );
+    assert!(tree.contains(r#"{"start":{"row":20,"col":1},"end":{"row":20,"col":1},"head":{"row":20,"col":1},"primary":false}"#), "{tree}");
+    // A backwards selection's head is its start.
+    assert!(tree.contains(r#"{"start":{"row":10,"col":0},"end":{"row":12,"col":2},"head":{"row":10,"col":0},"primary":false}"#), "{tree}");
+    assert!(tree.contains("scrolled=true"), "{tree}");
+    // Scrolled to the top, row 60 starts the visible text.
+    assert!(tree.contains(r#"row60={"top":0,"#), "{tree}");
+    assert!(!tree.contains("events=0"), "{tree}");
+    // The scroll handler already saw row 60 at the top.
+    assert!(tree.contains("scroll_seen=[0]"), "{tree}");
+    // An empty list would leave no caret: refused, and the selections kept.
+    assert!(tree.contains("empty=RangeError"), "{tree}");
+    // A list or nothing for one range: a TypeError naming the method.
+    assert!(tree.contains(r#"bad_add=["TypeError:true","TypeError:true"]"#), "{tree}");
+    let bad_row = format!("bad_row={}", serde_json::json!([vec!["TypeError:true"; 12], vec!["RangeError"]].concat()));
+    assert!(tree.contains(&bad_row), "{tree}");
+    assert!(tree.contains("round_trip=ok"), "{tree}");
+    assert!(tree.contains(r#"typos=["TypeError","TypeError","TypeError","TypeError","TypeError"]"#), "{tree}");
+    assert!(tree.contains("zero=[true,true]"), "{tree}");
+    assert!(tree.contains(r#"rows=["accepted","TypeError","TypeError","TypeError"]"#), "{tree}");
+
+    // A user moving the caret is reported too.
+    context.update(|_, cx| editor.update(cx, |state, cx| state.set_selected_range(0..0, cx)));
+    draw(&mut context, &view);
+    let tree = context
+        .update(|window, cx| runtime.render_to_spec(&object, None, window, cx))
+        .expect("render")
+        .replace("\\\"", "\"");
+    assert!(tree.contains(r#"sel=[{"start":{"row":0,"col":0},"end":{"row":0,"col":0}"#), "{tree}");
+}
+
+// HERDR: a gutter click carries the same `modifiers` object as element mouse
+// events, and only editors accept `gutter_click` (inputs have no gutter),
+// `selection_change` and `scroll` (inputs have nothing to read them with).
+#[gpui::test]
+fn gutter_clicks_carry_modifiers_and_only_editors_accept_them(cx: &mut TestAppContext) {
+    cx.update(|cx| crate::init(cx));
+    let runtime = ShellRuntime::new_isolated().expect("runtime");
+    cx.update(|cx| runtime.set_global(cx));
+    let source = r##"
+import { View, div } from "gpui-kit";
+import { Editor, EditorState, TextareaState, InputState } from "gpui-base";
+export default class Code extends View {
+  init() {
+    this.code = EditorState.new({ language: "rust", value: "a\nb\nc", line_numbers: true });
+    this.seen = "none";
+    this.code.on("gutter_click", (event) => { this.seen = JSON.stringify(event); });
+    const rejects = (state, event = "gutter_click") => {
+      try { state.on(event, () => {}); return "accepted"; }
+      catch (error) { return String(error.message); }
+    };
+    this.textarea = rejects(TextareaState.new({ value: "x" }));
+    this.input = rejects(InputState.new({ value: "x" }));
+    this.textarea_scroll = rejects(TextareaState.new({ value: "x" }), "scroll");
+    this.input_selection = rejects(InputState.new({ value: "x" }), "selection_change");
+    this.editor_scroll = rejects(this.code, "scroll");
+  }
+  render(cx) {
+    return div()
+      .child(Editor.new(this.code).h(200))
+      .child("seen=" + this.seen)
+      .child("textarea=" + this.textarea)
+      .child("input=" + this.input)
+      .child("textarea_scroll=" + this.textarea_scroll)
+      .child("input_selection=" + this.input_selection)
+      .child("editor_scroll=" + this.editor_scroll);
+  }
+}
+"##;
+    let view_type = runtime.load_source("gutter", source).expect("load");
+    let window = cx.add_window(|_, _| Empty);
+    let mut context = VisualTestContext::from_window(*window.deref(), cx);
+    let object = context
+        .update(|window, cx| runtime.instantiate(&view_type, window, cx))
+        .expect("instantiate");
+    let view = context.update(|_, cx| cx.new(|_| ScriptView::new(runtime.clone(), object.clone())));
+    draw(&mut context, &view);
+    let editor = runtime.entities().first_editor().expect("editor");
+    context.update(|_, cx| {
+        editor.update(cx, |_, cx| {
+            cx.emit(gpui_base::input::InputEvent::GutterClick {
+                row: 1,
+                button: gpui::MouseButton::Right,
+                modifiers: Modifiers { alt: true, ..Default::default() },
+                click_count: 1,
+            })
+        })
+    });
+    context.run_until_parked();
+    draw(&mut context, &view);
+    let tree = context
+        .update(|window, cx| runtime.render_to_spec(&object, None, window, cx))
+        .expect("render")
+        .replace("\\\"", "\"");
+    assert!(tree.contains(r#""row":1"#), "{tree}");
+    assert!(tree.contains(r#""button":"right""#), "{tree}");
+    assert!(tree.contains(r#""click_count":1"#), "{tree}");
+    assert!(
+        tree.contains(r#""modifiers":{"shift":false,"control":false,"alt":true,"platform":false,"function":false}"#),
+        "{tree}"
+    );
+    assert!(!tree.contains("textarea=accepted"), "{tree}");
+    assert!(tree.contains("textarea=unknown textarea event `gutter_click`"), "{tree}");
+    assert!(tree.contains("input=unknown input event `gutter_click`"), "{tree}");
+    assert!(tree.contains("textarea_scroll=unknown textarea event `scroll`"), "{tree}");
+    assert!(tree.contains("input_selection=unknown input event `selection_change`"), "{tree}");
+    assert!(tree.contains("editor_scroll=accepted"), "{tree}");
+}
+
 // HERDR: readonly rejects keyboard edits without disabling selection or programmatic refresh.
 #[gpui::test]
 fn a_readonly_script_editor_remains_selectable(cx: &mut TestAppContext) {

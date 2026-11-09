@@ -3879,7 +3879,25 @@ impl ShellRuntime {
                     payload.set("secondary", *secondary)?;
                     payload.set("shift", *shift)?;
                 }
-                InputEvent::Change | InputEvent::Focus | InputEvent::Blur | InputEvent::PasteWithoutText => {}
+                InputEvent::GutterClick {
+                    row,
+                    button,
+                    modifiers,
+                    click_count,
+                } => {
+                    // HERDR: the same button names and `modifiers` object as
+                    // element mouse events, so one handler reads both.
+                    payload.set("row", *row as f64)?;
+                    payload.set("button", mouse_button_name(*button))?;
+                    payload.set("click_count", *click_count as u32)?;
+                    payload.set("modifiers", modifiers_object(ctx, *modifiers)?)?;
+                }
+                InputEvent::Change
+                | InputEvent::Focus
+                | InputEvent::Blur
+                | InputEvent::PasteWithoutText
+                | InputEvent::SelectionChange
+                | InputEvent::Scroll => {}
             }
             handler.call::<_, ()>((
                 payload,
@@ -5562,6 +5580,28 @@ globalThis.__gpui = (() => {
 
   globalThis.__diagnostics = false;
 
+  const editorList = (method, value) => {
+    // An array only, as typed: another iterable (a `Map` gives
+    // `[key, value]` pairs) would fail later with a raw parse error.
+    if (!Array.isArray(value)) {
+      throw new TypeError(`EditorState.${method} expects an array`);
+    }
+    return value;
+  };
+  const editorRange = (method, value) => {
+    if (value == null || typeof value !== "object" || Array.isArray(value)) {
+      throw new TypeError(`EditorState.${method} expects one { start, end } range`);
+    }
+    return value;
+  };
+  // HERDR: `Number(row)` would turn `null`, `""`, `[]` and `false` into
+  // row 0 instead of an error.
+  const editorRow = (method, value) => {
+    if (typeof value !== "number") {
+      throw new TypeError(`EditorState.${method} expects a row number`);
+    }
+    return value;
+  };
   const element = (id) => {
     const object = Object.create(globalThis.__diagnostics ? diagnostic : methods);
     object.__id = id;
@@ -7027,6 +7067,10 @@ globalThis.__gpui = (() => {
       new: (state) => element(__number_input_element(state.__handle)),
     },
     // HERDR: code editor uses the same value/event lifecycle as TextareaState.
+    // `editorList` rejects a single object passed for a list: `Array.from` on it
+    // would be an empty list, and the call would silently do nothing.
+    // `editorRange` rejects the reverse (a list, or nothing, for one range), so
+    // the error names the method instead of being a raw parse error.
     EditorState: {
       new: (options = {}) => {
         const handle = __editor_state_new(JSON.stringify(options));
@@ -7035,6 +7079,21 @@ globalThis.__gpui = (() => {
           value: () => __editor_value(handle),
           set_value: (value) => __editor_set_value(handle, String(value)),
           on: (event, handler) => __editor_on(handle, String(event), handler),
+          selections: () => JSON.parse(__editor_selections(handle)),
+          set_selections: (ranges) =>
+            __editor_set_selections(handle, JSON.stringify(editorList("set_selections", ranges)), false),
+          add_selection: (range) =>
+            __editor_set_selections(handle, JSON.stringify([editorRange("add_selection", range)]), true),
+          scroll_to_row: (row, align) =>
+            __editor_scroll_to_row(handle, editorRow("scroll_to_row", row), String(align ?? "nearest")),
+          scroll_position: () => JSON.parse(__editor_scroll_position(handle)),
+          row_bounds: (row) => JSON.parse(__editor_row_bounds(handle, editorRow("row_bounds", row))),
+          set_line_decorations: (key, decorations) =>
+            __editor_set_line_decorations(
+              handle,
+              String(key),
+              JSON.stringify(editorList("set_line_decorations", decorations)),
+            ),
           release: () => __editor_release(handle),
         };
       },
@@ -9618,18 +9677,21 @@ fn mouse_button_payload<'js>(
     bounds: Option<gpui::Bounds<gpui::Pixels>>,
 ) -> JsResult<Object<'js>> {
     let payload = Object::new(ctx.clone())?;
-    payload.set(
-        "button",
-        match button {
-            gpui::MouseButton::Right => "right",
-            gpui::MouseButton::Middle => "middle",
-            _ => "left",
-        },
-    )?;
+    payload.set("button", mouse_button_name(button))?;
     payload.set("click_count", click_count as u32)?;
     set_pointer_geometry(ctx, &payload, position, bounds)?;
     payload.set("modifiers", modifiers_object(ctx, modifiers)?)?;
     Ok(payload)
+}
+
+/// The name scripts see for a mouse button. Back and forward report as
+/// `"left"`, as they always have for element mouse events.
+fn mouse_button_name(button: gpui::MouseButton) -> &'static str {
+    match button {
+        gpui::MouseButton::Right => "right",
+        gpui::MouseButton::Middle => "middle",
+        _ => "left",
+    }
 }
 
 fn set_pointer_geometry<'js>(

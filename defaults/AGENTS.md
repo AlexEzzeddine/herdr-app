@@ -935,8 +935,21 @@ and other interactive controls too.
 them. Text: `TextView.markdown(id, text)` renders markdown; `EditorState.new({
 language, value, readonly, font_family: settings().font_family, syntax: {
 keyword: theme().ansi5, ... } })` + `Editor.new(state)` is a code view (readonly)
-or editor with syntax highlighting, line numbers and folding. A viewer opens
-beside the shell as a pane: `pane.split {direction, mod, props: { file }}`.
+or editor with syntax highlighting, line numbers and folding. Editors have
+multiple selections (`selections()`, `set_selections([{ start: { row, col },
+end }])`, `add_selection(range)`; 0-based, `col` in JS string units), scroll
+and measure (`scroll_to_row(row, "center")`, `scroll_position()`,
+`row_bounds(row)`) and report `on("selection_change")` and `on("scroll")`.
+`set_value` is silent and drops scrolls the script asked for earlier: set
+the text, then `scroll_to_row`. `set_line_decorations(key, [{ row, end_row?,
+background?, gutter? }])` colors rows (`end_row` inclusive, for a range) and
+the gutter (a diff); rows don't follow edits, so re-set them
+on `change`. `on("gutter_click", ({ row, click_count }) => …)` reports presses
+on a line number; toggle only on `click_count === 1`. A `set_selections` in it
+ends the press's drag, so the selection stays put.
+`show_unfocused_selection: true` keeps selections painted while another
+element has focus. A viewer opens beside the shell as a pane:
+`pane.split {direction, mod, props: { file }}`.
 The full surface is in `gpui-kit.d.ts` next to this file.
 
 ### The `herdr` module

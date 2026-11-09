@@ -22,7 +22,7 @@ use rquickjs::{
 };
 
 use crate::{
-    entities::{EntityHandle, InputEventName, OtpEventName, SliderEventName},
+    entities::{EntityHandle, InputEventName, OtpEventName, SliderEventName, TextStateKind},
     scope::{self, ScopePhase},
     spec::{Component, SpecId},
 };
@@ -256,7 +256,14 @@ pub fn install(ctx: &Ctx<'_>, module: &Object<'_>, runtime: Weak<ShellRuntime>) 
                   name: String,
                   handler: Handler|
                   -> JsResult<bool> {
-                subscribe(&ctx, &subscribe_runtime, handle, &name, handler, "input")
+                subscribe(
+                    &ctx,
+                    &subscribe_runtime,
+                    handle,
+                    &name,
+                    handler,
+                    TextStateKind::Input,
+                )
             },
         ),
     )?;
@@ -336,7 +343,7 @@ pub fn install(ctx: &Ctx<'_>, module: &Object<'_>, runtime: Weak<ShellRuntime>) 
                     handle,
                     &name,
                     handler,
-                    "textarea",
+                    TextStateKind::Textarea,
                 )
             },
         ),
@@ -497,6 +504,212 @@ pub fn install(ctx: &Ctx<'_>, module: &Object<'_>, runtime: Weak<ShellRuntime>) 
         ),
     )?;
 
+    // HERDR: selections and scrolling. Positions are 0-based { row, col },
+    // `col` in UTF-16 code units so it indexes the line as a JS string.
+    let read_selections = runtime.clone();
+    globals.set(
+        "__editor_selections",
+        Func::from(
+            move |ctx: Ctx<'_>, handle: EntityHandle| -> JsResult<String> {
+                let state = live_editor(&ctx, &read_selections, handle)?;
+                scope::with_current_app(|cx| {
+                    let state = state.read(cx);
+                    let text = state.text();
+                    let items: Vec<serde_json::Value> = state
+                        .selections()
+                        .into_iter()
+                        .enumerate()
+                        .map(|(index, selection)| {
+                            let start = editor_position(text, selection.range.start);
+                            let end = editor_position(text, selection.range.end);
+                            // The caret (`SelectionRange::head`) is one of
+                            // the ends: reuse that end's position rather than
+                            // converting it again.
+                            let head = if selection.head() == selection.range.start {
+                                start.clone()
+                            } else {
+                                end.clone()
+                            };
+                            serde_json::json!({
+                                "start": start,
+                                "end": end,
+                                "head": head,
+                                "primary": index == 0,
+                            })
+                        })
+                        .collect();
+                    serde_json::Value::Array(items).to_string()
+                })
+                .ok_or_else(|| needs_call(&ctx, "selections()"))
+            },
+        ),
+    )?;
+
+    let write_selections = runtime.clone();
+    globals.set(
+        "__editor_set_selections",
+        Func::from(
+            move |ctx: Ctx<'_>, handle: EntityHandle, json: String, add: bool| -> JsResult<()> {
+                let state = live_editor(&ctx, &write_selections, handle)?;
+                let ranges: Vec<EditorRange> = serde_json::from_str(&json).map_err(|error| {
+                    Exception::throw_type(
+                        &ctx,
+                        &format!("expected {{ start: {{ row, col }}, end: {{ row, col }} }}: {error}"),
+                    )
+                })?;
+                // `set_selections([])` would leave no caret; the editor keeps
+                // its selections then, which a caller clearing them wouldn't
+                // expect, so it is refused rather than silently ignored.
+                if !add && ranges.is_empty() {
+                    return Err(Exception::throw_range(
+                        &ctx,
+                        "set_selections needs at least one range (a caret is an empty range)",
+                    ));
+                }
+                let applied = scope::with_current(|window, cx| {
+                    state.update(cx, |state, cx| {
+                        // Every range is checked before any is applied, so a
+                        // bad one in a list changes nothing.
+                        let Some(selections) = ranges
+                            .iter()
+                            .map(|range| editor_selection(state.text(), range))
+                            .collect::<Option<Vec<_>>>()
+                        else {
+                            return false;
+                        };
+                        if add {
+                            for selection in selections {
+                                state.add_selection_range(selection, window, cx);
+                            }
+                        } else {
+                            state.set_selections(selections, window, cx);
+                        }
+                        true
+                    })
+                })
+                .ok_or_else(|| needs_call(&ctx, "set_selections()"))?;
+                if applied {
+                    Ok(())
+                } else {
+                    Err(Exception::throw_type(&ctx, "a range's head must be its start or its end"))
+                }
+            },
+        ),
+    )?;
+
+    let scroll_editor = runtime.clone();
+    globals.set(
+        "__editor_scroll_to_row",
+        Func::from(
+            move |ctx: Ctx<'_>, handle: EntityHandle, row: f64, align: String| -> JsResult<()> {
+                let state = live_editor(&ctx, &scroll_editor, handle)?;
+                let row = editor_row(&ctx, row)?;
+                let align = match align.as_str() {
+                    "nearest" => gpui_base::input::RowScrollAlign::Nearest,
+                    "top" => gpui_base::input::RowScrollAlign::Top,
+                    "center" => gpui_base::input::RowScrollAlign::Center,
+                    _ => {
+                        return Err(Exception::throw_type(
+                            &ctx,
+                            "scroll_to_row align must be \"nearest\", \"top\" or \"center\"",
+                        ));
+                    }
+                };
+                scope::with_current(|window, cx| {
+                    state.update(cx, |state, cx| state.scroll_to_row(row, align, window, cx))
+                })
+                .ok_or_else(|| needs_call(&ctx, "scroll_to_row()"))
+            },
+        ),
+    )?;
+
+    let read_scroll = runtime.clone();
+    globals.set(
+        "__editor_scroll_position",
+        Func::from(
+            move |ctx: Ctx<'_>, handle: EntityHandle| -> JsResult<String> {
+                let state = live_editor(&ctx, &read_scroll, handle)?;
+                scope::with_current(|window, cx| {
+                    // A scroll queued in this handler counts, like `row_bounds`.
+                    let state = state.read(cx);
+                    let (offset, line_height) =
+                        (state.queued_scroll_offset(window), state.line_height());
+                    // `0. - x` rather than `-x`: an unscrolled view is
+                    // `0`, not `-0` (which `Object.is(top, 0)` tells apart).
+                    serde_json::json!({
+                        "top": 0. - f32::from(offset.y),
+                        "left": 0. - f32::from(offset.x),
+                        "line_height": line_height.map(f32::from),
+                    })
+                    .to_string()
+                })
+                .ok_or_else(|| needs_call(&ctx, "scroll_position()"))
+            },
+        ),
+    )?;
+
+    let read_row = runtime.clone();
+    globals.set(
+        "__editor_row_bounds",
+        Func::from(
+            move |ctx: Ctx<'_>, handle: EntityHandle, row: f64| -> JsResult<String> {
+                let state = live_editor(&ctx, &read_row, handle)?;
+                let row = editor_row(&ctx, row)?;
+                scope::with_current(|window, cx| match state.read(cx).row_bounds(row, window) {
+                    Some((top, height)) => serde_json::json!({
+                        "top": f32::from(top),
+                        "height": f32::from(height),
+                    })
+                    .to_string(),
+                    None => "null".to_string(),
+                })
+                .ok_or_else(|| needs_call(&ctx, "row_bounds()"))
+            },
+        ),
+    )?;
+
+    let decorate_editor = runtime.clone();
+    globals.set(
+        "__editor_set_line_decorations",
+        Func::from(
+            move |ctx: Ctx<'_>, handle: EntityHandle, key: String, json: String| -> JsResult<()> {
+                let state = live_editor(&ctx, &decorate_editor, handle)?;
+                let items: Vec<EditorLineDecoration> = serde_json::from_str(&json).map_err(|error| {
+                    Exception::throw_type(
+                        &ctx,
+                        &format!("expected [{{ row, end_row?, background?, gutter? }}]: {error}"),
+                    )
+                })?;
+                let color = |value: &Option<String>| -> JsResult<Option<gpui::Hsla>> {
+                    value
+                        .as_ref()
+                        .map(|value| {
+                            crate::value::Bridged::Str(value.clone())
+                                .as_color()
+                                .map_err(|error| Exception::throw_type(&ctx, &error.to_string()))
+                        })
+                        .transpose()
+                };
+                let mut decorations = Vec::with_capacity(items.len());
+                for item in &items {
+                    let end = item.end_row.unwrap_or(item.row);
+                    if end < item.row {
+                        return Err(Exception::throw_range(&ctx, "end_row must not be before row"));
+                    }
+                    decorations.push(gpui_base::input::LineDecoration {
+                        rows: item.row..end.saturating_add(1),
+                        background: color(&item.background)?,
+                        gutter: color(&item.gutter)?,
+                    });
+                }
+                scope::with_current_app(|cx| {
+                    state.update(cx, |state, cx| state.set_line_decorations(key, decorations, cx))
+                })
+                .ok_or_else(|| needs_call(&ctx, "set_line_decorations()"))
+            },
+        ),
+    )?;
+
     let subscribe_editor = runtime.clone();
     globals.set(
         "__editor_on",
@@ -506,7 +719,14 @@ pub fn install(ctx: &Ctx<'_>, module: &Object<'_>, runtime: Weak<ShellRuntime>) 
                   name: String,
                   handler: Handler|
                   -> JsResult<bool> {
-                subscribe(&ctx, &subscribe_editor, handle, &name, handler, "editor")
+                subscribe(
+                    &ctx,
+                    &subscribe_editor,
+                    handle,
+                    &name,
+                    handler,
+                    TextStateKind::Editor,
+                )
             },
         ),
     )?;
@@ -1323,21 +1543,23 @@ fn write_value<M: InputModeKind>(
 ///
 /// The store resolves the handle to whichever entity it names, so the whole of
 /// this — the event-name check, the captured grant, the released-state report —
-/// is shared; `what` only names the state in the error a script sees.
+/// is shared; `what` decides which events it reports (editors report a few
+/// more) and names the state in the error a script sees.
 fn subscribe(
     ctx: &Ctx<'_>,
     runtime: &Weak<ShellRuntime>,
     handle: EntityHandle,
     name: &str,
     handler: Handler,
-    what: &str,
+    what: TextStateKind,
 ) -> JsResult<bool> {
-    let event = InputEventName::from_name(name).ok_or_else(|| {
+    let event = InputEventName::from_name(name, what).ok_or_else(|| {
         Exception::throw_type(
             ctx,
             &format!(
-                "unknown input event `{name}`; expected one of: {}",
-                InputEventName::NAMES.join(", ")
+                "unknown {} event `{name}`; expected one of: {}",
+                what.name(),
+                InputEventName::names(what).join(", ")
             ),
         )
     })?;
@@ -1375,7 +1597,7 @@ fn subscribe(
     if !subscribed {
         return Err(Exception::throw_type(
             ctx,
-            &format!("this {what} state has been released"),
+            &format!("this {} state has been released", what.name()),
         ));
     }
     Ok(true)
@@ -1797,4 +2019,126 @@ fn needs_call(ctx: &Ctx<'_>, what: &str) -> rquickjs::Error {
         ctx,
         &format!("{what} needs a live host call; call it from render or an event handler"),
     )
+}
+
+// HERDR: editor positions crossing to scripts. Script input refuses keys
+// it doesn't know, as `EditorState.new` options do, so a misspelled one
+// (`column`, `haed`, `endRow`) is a TypeError rather than silently dropped.
+#[derive(Clone, Copy, PartialEq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EditorPosition {
+    #[serde(deserialize_with = "script_index")]
+    row: usize,
+    #[serde(deserialize_with = "script_index")]
+    col: usize,
+}
+
+/// A row or column in script input: [`script_row`], as [`editor_row`], so a row too
+/// large for `usize` means past the end everywhere (clamped or clipped by
+/// whoever uses it) rather than an error in some calls only. JSON gives a
+/// number past `u64` (`1e20`) as a float, which serde's `usize` refuses.
+fn script_index<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<usize, D::Error> {
+    struct Index;
+    impl serde::de::Visitor<'_> for Index {
+        type Value = usize;
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            f.write_str("a non-negative integer")
+        }
+        fn visit_u64<E: serde::de::Error>(self, value: u64) -> Result<usize, E> {
+            Ok(usize::try_from(value).unwrap_or(usize::MAX))
+        }
+        fn visit_i64<E: serde::de::Error>(self, value: i64) -> Result<usize, E> {
+            u64::try_from(value)
+                .map_err(|_| E::invalid_value(serde::de::Unexpected::Signed(value), &self))
+                .and_then(|value| self.visit_u64(value))
+        }
+        fn visit_f64<E: serde::de::Error>(self, value: f64) -> Result<usize, E> {
+            script_row(value)
+                .ok_or_else(|| E::invalid_value(serde::de::Unexpected::Float(value), &self))
+        }
+    }
+    deserializer.deserialize_any(Index)
+}
+
+fn script_index_opt<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<usize>, D::Error> {
+    #[derive(serde::Deserialize)]
+    struct Index(#[serde(deserialize_with = "script_index")] usize);
+    let index: Option<Index> = serde::Deserialize::deserialize(deserializer)?;
+    Ok(index.map(|Index(index)| index))
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EditorRange {
+    start: EditorPosition,
+    end: EditorPosition,
+    /// The caret's side, as `selections()` reports it: `start` or `end`
+    /// (anything else is refused); without it a range whose `start` is
+    /// after its `end` is a backwards selection.
+    #[serde(default)]
+    head: Option<EditorPosition>,
+    /// What `selections()` reports; accepted and ignored, so its output
+    /// can be set back as is (the first range becomes primary).
+    #[serde(default, rename = "primary")]
+    _primary: Option<bool>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EditorLineDecoration {
+    #[serde(deserialize_with = "script_index")]
+    row: usize,
+    /// Inclusive.
+    #[serde(default, deserialize_with = "script_index_opt")]
+    end_row: Option<usize>,
+    #[serde(default)]
+    background: Option<String>,
+    #[serde(default)]
+    gutter: Option<String>,
+}
+
+/// A script range as a byte selection, keeping which side the caret is on.
+/// `None` when its `head` is neither end: a position inside the range, or one
+/// computed in another coordinate space, is a mistake, not a forward
+/// selection. Compared as offsets, after clipping like the ends, so a head
+/// that lands where an end clips to (`col: 999` and the line's length) is
+/// that end.
+fn editor_selection(
+    text: &gpui_base::input::Rope,
+    range: &EditorRange,
+) -> Option<gpui_base::input::SelectionRange> {
+    let offset = |at: EditorPosition| gpui_base::input::script_offset(text, at.row, at.col);
+    let start = offset(range.start);
+    let end = offset(range.end);
+    let (low, high) = (start.min(end), start.max(end));
+    let reversed = match range.head.map(offset) {
+        Some(head) if head != low && head != high => return None,
+        Some(head) => low != high && head == low,
+        None => start > end,
+    };
+    Some(gpui_base::input::SelectionRange {
+        range: low..high,
+        reversed,
+    })
+}
+
+fn editor_row(ctx: &Ctx<'_>, row: f64) -> JsResult<usize> {
+    script_row(row)
+        .ok_or_else(|| Exception::throw_range(ctx, "row must be a non-negative integer"))
+}
+
+/// The one rule for a row or column number from a script, shared by
+/// [`editor_row`] and [`script_index`]: a finite non-negative integer, one
+/// past `usize` saturated (`as` does), so it means past the end.
+fn script_row(value: f64) -> Option<usize> {
+    (value.is_finite() && value >= 0. && value.fract() == 0.).then_some(value as usize)
+}
+
+/// `{ row, col }` of a byte offset, `col` in UTF-16 code units: the same
+/// conversion selection-change reports compare.
+fn editor_position(text: &gpui_base::input::Rope, offset: usize) -> serde_json::Value {
+    let (row, col) = gpui_base::input::script_position(text, offset);
+    serde_json::json!({ "row": row, "col": col })
 }
