@@ -3335,7 +3335,10 @@ impl<M: InputModeKind> InputBaseState<M> {
     /// one is past the end after an edit shortened the text until paint
     /// clamps it). Before the first layout a row or caret scroll has no
     /// offset yet and isn't counted. Reads focus from `window`: ghost lines, drawn only while
-    /// focused, change how far the text reaches.
+    /// focused, change how far the text reaches. A caret on a row the last
+    /// frame didn't lay out has no column until it is shaped, so its
+    /// sideways reveal (`reveal_x`) isn't counted in `x`: the frame that
+    /// draws the row does it.
     pub fn queued_scroll_offset(&self, window: &Window) -> Point<Pixels> {
         self.next_scroll_offset(self.focus_handle.is_focused(window))
     }
@@ -4308,16 +4311,19 @@ impl<M: InputModeKind> InputBaseState<M> {
     }
 
     /// HERDR: whether [`Self::resolve_pending_scroll`] has anything to do
-    /// for a view of `view_size`: a queued scroll, or an early one settling
-    /// whose view changed size. It returns at once otherwise, so prepaint
-    /// skips the update. An early scroll in a view that keeps its size has
+    /// for a view of `view_size`: a row or caret waiting for layout, or an
+    /// early one settling whose view changed size. It returns at once
+    /// otherwise, so prepaint skips the update. A queued offset (keys, mouse,
+    /// search, or the HERDR API once laid out) is applied by paint and needs
+    /// no update: the settling scroll it ends is compared as state at the
+    /// next resize (the scroll handle no longer matches). An early scroll in a view that keeps its size has
     /// nothing to place, so whether the reader took over the view is checked
     /// only when the size changes, not on every frame: an idle editor pays
     /// one read. (Undone changes, such as a fold unfolded before the
     /// resize, are then not seen; the view is as it was placed.)
     pub(super) fn has_waiting_scroll(&self, view_size: gpui::Size<Pixels>) -> bool {
         !self.is_single_line()
-            && (self.queued_scroll.is_some()
+            && (self.queued_scroll.is_some_and(|queued| queued.is_pending())
                 || self.settling_scroll.as_ref().is_some_and(|settling| {
                     settling.painted.is_some() && settling.view_size != view_size
                 }))

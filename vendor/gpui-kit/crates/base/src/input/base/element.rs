@@ -4768,6 +4768,27 @@ mod tests {
         });
     }
 
+    // HERDR: a queued offset (an upstream reveal while typing or arrowing)
+    // is applied by paint; prepaint takes no state update for it.
+    #[gpui::test]
+    fn a_queued_offset_does_not_wait_in_prepaint(cx: &mut TestAppContext) {
+        let (editor, window) = decoration_editor(cx, &sixty_lines("line"), false);
+        let mut cx = VisualTestContext::from_window(window.into(), cx);
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        editor.update(&mut cx, |state, cx| {
+            let offset = state.text.line_start_offset(40);
+            state.scroll_to(offset, None, cx);
+            assert!(state.deferred_scroll_offset().is_some(), "an offset is queued");
+            let view = state.last_bounds.unwrap().size;
+            assert!(!state.has_waiting_scroll(view), "an offset skips the update");
+        });
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        editor.read_with(&cx, |state, _| {
+            assert!(state.queued_scroll.is_none(), "paint applied it");
+            assert!(state.scroll_offset().y < px(0.), "and scrolled");
+        });
+    }
+
     // HERDR: a caret set by code clears the inline completion before it is
     // revealed, and ghost lines are drawn at the active caret's own row, so
     // a revealed caret and `row_bounds` never disagree about ghost lines.

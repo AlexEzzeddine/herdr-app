@@ -3208,7 +3208,9 @@ const BASE: &str = r#"  /** A row. */
     scroll_to_row(row: number, align?: "nearest" | "top" | "center"): void;
     /** Pixels scrolled from the top left, counting a scroll asked for earlier in the same
      * handler (`scroll_to_row`, `set_selections`). Before the first layout `line_height` is
-     * null and such a scroll is still waiting: it isn't counted until the editor is laid out. */
+     * null and such a scroll is still waiting: it isn't counted until the editor is laid out.
+     * A caret on a row out of view is revealed sideways only once its row is drawn: `top`
+     * counts it at once, `left` in the next frame, which reports `scroll`. */
     scroll_position(): { top: number; left: number; line_height: number | null };
     /** Pixels from the top of the visible text area; null before layout, for a row past
      * the last one, or inside a fold.

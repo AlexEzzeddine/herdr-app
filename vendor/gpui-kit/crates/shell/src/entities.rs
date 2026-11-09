@@ -816,6 +816,9 @@ impl EntityStore {
         cx: &mut App,
         handler: impl Fn(&InputEvent, &mut Window, &mut App) + 'static,
     ) -> bool {
+        // HERDR: the editor, kept to turn its reports on once the
+        // subscription is stored.
+        let mut editor = None;
         let subscription = match self.record(handle) {
             Some(Record::Input { state, .. }) => {
                 subscribe_to_events(&state.clone(), event, window, cx, handler)
@@ -823,19 +826,12 @@ impl EntityStore {
             Some(Record::Textarea { state, .. }) => {
                 subscribe_to_events(&state.clone(), event, window, cx, handler)
             }
-            // HERDR: code editors emit the same input events. Selection
-            // changes and scrolls are reported only once someone listens for
-            // them.
+            // HERDR: code editors emit the same input events.
             Some(Record::Editor { state, .. }) => {
                 let state = state.clone();
-                match event {
-                    InputEventName::SelectionChange => {
-                        state.update(cx, |state, cx| state.report_selection_changes(cx))
-                    }
-                    InputEventName::Scroll => state.update(cx, |state, _| state.report_scrolls()),
-                    _ => {}
-                }
-                subscribe_to_events(&state, event, window, cx, handler)
+                let subscription = subscribe_to_events(&state, event, window, cx, handler);
+                editor = Some(state);
+                subscription
             }
             _ => return false,
         };
@@ -845,12 +841,22 @@ impl EntityStore {
                 Record::Input { subscriptions, .. }
                 | Record::Textarea { subscriptions, .. }
                 | Record::Editor { subscriptions, .. },
-            ) => {
-                subscriptions.push(subscription);
-                true
-            }
-            _ => false,
+            ) => subscriptions.push(subscription),
+            _ => return false,
         }
+        // HERDR: selection changes and scrolls are reported only once a
+        // subscription that receives them is kept, so an editor whose
+        // subscription was dropped pays nothing.
+        if let Some(state) = editor {
+            match event {
+                InputEventName::SelectionChange => {
+                    state.update(cx, |state, cx| state.report_selection_changes(cx))
+                }
+                InputEventName::Scroll => state.update(cx, |state, _| state.report_scrolls()),
+                _ => {}
+            }
+        }
+        true
     }
 
     /// Subscribes to one slider event for as long as the handle lives.
