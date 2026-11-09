@@ -181,10 +181,12 @@ pub(in crate::input) enum PendingScroll {
 }
 
 /// HERDR: a row or caret scroll asked for before layout, after prepaint
-/// placed it. It stays anchored: every change of the view's size (a pane
-/// still being sized, or later the window; with soft wrap, a width change
-/// rewraps the rows above) places it again, so the row the
-/// request was about stays where it asked, until the reader takes over the
+/// placed it. It stays anchored: every change to where its row is drawn
+/// ([`SettleView`]: the view's size, a pane still being sized or later the
+/// window; the row's own position, which a new line height, font or gutter
+/// width moves; an inline completion's ghost lines) places it again, so
+/// the row the request was about stays where it asked, until the reader
+/// takes over the
 /// view: another scroll (asked for, or the scroll handle moving), a press in
 /// the editor, changing the selections (keys, `set_selections`), folding or
 /// unfolding (by any path, the chevron included), an edit, or `set_value`
@@ -199,8 +201,8 @@ pub(in crate::input) enum PendingScroll {
 struct SettlingScroll {
     /// The row or caret asked for.
     request: PendingScroll,
-    /// The view size it was last placed for.
-    view_size: gpui::Size<Pixels>,
+    /// The view it was last placed for.
+    view: SettleView,
     /// The scroll the frame that placed it ended at; `None` until painted.
     painted: Option<Point<Pixels>>,
     /// [`Selections::stamp`](super::cursor::Selections::stamp) when it was
@@ -215,6 +217,20 @@ struct SettlingScroll {
     folds: Vec<crate::input::FoldRange>,
     /// `document_revision` when it was placed: any edit since moves rows.
     revision: u64,
+}
+
+/// HERDR: what decides where a [`SettlingScroll`]'s row is drawn, as the
+/// frame it is placed for lays it out. Compared, not watched: whatever
+/// changed it (a resize, the font size, line numbers turned on or off with
+/// soft wrap, ghost lines shown or hidden), the request is placed again.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) struct SettleView {
+    size: gpui::Size<Pixels>,
+    /// The requested row's (or caret's) top, on the rows as wrapped and
+    /// folded now: a new line height or wrap above it moves it.
+    row_y: Pixels,
+    /// The ghost block this frame draws ([`InputBaseState::completion_ghost`]).
+    ghost: Option<(usize, Pixels)>,
 }
 
 /// HERDR: a position the frame applying a queued offset reveals
@@ -280,11 +296,21 @@ impl QueuedScroll {
         }
     }
 
-    /// Whether a multi-line `set_value` keeps it: an upstream offset, not a
+    /// What a multi-line `set_value` keeps of it: an upstream offset, not a
     /// request through the HERDR API (always so for a waiting row or caret).
     /// The new text starts at the top; a caller scrolls after setting it.
-    fn kept_by_set_value(&self) -> bool {
-        matches!(self, Self::Offset { api: false, .. })
+    /// Only the offset is kept, as upstream did: what it revealed
+    /// horizontally (a caret or a byte offset) belongs to the old text.
+    fn kept_by_set_value(self) -> Option<Self> {
+        match self {
+            Self::Offset { offset, api: false, .. } => Some(Self::Offset {
+                offset,
+                reveal_x: None,
+                measured: None,
+                api: false,
+            }),
+            _ => None,
+        }
     }
 }
 
@@ -1613,12 +1639,12 @@ impl<M: InputModeKind> InputBaseState<M> {
         self.scroll_handle.set_offset(point(px(0.), px(0.)));
         if self.is_single_line() {
             self.queue_scroll_offset(point(px(0.), px(0.)));
-        } else if self.queued_scroll.is_some_and(|queued| !queued.kept_by_set_value()) {
-            // HERDR: a multi-line input keeps an upstream queued scroll, as
+        } else {
+            // HERDR: a multi-line input keeps an upstream queued offset, as
             // upstream always has, and drops one asked for through the HERDR
             // API: the new text starts at the top, and the caller scrolls
             // after setting it ([`QueuedScroll::kept_by_set_value`]).
-            self.queued_scroll = None;
+            self.queued_scroll = self.queued_scroll.and_then(QueuedScroll::kept_by_set_value);
         }
         // HERDR: an early scroll placed for the old text is no longer placed
         // again.
@@ -3811,7 +3837,8 @@ impl<M: InputModeKind> InputBaseState<M> {
     /// covered by a selection adds nothing. Overlapping selections are merged.
     /// On a single-line input there is no second cursor to add, so the call
     /// replaces the selection instead.
-    /// The view scrolls to the new selection.
+    /// The view scrolls to the added range's caret, also when it was covered
+    /// or merged (HERDR: so whether it scrolls doesn't depend on overlap).
     ///
     /// The reveal uses the focus as last painted (this keeps upstream's
     /// signature); [`Self::add_selection_range`] reads it from the window.
@@ -3857,7 +3884,15 @@ impl<M: InputModeKind> InputBaseState<M> {
         }
 
         let (start, end) = self.clip_selection_range(selection.range.clone());
+        // Where the added range's caret is: revealed when the range doesn't
+        // survive as its own selection, as upstream scrolled to the added
+        // range. The covering selection's caret can be far away.
+        let caret = if selection.reversed { start } else { end };
         if self.selections.iter().any(|sel| sel.start <= start && end <= sel.end) {
+            // Already selected: nothing changes, but it scrolls like a range
+            // merged into one that overlapped it, whatever the overlap.
+            self.reveal_added_caret(caret, focused, api, cx);
+            cx.notify();
             return;
         }
 
@@ -3869,21 +3904,24 @@ impl<M: InputModeKind> InputBaseState<M> {
         if self.selections.iter().any(|sel| sel.id == id) {
             self.reveal_caret(id, focused, api, cx);
         } else {
-            // Merged into a selection that already overlapped it: reveal
-            // where the added range's caret is, as upstream scrolled to the
-            // added range. The covering selection's caret can be far away.
-            let caret = if selection.reversed { start } else { end };
-            if api && !self.has_usable_layout() {
-                // No id to follow edits by: its row, vertically.
-                let row = self.text.offset_to_point(caret).row;
-                self.queued_scroll =
-                    Some(QueuedScroll::Pending(PendingScroll::Row(row, RowScrollAlign::Nearest)));
-            } else {
-                let by = RevealBy::Offset { api };
-                self.reveal_offset(caret, None, ScrollPadding::Minimal, focused, by, cx);
-            }
+            self.reveal_added_caret(caret, focused, api, cx);
         }
         cx.notify();
+    }
+
+    /// HERDR: [`Self::push_selection`]'s reveal for an added range that is
+    /// not its own selection (covered by one, or merged into it): the
+    /// range's caret offset.
+    fn reveal_added_caret(&mut self, caret: usize, focused: bool, api: bool, cx: &mut Context<Self>) {
+        if api && !self.has_usable_layout() {
+            // No id to follow edits by: its row, vertically.
+            let row = self.text.offset_to_point(caret).row;
+            self.queued_scroll =
+                Some(QueuedScroll::Pending(PendingScroll::Row(row, RowScrollAlign::Nearest)));
+        } else {
+            let by = RevealBy::Offset { api };
+            self.reveal_offset(caret, None, ScrollPadding::Minimal, focused, by, cx);
+        }
     }
 
     /// Keep painting selections while the input is not focused, so a
@@ -4265,8 +4303,9 @@ impl<M: InputModeKind> InputBaseState<M> {
     /// instead of at the top and jumping on the next one. A view with no
     /// height has nowhere to place the row: the request keeps waiting. A
     /// first frame can also have a size that is not the final one (a pane
-    /// still being sized), so the request is placed again whenever the size
-    /// changes (with soft wrap a new width rewraps the rows), until the reader takes over the view
+    /// still being sized), so the request is placed again whenever its row
+    /// would be drawn elsewhere (a new size, line height or wrap, ghost
+    /// lines; [`SettleView`]), until the reader takes over the view
     /// ([`SettlingScroll`]). `focused`: whether this frame draws an inline
     /// completion's ghost lines.
     ///
@@ -4293,14 +4332,16 @@ impl<M: InputModeKind> InputBaseState<M> {
                 // Something else scrolled, a caret moved, or the rows were
                 // folded or edited since: it no longer applies.
                 self.settling_scroll = None;
-            } else if settling.view_size != view_size {
+            } else if settling.view
+                != self.settle_view(settling.request, line_height, view_size, focused)
+            {
                 self.queued_scroll = Some(QueuedScroll::Pending(settling.request));
             }
         }
         let request = self.queued_scroll?.pending()?;
         self.settling_scroll = Some(SettlingScroll {
             request,
-            view_size,
+            view: self.settle_view(request, line_height, view_size, focused),
             painted: None,
             selections: self.selections.stamp(),
             folds: self.display_map.folded_ranges().to_vec(),
@@ -4311,22 +4352,55 @@ impl<M: InputModeKind> InputBaseState<M> {
     }
 
     /// HERDR: whether [`Self::resolve_pending_scroll`] has anything to do
-    /// for a view of `view_size`: a row or caret waiting for layout, or an
-    /// early one settling whose view changed size. It returns at once
-    /// otherwise, so prepaint skips the update. A queued offset (keys, mouse,
-    /// search, or the HERDR API once laid out) is applied by paint and needs
-    /// no update: the settling scroll it ends is compared as state at the
-    /// next resize (the scroll handle no longer matches). An early scroll in a view that keeps its size has
-    /// nothing to place, so whether the reader took over the view is checked
-    /// only when the size changes, not on every frame: an idle editor pays
-    /// one read. (Undone changes, such as a fold unfolded before the
-    /// resize, are then not seen; the view is as it was placed.)
-    pub(super) fn has_waiting_scroll(&self, view_size: gpui::Size<Pixels>) -> bool {
+    /// for a `view_size` view drawn with `line_height` rows, `focused` or
+    /// not: a row or caret waiting for layout, or an early one settling
+    /// whose row would now be drawn elsewhere ([`SettleView`]). It returns
+    /// at once otherwise, so prepaint skips the update. A view with no
+    /// height has nowhere to place a row, so nothing waits in it.
+    /// A queued offset (keys, mouse, search, or the HERDR API once laid
+    /// out) is applied by paint and needs no update: the settling scroll it
+    /// ends is compared as state at the next change of the view (the
+    /// scroll handle no longer matches). An early scroll whose row stays
+    /// where it was placed has nothing to place, so whether the reader
+    /// took over the view is checked only when that changes, not on every
+    /// frame. (Undone changes, such as a fold unfolded before it, are then
+    /// not seen; the view is as it was placed.)
+    pub(super) fn has_waiting_scroll(
+        &self,
+        view_size: gpui::Size<Pixels>,
+        line_height: Pixels,
+        focused: bool,
+    ) -> bool {
         !self.is_single_line()
+            && view_size.height > px(0.)
             && (self.queued_scroll.is_some_and(|queued| queued.is_pending())
                 || self.settling_scroll.as_ref().is_some_and(|settling| {
-                    settling.painted.is_some() && settling.view_size != view_size
+                    settling.painted.is_some()
+                        && settling.view
+                            != self.settle_view(settling.request, line_height, view_size, focused)
                 }))
+    }
+
+    /// HERDR: where `request`'s row is drawn in a `view_size` view with
+    /// `line_height` rows ([`SettleView`]).
+    fn settle_view(
+        &self,
+        request: PendingScroll,
+        line_height: Pixels,
+        view_size: gpui::Size<Pixels>,
+        focused: bool,
+    ) -> SettleView {
+        let offset = match request {
+            PendingScroll::Row(row, _) => self
+                .text
+                .line_start_offset(row.min(self.text.lines_len().saturating_sub(1))),
+            PendingScroll::Caret(id) => self.caret_of(id),
+        };
+        SettleView {
+            size: view_size,
+            row_y: self.display_row_y(offset, line_height),
+            ghost: self.completion_ghost(line_height, focused),
+        }
     }
 
     /// HERDR: [`Self::resolve_pending_scroll`] placed `request` before the
@@ -4344,6 +4418,14 @@ impl<M: InputModeKind> InputBaseState<M> {
         let placed = self.placed_offset(request, line_height, view_height, focused);
         let changed = placed != self.queued_scroll;
         self.queued_scroll = placed;
+        // The rows as now wrapped are what the next frame compares against.
+        let view = self.settling_scroll.as_ref().map(|settling| settling.view.size);
+        if let Some(size) = view {
+            let view = self.settle_view(request, line_height, size, focused);
+            if let Some(settling) = &mut self.settling_scroll {
+                settling.view = view;
+            }
+        }
         changed
     }
 

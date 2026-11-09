@@ -2727,7 +2727,8 @@ impl<M: InputModeKind> Element for TextElement<M> {
         // Most frames have nothing waiting: they skip the update.
         let (focused, waiting) = {
             let state = self.state.read(cx);
-            (state.focus_handle.is_focused(window), state.has_waiting_scroll(bounds.size))
+            let focused = state.focus_handle.is_focused(window);
+            (focused, state.has_waiting_scroll(bounds.size, line_height, focused))
         };
         let placed = waiting
             .then(|| {
@@ -4732,9 +4733,10 @@ mod tests {
         );
     }
 
-    // HERDR: an early scroll that has been placed waits only for a size
-    // change: frames at the same size skip prepaint's update, and a resize
-    // still places it again.
+    // HERDR: an early scroll that has been placed waits only for its row
+    // to move: frames that draw it where it was skip prepaint's update, and
+    // a resize or a new line height still places it again. A view with no
+    // height takes no update.
     #[gpui::test]
     fn a_placed_early_scroll_waits_only_for_a_resize(cx: &mut TestAppContext) {
         cx.update(crate::init);
@@ -4763,8 +4765,73 @@ mod tests {
         });
         editor.read_with(&cx, |state, _| {
             let view = state.last_bounds.unwrap().size;
-            assert!(!state.has_waiting_scroll(view), "an idle frame skips the update");
-            assert!(state.has_waiting_scroll(size(view.width, view.height + px(80.))), "a resize places it again");
+            let lh = state.line_height().unwrap();
+            assert!(!state.has_waiting_scroll(view, lh, false), "an idle frame skips the update");
+            assert!(
+                state.has_waiting_scroll(size(view.width, view.height + px(80.)), lh, false),
+                "a resize places it again"
+            );
+            assert!(
+                state.has_waiting_scroll(view, lh + px(4.), false),
+                "so does a new line height, which moves the row"
+            );
+            assert!(
+                !state.has_waiting_scroll(size(view.width, px(0.)), lh, false),
+                "a view with no height has nowhere to place it: no update"
+            );
+        });
+    }
+
+    struct FontHarness(Entity<EditorState>, Rc<std::cell::Cell<Pixels>>);
+
+    impl Render for FontHarness {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div().w_full().h(px(100.)).text_size(self.1.get()).child(self.0.clone())
+        }
+    }
+
+    // HERDR: a placed early scroll is placed again when its row moves
+    // without the view changing size (here a new font size), rather than
+    // drifting and snapping back at some later resize.
+    #[gpui::test]
+    fn an_early_scroll_follows_a_font_size_change(cx: &mut TestAppContext) {
+        cx.update(crate::init);
+        let text_size = Rc::new(std::cell::Cell::new(px(14.)));
+        let mut editor = None;
+        let window = cx.open_window(size(px(240.), px(200.)), {
+            let text_size = text_size.clone();
+            |window, cx| {
+                let state = cx.new(|cx| {
+                    let mut state =
+                        EditorState::new(window, cx).soft_wrap(false).default_value(sixty_lines("line"));
+                    state.scroll_to_row(40, crate::input::RowScrollAlign::Top, window, cx);
+                    state
+                });
+                editor = Some(state.clone());
+                FontHarness(state, text_size)
+            }
+        });
+        let editor = editor.unwrap();
+        let mut cx = VisualTestContext::from_window(window.into(), cx);
+        let draw = |cx: &mut VisualTestContext| {
+            cx.update(|window, cx| {
+                window.refresh();
+                window.draw(cx).clear(cx);
+            })
+        };
+        draw(&mut cx);
+        draw(&mut cx);
+        let before = editor.read_with(&cx, |state, _| state.line_height().unwrap());
+        editor.read_with(&cx, |state, _| {
+            assert_eq!(state.scroll_offset().y, -(before * 40.), "row 40 at the top");
+        });
+        text_size.set(px(24.));
+        draw(&mut cx);
+        draw(&mut cx);
+        editor.read_with(&cx, |state, _| {
+            let lh = state.line_height().unwrap();
+            assert!(lh > before, "the font size changed the line height");
+            assert_eq!(state.scroll_offset().y, -(lh * 40.), "row 40 is still at the top");
         });
     }
 
@@ -4780,12 +4847,33 @@ mod tests {
             state.scroll_to(offset, None, cx);
             assert!(state.deferred_scroll_offset().is_some(), "an offset is queued");
             let view = state.last_bounds.unwrap().size;
-            assert!(!state.has_waiting_scroll(view), "an offset skips the update");
+            let lh = state.line_height().unwrap();
+            assert!(!state.has_waiting_scroll(view, lh, false), "an offset skips the update");
         });
         cx.update(|window, cx| window.draw(cx).clear(cx));
         editor.read_with(&cx, |state, _| {
             assert!(state.queued_scroll.is_none(), "paint applied it");
             assert!(state.scroll_offset().y < px(0.), "and scrolled");
+        });
+    }
+
+    // HERDR: `set_value` keeps an upstream queued offset, as upstream did,
+    // but not what it was to reveal horizontally: that position belongs to
+    // the old text.
+    #[gpui::test]
+    fn set_value_keeps_an_upstream_offset_without_its_sideways_reveal(cx: &mut TestAppContext) {
+        let (editor, window) = decoration_editor(cx, &sixty_lines("line"), false);
+        let mut cx = VisualTestContext::from_window(window.into(), cx);
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        editor.update_in(&mut cx, |state, window, cx| {
+            let offset = state.text.line_start_offset(40) + 3;
+            state.scroll_to(offset, None, cx);
+            let queued = state.deferred_scroll_offset();
+            assert!(queued.is_some(), "an offset is queued");
+            assert!(state.queued_reveal_x().is_some(), "with a reveal for its unlaid row");
+            state.set_value(sixty_lines("other"), window, cx);
+            assert_eq!(state.deferred_scroll_offset(), queued, "the offset is kept");
+            assert_eq!(state.queued_reveal_x(), None, "its sideways reveal is not");
         });
     }
 
@@ -5098,6 +5186,40 @@ mod tests {
             let (top, height) = state.row_bounds(50, window).expect("row 50");
             assert!(top >= px(0.) && top + height <= px(140.), "row 50 is in view: {top:?}");
         });
+    }
+
+    // HERDR: a range already inside a selection changes nothing, but scrolls
+    // to its caret like one merged into an overlapping selection: whether
+    // add_selection scrolls doesn't depend on the overlap.
+    #[gpui::test]
+    fn add_selection_inside_a_selection_scrolls_to_the_added_caret(cx: &mut TestAppContext) {
+        let text = sixty_lines("line");
+        let (editor, window) = decoration_editor(cx, &text, false);
+        let mut cx = VisualTestContext::from_window(window.into(), cx);
+        let at = |row: usize| text.find(&format!("line {row}\n")).unwrap();
+        for api in [false, true] {
+            cx.update(|window, cx| {
+                editor.update(cx, |state, cx| {
+                    state.set_selections(vec![sel(at(0)..at(55), false)], window, cx);
+                    state.scroll_to_row(0, crate::input::RowScrollAlign::Top, window, cx);
+                });
+                window.draw(cx).clear(cx);
+                editor.update(cx, |state, cx| {
+                    let added = at(50)..at(50) + 3;
+                    if api {
+                        state.add_selection_range(sel(added, false), window, cx);
+                    } else {
+                        state.add_selection(added, cx);
+                    }
+                });
+                window.draw(cx).clear(cx);
+            });
+            editor.update_in(&mut cx, |state, window, _| {
+                assert_eq!(state.selections(), vec![sel(at(0)..at(55), false)], "nothing changed");
+                let (top, height) = state.row_bounds(50, window).expect("row 50");
+                assert!(top >= px(0.) && top + height <= px(140.), "row 50 is in view ({api}): {top:?}");
+            });
+        }
     }
 
     // HERDR: on a single-line input, add_selection replaces the selection

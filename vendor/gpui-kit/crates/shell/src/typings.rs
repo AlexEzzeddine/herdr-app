@@ -3195,12 +3195,15 @@ const BASE: &str = r#"  /** A row. */
      * or position doesn't have is a `TypeError`; `primary` is accepted and ignored, so
      * `selections()` output sets back as is. */
     set_selections(ranges: EditorRange[]): void;
-    /** Adds a selection (like Alt-click), keeping the others. Throws a `TypeError` when
+    /** Adds a selection (like Alt-click), keeping the others, and scrolls to its caret.
+     * A range inside an existing selection adds nothing but still scrolls there; one
+     * that overlaps is merged into it. Throws a `TypeError` when
      * `range` is not a single range object or has a key a range doesn't have. */
     add_selection(range: EditorRange): void;
     /** Scrolls vertically only. Before the first layout the request waits for it, and
-     * after placing it the row stays where it asked across size changes (the pane
-     * being sized, a later resize, a width change rewrapping soft-wrapped rows) until
+     * after placing it the row stays where it asked when the view changes (the pane
+     * being sized, a later resize, a width change rewrapping soft-wrapped rows, a new
+     * font size, line numbers turned on or off, ghost lines shown) until
      * the reader takes over the view: another scroll, a press in the editor, a
      * selection change or an edit. A later `set_value` drops it. Defaults to
      * "nearest". Throws a TypeError when `row` isn't a number and a RangeError when it
